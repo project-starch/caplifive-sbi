@@ -24,7 +24,8 @@ unsigned mtime;
 unsigned mtimecmp;
 
 __dom void* domains[CAPSTONE_MAX_DOM_N];
-unsigned dom_n;
+void* regions[CAPSTONE_MAX_REGION_N];
+unsigned dom_n, region_n;
 
 static unsigned create_domain(unsigned base_addr, unsigned code_size,
                           unsigned tot_size, unsigned entry_offset)
@@ -92,6 +93,26 @@ static unsigned call_domain_with_cap(unsigned dom_id, unsigned base, unsigned le
     return 0;
 }
 
+static unsigned create_region(unsigned base, unsigned len) {
+    __linear void *region;
+    C_GEN_CAP(region, base, base + len);
+
+    regions[region_n] = __delin(region);
+    region_n += 1;
+
+    return region_n - 1;
+}
+
+static unsigned share_region(unsigned dom_id, unsigned region_id) {
+    if(dom_id >= dom_n || region_id >= region_n) {
+        return -1;
+    }
+
+    __domcallsaves(domains[dom_id], CAPSTONE_DPI_REGION_SHARE, regions[region_id]);
+
+    return 0;
+}
+
 // SBI implementation
 unsigned handle_trap_ecall(unsigned arg0, unsigned arg1,
                            unsigned arg2, unsigned arg3,
@@ -147,9 +168,16 @@ unsigned handle_trap_ecall(unsigned arg0, unsigned arg1,
                 case SBI_EXT_CAPSTONE_DOM_CALL_WITH_CAP:
                     res = call_domain_with_cap(arg0, arg1, arg2, arg3);
                     break;
+                case SBI_EXT_CAPSTONE_REGION_CREATE:
+                    res = create_region(arg0, arg1);
+                    break;
+                case SBI_EXT_CAPSTONE_REGION_SHARE:
+                    res = share_region(arg0, arg1);
+                    break;
                 default:
                     err = 1;
             }
+            break;
         default:
             err = 1;
     }
@@ -163,4 +191,25 @@ void handle_interrupt(unsigned int_code) {
             __asm__ volatile ("csrs mip, %0" :: "r"(MIP_STIP));
             break;        
     }
+}
+
+
+/* DPI */
+
+static void dpi_share_region(void *region) {
+    regions[region_n] = region_n;
+    region_n += 1;
+}
+
+unsigned handle_dpi(unsigned func, void *arg) {
+    unsigned handled = 0;
+
+    switch(func) {
+        case CAPSTONE_DPI_REGION_SHARE:
+            dpi_share_region(arg);
+            handled = 1;
+            break;
+    }
+
+    return handled;
 }

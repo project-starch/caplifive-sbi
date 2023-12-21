@@ -34,6 +34,7 @@
 
 
 #define CAPSTONE_MAX_DOM_N   64
+#define CAPSTONE_MAX_REGION_N   64
 
 /* Capstone SBI */
 
@@ -42,6 +43,12 @@
 #define SBI_EXT_CAPSTONE_DOM_CREATE 0x0
 #define SBI_EXT_CAPSTONE_DOM_CALL   0x1
 #define SBI_EXT_CAPSTONE_DOM_CALL_WITH_CAP   0x2
+#define SBI_EXT_CAPSTONE_REGION_CREATE   0x3
+#define SBI_EXT_CAPSTONE_REGION_SHARE    0x4
+
+/* Capstone DPI */
+
+#define CAPSTONE_DPI_REGION_SHARE     0x0
 
 /** Index of zero member in sbi_trap_regs */
 #define SBI_TRAP_REGS_zero			0
