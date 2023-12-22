@@ -48,7 +48,8 @@
 
 /* Capstone DPI */
 
-#define CAPSTONE_DPI_REGION_SHARE     0x0
+#define CAPSTONE_DPI_CALL             0x0
+#define CAPSTONE_DPI_REGION_SHARE     0x1
 
 /** Index of zero member in sbi_trap_regs */
 #define SBI_TRAP_REGS_zero			0

@@ -78,7 +78,7 @@ static unsigned call_domain(unsigned dom_id) {
     }
     
     unsigned res;
-    __domcallsaves(domains[dom_id], &res);
+    __domcallsaves(domains[dom_id], CAPSTONE_DPI_CALL, &res);
 
     return res;
 }
@@ -88,7 +88,7 @@ static unsigned call_domain_with_cap(unsigned dom_id, unsigned base, unsigned le
     C_GEN_CAP(region, base, base + len);
     __asm__ ("scc(%0, %1, %2)" : "=r"(region) : "r"(region), "r"(cursor));
 
-    __domcallsaves(domains[dom_id], region);
+    __domcallsaves(domains[dom_id], CAPSTONE_DPI_CALL, region);
 
     return 0;
 }
