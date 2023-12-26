@@ -144,8 +144,8 @@ unsigned handle_trap_ecall(unsigned arg0, unsigned arg1,
                     res = 0;
                     break;
                 case SBI_EXT_BASE_PROBE_EXT:
-                    // we only have time extension
-                    res = arg0 == SBI_EXT_TIME;
+                    // we only have time and Capstone extensions
+                    res = arg0 == SBI_EXT_TIME || arg0 == SBI_EXT_CAPSTONE;
                     break;
                 case SBI_EXT_BASE_GET_MVENDORID:
                     C_READ_CSR(mvendorid, res);
@@ -179,13 +179,13 @@ unsigned handle_trap_ecall(unsigned arg0, unsigned arg1,
                     break;
                 case SBI_EXT_CAPSTONE_DOM_CALL_WITH_CAP:
                     res = call_domain_with_cap(arg0, arg1, arg2, arg3);
-                                        break;
+                    break;
                 case SBI_EXT_CAPSTONE_REGION_CREATE:
                     res = create_region(arg0, arg1);
                     break;
                 case SBI_EXT_CAPSTONE_REGION_SHARE:
                     res = share_region(arg0, arg1);
-                                        break;
+                    break;
                 case SBI_EXT_CAPSTONE_DOM_RETURN:
                     return_from_domain(arg0);
                     while(1); /* should not reach here */
