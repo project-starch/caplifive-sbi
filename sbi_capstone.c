@@ -18,6 +18,7 @@
 #define C_SET_CURSOR(dest, cap, cursor) __asm__("scc(%0, %1, %2)" : "=r"(dest) : "r"(cap), "r"(cursor))
 #define C_PRINT(v) __asm__ volatile(".insn r 0x5b, 0x1, 0x43, x0, %0, x0" :: "r"(v))
 #define C_GEN_CAP(dest, base, end) __asm__(".insn r 0x5b, 0x1, 0x40, %0, %1, %2" : "=r"(dest) : "r"(base), "r"(end));
+#define capstone_error(err_code) do { C_PRINT(CAPSTONE_ERR_STARTER); C_PRINT(err_code); while(1); } while(0)
 
 
 unsigned mtime;
@@ -37,14 +38,20 @@ static unsigned create_domain(unsigned base_addr, unsigned code_size,
     code_size = (((code_size - 1) >> 4) + 1) << 4;
     __linear void *mem_l, *dom_code, *dom_data, *mem_r;
     __linear void **dom_seal;
-    // READ_CCSR(cmmu, mem_l);
 
-    // FIXME: cmmu is not working properly; we cheat for now
-    // mint a capability for the memory region
+    // FIXME: swapping cmmu is currently very slow
+    // toggle the following for swapping between cmmu swapping and gen_cap (hack)
+#if 0
     C_GEN_CAP(dom_code, base_addr, base_addr + tot_size);
+#else
+    C_READ_CCSR(cmmu, mem_l);
+    dom_code = __split(mem_l, base_addr);
+    mem_r = __split(dom_code, base_addr + tot_size);
 
-    // dom_code = __split(mem_l, base_addr);
-    // mem_r = __split(dom_code, base_addr + tot_size);
+    C_WRITE_CCSR(cmmu, mem_l);
+    regions[region_n] = mem_r;
+    region_n += 1;
+#endif
 
     dom_seal = __split(dom_code, base_addr + code_size);
     dom_data = __split(dom_seal, base_addr + code_size + (16 * 64));
@@ -68,9 +75,6 @@ static unsigned create_domain(unsigned base_addr, unsigned code_size,
     domains[dom_n] = dom;
 
     dom_n += 1;
-
-    // WRITE_CCSR(cmmu, mem_l);
-
 
     return dom_n - 1;
 }
@@ -166,7 +170,7 @@ unsigned handle_trap_ecall(unsigned arg0, unsigned arg1,
             }
             break;
         case SBI_EXT_CAPSTONE:
-                        switch(func_code) {
+            switch(func_code) {
                 case SBI_EXT_CAPSTONE_DOM_CREATE:
                     res = create_domain(arg0, arg1, arg2, arg3);
                     break;
@@ -188,7 +192,7 @@ unsigned handle_trap_ecall(unsigned arg0, unsigned arg1,
                 default:
                     err = 1;
             }
-                        break;
+            break;
         default:
             err = 1;
     }
@@ -201,6 +205,38 @@ void handle_interrupt(unsigned int_code) {
             __asm__ volatile ("csrc mie, %0" :: "r"(MIP_MTIP));
             __asm__ volatile ("csrs mip, %0" :: "r"(MIP_STIP));
             break;
+    }
+}
+
+static void swap_cmmu(unsigned badaddr) {
+    unsigned i, start_addr, end_addr;
+    void *tmp, *tmp2;
+    for(i = 0; i < region_n; i += 1) {
+        start_addr = __capfield(regions[i], 3);
+        end_addr = __capfield(regions[i], 4);
+        if(start_addr <= badaddr && badaddr < end_addr)
+            break;
+    }
+    if(i >= region_n) {
+        capstone_error(CAPSTONE_NO_REGION);
+    }
+    tmp = regions[i];
+    C_READ_CCSR(cmmu, tmp2);
+    regions[i] = tmp2;
+    C_WRITE_CCSR(cmmu, tmp);
+}
+
+void handle_exception(unsigned cause) {
+    unsigned badaddr;
+    switch(cause) {
+        case CAUSE_LOAD_ACCESS:
+        case CAUSE_STORE_ACCESS:
+        case CAUSE_FETCH_ACCESS:
+            C_READ_CSR(mtval, badaddr);
+            swap_cmmu(badaddr);
+            break;
+        default:
+            capstone_error(CAPSTONE_UNKNOWN_EXCP);
     }
 }
 

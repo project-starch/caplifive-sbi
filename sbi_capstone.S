@@ -49,9 +49,9 @@ _cap_trap_entry:
     csrr t0, mcause
 
     srli t1, t0, 63
-    bne t1, x0, 1f
+    bne t1, x0, _handle_ints
     li t1, CAUSE_SUPERVISOR_ECALL
-    bne t0, t1, 2f
+    bne t0, t1, _handle_non_ecall
 
     call handle_trap_ecall
     mv a1, a0
@@ -63,10 +63,14 @@ _cap_trap_entry:
 
     j return_to_sumode
 
-2:
-    j 2b
+_handle_non_ecall:
+    mv a0, t0
+    call handle_exception
+    RESTORE_REG(a0, sp)
+    RESTORE_REG(a1, sp)
+    j return_to_sumode
 
-1:
+_handle_ints:
     # handle interrupts
     slli t0, t0, 1
     srli a0, t0, 1

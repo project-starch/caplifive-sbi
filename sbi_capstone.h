@@ -36,6 +36,10 @@
 #define CAPSTONE_MAX_DOM_N   64
 #define CAPSTONE_MAX_REGION_N   64
 
+#define CAPSTONE_ERR_STARTER   0xdeadbeef
+#define CAPSTONE_UNKNOWN_EXCP  0x0
+#define CAPSTONE_NO_REGION     0x1
+
 /* Capstone SBI */
 
 #define SBI_EXT_CAPSTONE 0x12345678
