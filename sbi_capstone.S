@@ -1,5 +1,11 @@
 #include "sbi_capstone.h"
 
+#ifndef DOM_REENTRY_POINT
+_dom_reentry:
+    j _dom_reentry
+#define DOM_REENTRY_POINT _dom_reentry
+#endif
+
 _cap_trap_entry:
     CCSRRW(sp, CCSR_CSCRATCH, sp)
 
@@ -108,5 +114,17 @@ return_to_sumode:
 
     CCSRRW(sp, CCSR_CSCRATCH, sp)
 
+    # right before returning to S mode:
+    # cscratch: sp  ->
+    #      sp - 16  -> gp
     mret
 
+call_into_smode:
+    # TODO: if this is not the first time we call into S mode
+    # we might need to restore its context
+    # alternatively, we let the S mode handle this by itself
+    STC(gp, sp, -16)
+    CCSRRW(sp, CCSR_CSCRATCH, sp)
+    li gp, 0
+
+    mret

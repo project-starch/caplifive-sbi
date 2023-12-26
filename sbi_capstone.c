@@ -27,6 +27,9 @@ __dom void* domains[CAPSTONE_MAX_DOM_N];
 void* regions[CAPSTONE_MAX_REGION_N];
 unsigned dom_n, region_n;
 
+__domret void *caller_dom;
+unsigned* caller_buf;
+
 static unsigned create_domain(unsigned base_addr, unsigned code_size,
                           unsigned tot_size, unsigned entry_offset)
 {
@@ -79,12 +82,12 @@ static unsigned call_domain(unsigned dom_id) {
     
     unsigned res;
     __domcallsaves(domains[dom_id], CAPSTONE_DPI_CALL, &res);
-
+    
     return res;
 }
 
 static unsigned call_domain_with_cap(unsigned dom_id, unsigned base, unsigned len, unsigned cursor) {
-    __linear void *region;
+        __linear void *region;
     C_GEN_CAP(region, base, base + len);
     __asm__ ("scc(%0, %1, %2)" : "=r"(region) : "r"(region), "r"(cursor));
 
@@ -109,8 +112,13 @@ static unsigned share_region(unsigned dom_id, unsigned region_id) {
     }
 
     __domcallsaves(domains[dom_id], CAPSTONE_DPI_REGION_SHARE, regions[region_id]);
-
+    
     return 0;
+}
+
+static void return_from_domain(unsigned retval) {
+    *caller_buf = retval;
+    __domreturnsaves(caller_dom, DOM_REENTRY_POINT, 0);
 }
 
 // SBI implementation
@@ -158,7 +166,7 @@ unsigned handle_trap_ecall(unsigned arg0, unsigned arg1,
             }
             break;
         case SBI_EXT_CAPSTONE:
-            switch(func_code) {
+                        switch(func_code) {
                 case SBI_EXT_CAPSTONE_DOM_CREATE:
                     res = create_domain(arg0, arg1, arg2, arg3);
                     break;
@@ -167,17 +175,20 @@ unsigned handle_trap_ecall(unsigned arg0, unsigned arg1,
                     break;
                 case SBI_EXT_CAPSTONE_DOM_CALL_WITH_CAP:
                     res = call_domain_with_cap(arg0, arg1, arg2, arg3);
-                    break;
+                                        break;
                 case SBI_EXT_CAPSTONE_REGION_CREATE:
                     res = create_region(arg0, arg1);
                     break;
                 case SBI_EXT_CAPSTONE_REGION_SHARE:
                     res = share_region(arg0, arg1);
-                    break;
+                                        break;
+                case SBI_EXT_CAPSTONE_DOM_RETURN:
+                    return_from_domain(arg0);
+                    while(1); /* should not reach here */
                 default:
                     err = 1;
             }
-            break;
+                        break;
         default:
             err = 1;
     }
@@ -189,12 +200,17 @@ void handle_interrupt(unsigned int_code) {
         case IRQ_M_TIMER:
             __asm__ volatile ("csrc mie, %0" :: "r"(MIP_MTIP));
             __asm__ volatile ("csrs mip, %0" :: "r"(MIP_STIP));
-            break;        
+            break;
     }
 }
 
 
 /* DPI */
+
+static void dpi_call(void *arg) {
+    caller_buf = arg;
+    __asm__ volatile ("j call_into_smode");
+}
 
 static void dpi_share_region(void *region) {
     regions[region_n] = region_n;
@@ -205,6 +221,9 @@ unsigned handle_dpi(unsigned func, void *arg) {
     unsigned handled = 0;
 
     switch(func) {
+        case CAPSTONE_DPI_CALL:
+            dpi_call(arg);
+            while(1); /* should not reach here */
         case CAPSTONE_DPI_REGION_SHARE:
             dpi_share_region(arg);
             handled = 1;

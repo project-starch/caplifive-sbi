@@ -45,6 +45,8 @@
 #define SBI_EXT_CAPSTONE_DOM_CALL_WITH_CAP   0x2
 #define SBI_EXT_CAPSTONE_REGION_CREATE   0x3
 #define SBI_EXT_CAPSTONE_REGION_SHARE    0x4
+/* exit from S mode and return to caller domain */
+#define SBI_EXT_CAPSTONE_DOM_RETURN      0x5 
 
 /* Capstone DPI */
 
