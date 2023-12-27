@@ -19,7 +19,13 @@
 #define C_PRINT(v) __asm__ volatile(".insn r 0x5b, 0x1, 0x43, x0, %0, x0" :: "r"(v))
 #define C_GEN_CAP(dest, base, end) __asm__(".insn r 0x5b, 0x1, 0x40, %0, %1, %2" : "=r"(dest) : "r"(base), "r"(end));
 #define capstone_error(err_code) do { C_PRINT(CAPSTONE_ERR_STARTER); C_PRINT(err_code); while(1); } while(0)
+#define cap_base(cap) __capfield((cap), 3)
+#define cap_end(cap) __capfield((cap), 4)
 
+
+// FIXME: swapping cmmu is currently very slow
+// toggle the following for swapping between cmmu swapping and gen_cap (hack)
+// #define USE_GEN_CAP
 
 unsigned mtime;
 unsigned mtimecmp;
@@ -39,9 +45,7 @@ static unsigned create_domain(unsigned base_addr, unsigned code_size,
     __linear void *mem_l, *dom_code, *dom_data, *mem_r;
     __linear void **dom_seal;
 
-    // FIXME: swapping cmmu is currently very slow
-    // toggle the following for swapping between cmmu swapping and gen_cap (hack)
-#if 0
+#ifdef USE_GEN_CAP
     C_GEN_CAP(dom_code, base_addr, base_addr + tot_size);
 #else
     C_READ_CCSR(cmmu, mem_l);
@@ -90,9 +94,45 @@ static unsigned call_domain(unsigned dom_id) {
     return res;
 }
 
-static unsigned call_domain_with_cap(unsigned dom_id, unsigned base, unsigned len, unsigned cursor) {
-        __linear void *region;
+static void * split_out_cap(unsigned base, unsigned len) {
+    void *region;
+
+#ifdef USE_GEN_CAP
     C_GEN_CAP(region, base, base + len);
+#else
+    void *mem_l, *mem_r;
+    unsigned i, begin_addr, end_addr;
+    C_READ_CCSR(cmmu, mem_l);
+    begin_addr = cap_base(mem_l);
+    end_addr = cap_end(mem_l);
+    if(begin_addr <= base && base + len <= end_addr) {
+        region = __split(mem_l, base);
+        C_WRITE_CCSR(cmmu, mem_l);
+    } else {
+        C_WRITE_CCSR(cmmu, mem_l);
+        for(i = 0; i < region_n; i += 1) {
+            begin_addr = cap_base(regions[i]);
+            end_addr = cap_end(regions[i]);
+            if(begin_addr <= base && base + len <= end_addr)
+                break;
+        }
+        if(i >= region_n) {
+            capstone_error(CAPSTONE_NO_REGION);
+        }
+        mem_l = regions[i];
+        region = __split(mem_l, base);
+        regions[i] = mem_l;
+    }
+    mem_r = __split(region, base + len);
+    regions[region_n] = mem_r;
+    region_n += 1;
+#endif
+
+    return region;
+}
+
+static unsigned call_domain_with_cap(unsigned dom_id, unsigned base, unsigned len, unsigned cursor) {
+    void *region = split_out_cap(base, len);
     __asm__ ("scc(%0, %1, %2)" : "=r"(region) : "r"(region), "r"(cursor));
 
     __domcallsaves(domains[dom_id], CAPSTONE_DPI_CALL, region);
@@ -101,10 +141,9 @@ static unsigned call_domain_with_cap(unsigned dom_id, unsigned base, unsigned le
 }
 
 static unsigned create_region(unsigned base, unsigned len) {
-    __linear void *region;
-    C_GEN_CAP(region, base, base + len);
+    void *region = split_out_cap(base, len);
 
-    regions[region_n] = __delin(region);
+    regions[region_n] = region;
     region_n += 1;
 
     return region_n - 1;
@@ -212,8 +251,8 @@ static void swap_cmmu(unsigned badaddr) {
     unsigned i, start_addr, end_addr;
     void *tmp, *tmp2;
     for(i = 0; i < region_n; i += 1) {
-        start_addr = __capfield(regions[i], 3);
-        end_addr = __capfield(regions[i], 4);
+        start_addr = cap_base(regions[i]);
+        end_addr = cap_end(regions[i]);
         if(start_addr <= badaddr && badaddr < end_addr)
             break;
     }
@@ -249,7 +288,7 @@ static void dpi_call(void *arg) {
 }
 
 static void dpi_share_region(void *region) {
-    regions[region_n] = region_n;
+    regions[region_n] = region;
     region_n += 1;
 }
 
