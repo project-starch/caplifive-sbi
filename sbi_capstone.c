@@ -37,6 +37,11 @@ unsigned dom_n, region_n;
 __domret void *caller_dom;
 unsigned* caller_buf;
 
+/* has S-mode been executed? */
+unsigned smode_initialised;
+/* saved context of S-mode at the last SBI dom-return call */
+unsigned *smode_saved_context;
+
 static unsigned create_domain(unsigned base_addr, unsigned code_size,
                           unsigned tot_size, unsigned entry_offset)
 {
@@ -164,6 +169,23 @@ static void return_from_domain(unsigned retval) {
     __domreturnsaves(caller_dom, DOM_REENTRY_POINT, 0);
 }
 
+static unsigned query_region(unsigned region_id, unsigned field) {
+    if(region_id >= region_n) {
+        return -1;
+    }
+
+    switch(field) {
+        case CAPSTONE_REGION_FIELD_BASE:
+            return cap_base(regions[region_id]);
+        case CAPSTONE_REGION_FIELD_END:
+            return cap_end(regions[region_id]);
+        case CAPSTONE_REGION_FIELD_LEN:
+            return cap_end(regions[region_id]) - cap_base(regions[region_id]);
+        default:
+            return -1;
+    }
+}
+
 // SBI implementation
 unsigned handle_trap_ecall(unsigned arg0, unsigned arg1,
                            unsigned arg2, unsigned arg3,
@@ -228,6 +250,9 @@ unsigned handle_trap_ecall(unsigned arg0, unsigned arg1,
                 case SBI_EXT_CAPSTONE_DOM_RETURN:
                     return_from_domain(arg0);
                     while(1); /* should not reach here */
+                case SBI_EXT_CAPSTONE_REGION_QUERY:
+                    res = query_region(arg0, arg1);
+                    break;
                 default:
                     err = 1;
             }
@@ -257,7 +282,7 @@ static void swap_cmmu(unsigned badaddr) {
             break;
     }
     if(i >= region_n) {
-        capstone_error(CAPSTONE_NO_REGION);
+        capstone_error(CAPSTONE_NO_CMMU_REGION);
     }
     tmp = regions[i];
     C_READ_CCSR(cmmu, tmp2);
@@ -284,7 +309,12 @@ void handle_exception(unsigned cause) {
 
 static void dpi_call(void *arg) {
     caller_buf = arg;
-    __asm__ volatile ("j call_into_smode");
+    if(smode_initialised) {
+        __asm__ volatile ("movc(a0, %0); j resume_smode" :: "r"(smode_saved_context));
+    } else {
+        smode_initialised = 1;
+        __asm__ volatile ("j call_into_smode");
+    }
 }
 
 static void dpi_share_region(void *region) {
@@ -306,4 +336,8 @@ unsigned handle_dpi(unsigned func, void *arg) {
     }
 
     return handled;
+}
+
+static void save_smode_context(unsigned *ctx) {
+    smode_saved_context = ctx;
 }

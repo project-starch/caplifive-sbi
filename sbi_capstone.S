@@ -9,7 +9,7 @@ _dom_reentry:
 _cap_trap_entry:
     CCSRRW(sp, CCSR_CSCRATCH, sp)
 
-    CINCOFFSETIMM(sp, sp, -34 * 8)
+    CINCOFFSETIMM(sp, sp, -32 * 8)
     # set up stack
     # save context. TODO: assuming that there is no GPR containing a capability
     SAVE_REG(ra, sp)
@@ -43,8 +43,24 @@ _cap_trap_entry:
     SAVE_REG(t5, sp)
     SAVE_REG(t6, sp)
 
-    LDC(gp, sp, 32 * 8)
+    LDC(gp, sp, -16)
 
+    MOVC(a0, sp)
+    CINCOFFSETIMM(sp, sp, -16)
+
+    # TODO: however, this would require the bottom of the stack to be reserved
+    # for storing S-mode context
+    call save_smode_context
+    CINCOFFSETIMM(sp, sp, 16)
+    RESTORE_REG(a0, sp)
+    RESTORE_REG(a1, sp)
+    RESTORE_REG(a2, sp)
+    RESTORE_REG(a3, sp)
+    RESTORE_REG(a4, sp)
+    RESTORE_REG(a5, sp)
+    RESTORE_REG(a6, sp)
+    RESTORE_REG(a7, sp)
+    CINCOFFSETIMM(sp, sp, -16)
 
     csrr t0, mcause
 
@@ -66,8 +82,10 @@ _cap_trap_entry:
 _handle_non_ecall:
     mv a0, t0
     call handle_exception
+    CINCOFFSETIMM(sp, sp, 16)
     RESTORE_REG(a0, sp)
     RESTORE_REG(a1, sp)
+    CINCOFFSETIMM(sp, sp, -16)
     j return_to_sumode
 
 _handle_ints:
@@ -77,13 +95,16 @@ _handle_ints:
 
     call handle_interrupt
 
+    CINCOFFSETIMM(sp, sp, 16)
     RESTORE_REG(a0, sp)
     RESTORE_REG(a1, sp)
+    CINCOFFSETIMM(sp, sp, -16)
 
 return_to_sumode:
 
+    STC(gp, sp, 0)
 
-    STC(gp, sp, 32 * 8)
+    CINCOFFSETIMM(sp, sp, 16)
 
     RESTORE_REG(ra, sp)
     RESTORE_REG(gp, sp)
@@ -114,21 +135,37 @@ return_to_sumode:
     RESTORE_REG(t5, sp)
     RESTORE_REG(t6, sp)
 
-    CINCOFFSETIMM(sp, sp, 34 * 8)
+    CINCOFFSETIMM(sp, sp, 32 * 8)
 
     CCSRRW(sp, CCSR_CSCRATCH, sp)
 
+    # TODO: this can be improved
     # right before returning to S mode:
     # cscratch: sp  ->
-    #      sp - 16  -> gp
+    #      sp - 8 * 32 - 16  -> gp
     mret
 
 call_into_smode:
-    # TODO: if this is not the first time we call into S mode
-    # we might need to restore its context
-    # alternatively, we let the S mode handle this by itself
-    STC(gp, sp, -16)
+    # reset sp to stack bottom
+    LCC(t0, sp, 4)
+    SCC(sp, sp, t0)
+
+    STC(gp, sp, -8 * 32 -16)
     CCSRRW(sp, CCSR_CSCRATCH, sp)
     li gp, 0
 
     mret
+
+resume_smode:
+    # The S mode has been run before, in which case the saved context is loaded
+    # The first argument is the base address of the saved context
+    MOVC(sp, a0)
+    CCSRRW(t0, CCSR_CEPC, x0)
+    addi t0, t0, 4
+    CCSRRW(x0, CCSR_CEPC, t0)
+    
+    li a0, 0
+    li a1, 0
+    CINCOFFSETIMM(sp, sp, -16)
+
+    j return_to_sumode

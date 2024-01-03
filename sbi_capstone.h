@@ -21,6 +21,8 @@
 #define SEAL(rd, rs1)  .insn r 0x5b, 0x1, 0x7, rd, rs1, x0
 #define CCSRRW(rd, ccsr, rs1) .insn i 0x5b, 0x7, rd, ccsr(rs1)
 #define SCC(rd, rs1, rs2) .insn r 0x5b, 0x1, 0x5, rd, rs1, rs2
+#define LCC(rd, rs, imm) .insn r 0x5b, 0x1, 0x4, rd, rs, x##imm
+#define MOVC(rd, rs) .insn r 0x5b, 0x1, 0xa, rd, rs, x0 
 #define CALL(rd, rs1) .insn r 0x5b, 0x1, 0x20, rd, rs1, x0
 #define RETURN(rd, rs1, rs2) .insn r 0x5b, 0x1, 0x21, rd, rs1, rs2
 #define CINCOFFSETIMM(rd, rs1, imm) .insn i 0x5b, 0x2, rd, imm(rs1)
@@ -36,9 +38,10 @@
 #define CAPSTONE_MAX_DOM_N   64
 #define CAPSTONE_MAX_REGION_N   64
 
-#define CAPSTONE_ERR_STARTER   0xdeadbeef
-#define CAPSTONE_UNKNOWN_EXCP  0x0
-#define CAPSTONE_NO_REGION     0x1
+#define CAPSTONE_ERR_STARTER        0xdeadbeef
+#define CAPSTONE_UNKNOWN_EXCP       0x0
+#define CAPSTONE_NO_REGION          0x1
+#define CAPSTONE_NO_CMMU_REGION     0x2
 
 /* Capstone SBI */
 
@@ -51,6 +54,11 @@
 #define SBI_EXT_CAPSTONE_REGION_SHARE    0x4
 /* exit from S mode and return to caller domain */
 #define SBI_EXT_CAPSTONE_DOM_RETURN      0x5 
+#define SBI_EXT_CAPSTONE_REGION_QUERY    0x6
+
+#define CAPSTONE_REGION_FIELD_BASE    0x0
+#define CAPSTONE_REGION_FIELD_END     0x1
+#define CAPSTONE_REGION_FIELD_LEN     0x2
 
 /* Capstone DPI */
 
