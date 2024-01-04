@@ -33,6 +33,7 @@ unsigned mtimecmp;
 __dom void* domains[CAPSTONE_MAX_DOM_N];
 void* regions[CAPSTONE_MAX_REGION_N];
 unsigned dom_n, region_n;
+unsigned cmmu_region_id; /* the ID of the region currently in cmmu */
 
 __domret void *caller_dom;
 unsigned* caller_buf;
@@ -116,6 +117,8 @@ static void * split_out_cap(unsigned base, unsigned len) {
     } else {
         C_WRITE_CCSR(cmmu, mem_l);
         for(i = 0; i < region_n; i += 1) {
+            if(i == cmmu_region_id)
+                continue;
             begin_addr = cap_base(regions[i]);
             end_addr = cap_end(regions[i]);
             if(begin_addr <= base && base + len <= end_addr)
@@ -174,16 +177,35 @@ static unsigned query_region(unsigned region_id, unsigned field) {
         return -1;
     }
 
+    void *region;
+    if(region_id == cmmu_region_id) {
+        C_READ_CCSR(cmmu, region);
+    } else {
+        region = regions[region_id];
+    }
+
+    unsigned res;
     switch(field) {
         case CAPSTONE_REGION_FIELD_BASE:
-            return cap_base(regions[region_id]);
+            res = cap_base(region);
+            break;
         case CAPSTONE_REGION_FIELD_END:
-            return cap_end(regions[region_id]);
+            res = cap_end(region);
+            break;
         case CAPSTONE_REGION_FIELD_LEN:
-            return cap_end(regions[region_id]) - cap_base(regions[region_id]);
+            res = cap_end(region) - cap_base(region);
+            break;
         default:
-            return -1;
+            res = -1;
     }
+
+    if(region_id == cmmu_region_id) {
+        C_WRITE_CCSR(cmmu, region);
+    } else {
+        regions[region_id] = region;
+    }
+
+    return res;
 }
 
 // SBI implementation
@@ -280,8 +302,10 @@ void handle_interrupt(unsigned int_code) {
 
 static void swap_cmmu(unsigned badaddr) {
     unsigned i, start_addr, end_addr;
-    void *tmp, *tmp2;
+    void *tmp;
     for(i = 0; i < region_n; i += 1) {
+        if(i == cmmu_region_id)
+            continue;
         start_addr = cap_base(regions[i]);
         end_addr = cap_end(regions[i]);
         if(start_addr <= badaddr && badaddr < end_addr)
@@ -290,10 +314,11 @@ static void swap_cmmu(unsigned badaddr) {
     if(i >= region_n) {
         capstone_error(CAPSTONE_NO_CMMU_REGION);
     }
+    C_READ_CCSR(cmmu, tmp);
+    regions[cmmu_region_id] = tmp;
     tmp = regions[i];
-    C_READ_CCSR(cmmu, tmp2);
-    regions[i] = tmp2;
     C_WRITE_CCSR(cmmu, tmp);
+    cmmu_region_id = i;
 }
 
 void handle_exception(unsigned cause) {
