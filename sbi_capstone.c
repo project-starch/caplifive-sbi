@@ -253,6 +253,12 @@ unsigned handle_trap_ecall(unsigned arg0, unsigned arg1,
                 case SBI_EXT_CAPSTONE_REGION_QUERY:
                     res = query_region(arg0, arg1);
                     break;
+                case SBI_EXT_CAPSTONE_DOM_SCHEDULE:
+                    // TODO: implement dom-schedule
+                    break;
+                case SBI_EXT_CAPSTONE_REGION_COUNT:
+                    res = region_n;
+                    break;
                 default:
                     err = 1;
             }
