@@ -208,6 +208,17 @@ static unsigned query_region(unsigned region_id, unsigned field) {
     return res;
 }
 
+// submit the specified domain to the interrupt handler for scheduling
+static unsigned schedule_domain(unsigned dom_id) {
+    if(dom_id >= dom_n) {
+        return -1;
+    }
+    __dom void *d = domains[dom_id];
+    // domains[dom_id] = 
+    __ihdomcallsaves(CAPSTONE_IHI_THREAD_SPAWN, d); // TODO: this shall return the async dom of the called domain
+    return 0;
+}
+
 // SBI implementation
 unsigned handle_trap_ecall(unsigned arg0, unsigned arg1,
                            unsigned arg2, unsigned arg3,
@@ -277,6 +288,7 @@ unsigned handle_trap_ecall(unsigned arg0, unsigned arg1,
                     break;
                 case SBI_EXT_CAPSTONE_DOM_SCHEDULE:
                     // TODO: implement dom-schedule
+                    res = schedule_domain(arg0);
                     break;
                 case SBI_EXT_CAPSTONE_REGION_COUNT:
                     res = region_n;

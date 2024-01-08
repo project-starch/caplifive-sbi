@@ -67,6 +67,12 @@
 #define CAPSTONE_DPI_CALL             0x0
 #define CAPSTONE_DPI_REGION_SHARE     0x1
 
+
+/* Capstone Interrupt Handler Interface */
+
+#define CAPSTONE_IHI_THREAD_SPAWN     0x0
+#define CAPSTONE_IHI_THREAD_YIELD     0x1
+
 /** Index of zero member in sbi_trap_regs */
 #define SBI_TRAP_REGS_zero			0
 /** Index of ra member in sbi_trap_regs */
