@@ -76,7 +76,7 @@ static unsigned create_domain(unsigned base_addr, unsigned code_size,
     // construct the sealed region of the domain
     dom_seal[0] = dom_code;
     dom_seal[2] = dom_data;
-    dom_seal[3] = 3 << 34;
+    dom_seal[3] = (3 << 38) | (2 << 34);
 
     __dom void *dom = __seal(dom_seal);
 
@@ -95,7 +95,9 @@ static unsigned call_domain(unsigned dom_id) {
     }
     
     unsigned res;
-    __domcallsaves(domains[dom_id], CAPSTONE_DPI_CALL, &res);
+    __dom void *d = domains[dom_id];
+    d = __domcallsaves(d, CAPSTONE_DPI_CALL, &res);
+    domains[dom_id] = d;
     
     return res;
 }
@@ -143,7 +145,9 @@ static unsigned call_domain_with_cap(unsigned dom_id, unsigned base, unsigned le
     void *region = split_out_cap(base, len);
     __asm__ ("scc(%0, %1, %2)" : "=r"(region) : "r"(region), "r"(cursor));
 
-    __domcallsaves(domains[dom_id], CAPSTONE_DPI_CALL, region);
+    __dom void *d = domains[dom_id];
+    d = __domcallsaves(d, CAPSTONE_DPI_CALL, region);
+    domains[dom_id] = d;
 
     return 0;
 }
@@ -162,7 +166,9 @@ static unsigned share_region(unsigned dom_id, unsigned region_id) {
         return -1;
     }
 
-    __domcallsaves(domains[dom_id], CAPSTONE_DPI_REGION_SHARE, regions[region_id]);
+    __dom void *d = domains[dom_id];
+    d = __domcallsaves(d, CAPSTONE_DPI_REGION_SHARE, regions[region_id]);
+    domains[dom_id] = d;
     
     return 0;
 }
@@ -214,8 +220,8 @@ static unsigned schedule_domain(unsigned dom_id) {
         return -1;
     }
     __dom void *d = domains[dom_id];
-    // domains[dom_id] = 
-    __ihdomcallsaves(CAPSTONE_IHI_THREAD_SPAWN, d); // TODO: this shall return the async dom of the called domain
+    d = __ihdomcallsaves(CAPSTONE_IHI_THREAD_SPAWN, d); // TODO: this shall
+    domains[dom_id] = d;
     return 0;
 }
 
