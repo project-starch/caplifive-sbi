@@ -43,6 +43,59 @@ unsigned smode_initialised;
 /* saved context of S-mode at the last SBI dom-return call */
 unsigned *smode_saved_context;
 
+
+static void * split_out_cap(unsigned base, unsigned len) {
+    void *region;
+
+#ifdef USE_GEN_CAP
+    C_GEN_CAP(region, base, base + len);
+#else
+    void *mem_l, *mem_r;
+    unsigned i;
+    unsigned region_base, region_end;
+
+    for(i = 0; i < region_n; i += 1) {
+        if(i == cmmu_region_id)
+            C_READ_CCSR(cmmu, mem_l);
+        else
+            mem_l = regions[i];
+        region_base = cap_base(mem_l);
+        region_end = cap_end(mem_l);
+        if(base >= region_base && base + len <= region_end)
+            break;
+        if(i == cmmu_region_id)
+            C_WRITE_CCSR(cmmu, mem_l);
+        else
+            regions[i] = mem_l;
+    }
+
+    if(i >= region_n)
+        capstone_error(CAPSTONE_NO_REGION);
+
+    if(base == region_base)
+        region = mem_l;
+    else
+        region = __split(mem_l, base);
+
+    mem_r = __split(region, base + len);
+
+    if(base == region_base) {
+        regions[i] = mem_r;
+    } else {
+        if(i == cmmu_region_id)
+            C_WRITE_CCSR(cmmu, mem_l);
+        else
+            regions[i] = mem_l;
+
+        regions[region_n] = mem_r;
+        region_n += 1;
+   }
+#endif
+
+    return region;
+}
+
+
 static unsigned create_domain(unsigned base_addr, unsigned code_size,
                           unsigned tot_size, unsigned entry_offset)
 {
@@ -51,17 +104,7 @@ static unsigned create_domain(unsigned base_addr, unsigned code_size,
     __linear void *mem_l, *dom_code, *dom_data, *mem_r;
     __linear void **dom_seal;
 
-#ifdef USE_GEN_CAP
-    C_GEN_CAP(dom_code, base_addr, base_addr + tot_size);
-#else
-    C_READ_CCSR(cmmu, mem_l);
-    dom_code = __split(mem_l, base_addr);
-    mem_r = __split(dom_code, base_addr + tot_size);
-
-    C_WRITE_CCSR(cmmu, mem_l);
-    regions[region_n] = mem_r;
-    region_n += 1;
-#endif
+    dom_code = split_out_cap(base_addr, tot_size);
 
     dom_seal = __split(dom_code, base_addr + code_size);
     dom_data = __split(dom_seal, base_addr + code_size + (16 * 64));
@@ -102,44 +145,6 @@ static unsigned call_domain(unsigned dom_id) {
     return res;
 }
 
-static void * split_out_cap(unsigned base, unsigned len) {
-    void *region;
-
-#ifdef USE_GEN_CAP
-    C_GEN_CAP(region, base, base + len);
-#else
-    void *mem_l, *mem_r;
-    unsigned i, begin_addr, end_addr;
-    C_READ_CCSR(cmmu, mem_l);
-    begin_addr = cap_base(mem_l);
-    end_addr = cap_end(mem_l);
-    if(begin_addr <= base && base + len <= end_addr) {
-        region = __split(mem_l, base);
-        C_WRITE_CCSR(cmmu, mem_l);
-    } else {
-        C_WRITE_CCSR(cmmu, mem_l);
-        for(i = 0; i < region_n; i += 1) {
-            if(i == cmmu_region_id)
-                continue;
-            begin_addr = cap_base(regions[i]);
-            end_addr = cap_end(regions[i]);
-            if(begin_addr <= base && base + len <= end_addr)
-                break;
-        }
-        if(i >= region_n) {
-            capstone_error(CAPSTONE_NO_REGION);
-        }
-        mem_l = regions[i];
-        region = __split(mem_l, base);
-        regions[i] = mem_l;
-    }
-    mem_r = __split(region, base + len);
-    regions[region_n] = mem_r;
-    region_n += 1;
-#endif
-
-    return region;
-}
 
 static unsigned call_domain_with_cap(unsigned dom_id, unsigned base, unsigned len, unsigned cursor) {
     void *region = split_out_cap(base, len);
