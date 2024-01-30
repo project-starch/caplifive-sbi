@@ -248,6 +248,17 @@ static unsigned revoke_region(unsigned region_id) {
     return 0;
 }
 
+static unsigned region_de_linear(unsigned region_id) {
+    if(region_id >= region_n) {
+        return -1;
+    }
+
+    __linear void *r = regions[region_id];
+    regions[region_id] = __delin(r);
+
+    return 0;
+}
+
 static void return_from_domain(unsigned retval) {
     *caller_buf = retval;
     __domreturnsaves(caller_dom, DOM_REENTRY_POINT, 0);
@@ -373,6 +384,15 @@ unsigned handle_trap_ecall(unsigned arg0, unsigned arg1,
                     break;
                 case SBI_EXT_CAPSTONE_REGION_COUNT:
                     res = region_n;
+                    break;
+                case SBI_EXT_CAPSTONE_REGION_SHARE_ANNOTATED:
+                    res = shared_region_annotated(arg0, arg1, arg2, arg3);
+                    break;
+                case SBI_EXT_CAPSTONE_REGION_REVOKE:
+                    res = revoke_region(arg0);
+                    break;
+                case SBI_EXT_CAPSTONE_REGION_DE_LINEAR:
+                    res = region_de_linear(arg0);
                     break;
                 default:
                     err = 1;
