@@ -27,8 +27,8 @@
 // toggle the following for swapping between cmmu swapping and gen_cap (hack)
 // #define USE_GEN_CAP
 
-unsigned mtime;
-unsigned mtimecmp;
+unsigned *mtime;
+unsigned *mtimecmp;
 
 __dom void* domains[CAPSTONE_MAX_DOM_N];
 void* regions[CAPSTONE_MAX_REGION_N];
@@ -43,8 +43,7 @@ unsigned smode_initialised;
 /* saved context of S-mode at the last SBI dom-return call */
 unsigned *smode_saved_context;
 
-
-static void * split_out_cap(unsigned base, unsigned len) {
+static void *split_out_cap(unsigned base, unsigned len, unsigned linear) {
     void *region;
 
 #ifdef USE_GEN_CAP
@@ -92,6 +91,20 @@ static void * split_out_cap(unsigned base, unsigned len) {
    }
 #endif
 
+    __linear void *region_linear;
+    unsigned ty = __capfield(region, 1);
+    if(linear && ty != 0) {
+        capstone_error(CAPSTONE_NO_REGION);
+    } else if(!linear && ty == 0) {
+        region_linear = region;
+        region = __delin(region_linear);
+    }
+
+    if(!linear) {
+        regions[region_n] = region;
+        region_n += 1;
+    }
+
     return region;
 }
 
@@ -104,7 +117,7 @@ static unsigned create_domain(unsigned base_addr, unsigned code_size,
     __linear void *mem_l, *dom_code, *dom_data, *mem_r;
     __linear void **dom_seal;
 
-    dom_code = split_out_cap(base_addr, tot_size);
+    dom_code = split_out_cap(base_addr, tot_size, 1);
 
     dom_seal = __split(dom_code, base_addr + code_size);
     dom_data = __split(dom_seal, base_addr + code_size + (16 * 64));
@@ -147,7 +160,7 @@ static unsigned call_domain(unsigned dom_id) {
 
 
 static unsigned call_domain_with_cap(unsigned dom_id, unsigned base, unsigned len, unsigned cursor) {
-    void *region = split_out_cap(base, len);
+    void *region = split_out_cap(base, len, 1);
     __asm__ ("scc(%0, %1, %2)" : "=r"(region) : "r"(region), "r"(cursor));
 
     __dom void *d = domains[dom_id];
@@ -158,7 +171,7 @@ static unsigned call_domain_with_cap(unsigned dom_id, unsigned base, unsigned le
 }
 
 static unsigned create_region(unsigned base, unsigned len) {
-    void *region = split_out_cap(base, len);
+    void *region = split_out_cap(base, len, 1);
 
     regions[region_n] = region;
     region_n += 1;
@@ -268,7 +281,7 @@ unsigned handle_trap_ecall(unsigned arg0, unsigned arg1,
         case SBI_EXT_TIME:
             if (func_code == SBI_EXT_TIME_SET_TIMER) {
                 __asm__ volatile ("csrc mip, %0" :: "r"(MIP_STIP | MIP_MTIP));
-                mtimecmp = arg0;
+                *mtimecmp = arg0;
                 __asm__ volatile ("csrs mie, %0" :: "r"(MIP_MTIP));
             } else {
                 err = 1;
