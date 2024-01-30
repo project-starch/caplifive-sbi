@@ -172,7 +172,7 @@ static unsigned shared_region_annotated(unsigned dom_id, unsigned region_id, uns
     }
 
     __dom void *d = domains[dom_id];
-    void *r = regions[region_id];
+    __linear void *r = regions[region_id];
 
     if (annotation_rev == CAPSTONE_ANNOTATION_REV_DEFAULT) {
         // capability type: non-linear; post-return revoke: yes
@@ -217,7 +217,7 @@ static unsigned shared_region_annotated(unsigned dom_id, unsigned region_id, uns
         return -1;
     }
 
-    d = __domcallsaves(d, CAPSTONE_DPI_REGION_SHARE, regions[region_id]);
+    d = __domcallsaves(d, CAPSTONE_DPI_REGION_SHARE, r);
     domains[dom_id] = d;
 
     return 0;
