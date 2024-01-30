@@ -261,6 +261,16 @@ static unsigned revoke_region(unsigned region_id) {
     return 0;
 }
 
+static unsigned pop_region(unsigned pop_num) {
+    if (pop_num > region_n) {
+        return -1;
+    }
+
+    region_n -= pop_num;
+
+    return 0;
+}
+
 static unsigned region_de_linear(unsigned region_id) {
     if(region_id >= region_n) {
         return -1;
@@ -406,6 +416,9 @@ unsigned handle_trap_ecall(unsigned arg0, unsigned arg1,
                     break;
                 case SBI_EXT_CAPSTONE_REGION_DE_LINEAR:
                     res = region_de_linear(arg0);
+                    break;
+                case SBI_EXT_CAPSTONE_REGION_POP:
+                    res = pop_region(arg0);
                     break;
                 default:
                     err = 1;
