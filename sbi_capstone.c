@@ -166,6 +166,63 @@ static unsigned create_region(unsigned base, unsigned len) {
     return region_n - 1;
 }
 
+static unsigned shared_region_annotated(unsigned dom_id, unsigned region_id, unsigned annotation_perm, unsigned annotation_rev) {
+    if(dom_id >= dom_n || region_id >= region_n) {
+        return -1;
+    }
+
+    __dom void *d = domains[dom_id];
+    void *r = regions[region_id];
+
+    if (annotation_rev == CAPSTONE_ANNOTATION_REV_DEFAULT) {
+        // capability type: non-linear; post-return revoke: yes
+        __rev void *rev = __mrev(r);
+        regions[region_id] = rev;
+        r = __delin(r);
+    }
+    else if (annotation_rev == CAPSTONE_ANNOTATION_REV_BORROWED) {
+        // capability type: linear; post-return revoke: yes
+        __rev void *rev = __mrev(r);
+        regions[region_id] = rev;
+    }
+    else if (annotation_rev == CAPSTONE_ANNOTATION_REV_SHARED) {
+        // capability type: non-linear; post-return revoke: no
+        r = __delin(r);
+        regions[region_id] = r;
+    }
+    else if (annotation_rev == CAPSTONE_ANNOTATION_REV_TRANSFERRED) {
+        // capability type: linear; post-return revoke: no
+        // TODO: regions[region_id] should be added to a free list
+    }
+    else {
+        return -1;
+    }
+
+    if (annotation_perm == CAPSTONE_ANNOTATION_PERM_IN) {
+        r = __tighten(r, 4);
+    }
+    else if (annotation_perm == CAPSTONE_ANNOTATION_PERM_INOUT) {
+        r = __tighten(r, 6);
+    }
+    else if (annotation_perm == CAPSTONE_ANNOTATION_PERM_OUT) {
+        r = __tighten(r, 2);
+    }
+    else if (annotation_perm == CAPSTONE_ANNOTATION_PERM_EXE) {
+        r = __tighten(r, 1);
+    }
+    else if (annotation_perm == CAPSTONE_ANNOTATION_PERM_FULL) {
+        r = __tighten(r, 7);
+    }
+    else {
+        return -1;
+    }
+
+    d = __domcallsaves(d, CAPSTONE_DPI_REGION_SHARE, regions[region_id]);
+    domains[dom_id] = d;
+
+    return 0;
+}
+
 static unsigned share_region(unsigned dom_id, unsigned region_id) {
     if(dom_id >= dom_n || region_id >= region_n) {
         return -1;
@@ -175,6 +232,19 @@ static unsigned share_region(unsigned dom_id, unsigned region_id) {
     d = __domcallsaves(d, CAPSTONE_DPI_REGION_SHARE, regions[region_id]);
     domains[dom_id] = d;
     
+    return 0;
+}
+
+static unsigned revoke_region(unsigned region_id) {
+    if(region_id >= region_n) {
+        return -1;
+    }
+    
+    __rev void *rev = regions[region_id];
+    void *r = __revoke(rev);
+
+    regions[region_id] = r;
+
     return 0;
 }
 
