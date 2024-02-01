@@ -21,14 +21,18 @@
 #define capstone_error(err_code) do { C_PRINT(CAPSTONE_ERR_STARTER); C_PRINT(err_code); while(1); } while(0)
 #define cap_base(cap) __capfield((cap), 3)
 #define cap_end(cap) __capfield((cap), 4)
+#define cap_type(cap) __capfield((cap), 1)
+
+#define __mrev_hack(cap) cap
+#define __revoke__hack(cap) cap
 
 
 // FIXME: swapping cmmu is currently very slow
 // toggle the following for swapping between cmmu swapping and gen_cap (hack)
 // #define USE_GEN_CAP
 
-unsigned *mtime;
-unsigned *mtimecmp;
+unsigned mtime;
+unsigned mtimecmp;
 
 __dom void* domains[CAPSTONE_MAX_DOM_N];
 void* regions[CAPSTONE_MAX_REGION_N];
@@ -189,23 +193,30 @@ static unsigned shared_region_annotated(unsigned dom_id, unsigned region_id, uns
 
     if (annotation_rev == CAPSTONE_ANNOTATION_REV_DEFAULT) {
         // capability type: non-linear; post-return revoke: yes
-        __rev void *rev = __mrev(r);
+        __rev void *rev = __mrev_hack(r);
         regions[region_id] = rev;
         r = __delin(r);
     }
     else if (annotation_rev == CAPSTONE_ANNOTATION_REV_BORROWED) {
         // capability type: linear; post-return revoke: yes
-        __rev void *rev = __mrev(r);
+        C_PRINT(0xdadada11);
+        __rev void *rev = __mrev_hack(r);
         regions[region_id] = rev;
     }
     else if (annotation_rev == CAPSTONE_ANNOTATION_REV_SHARED) {
         // capability type: non-linear; post-return revoke: no
-        r = __delin(r);
-        regions[region_id] = r;
+        if (cap_type(r) == 0) {
+            r = __delin(r);
+            regions[region_id] = r;
+        }
     }
     else if (annotation_rev == CAPSTONE_ANNOTATION_REV_TRANSFERRED) {
         // capability type: linear; post-return revoke: no
         // TODO: regions[region_id] should be added to a free list
+        if (cap_type(r) != 0) {
+            C_PRINT(0xdeadbeef);
+            while(1);
+        }
     }
     else {
         return -1;
@@ -254,7 +265,7 @@ static unsigned revoke_region(unsigned region_id) {
     }
     
     __rev void *rev = regions[region_id];
-    void *r = __revoke(rev);
+    void *r = __revoke__hack(rev);
 
     regions[region_id] = r;
 
@@ -372,7 +383,7 @@ unsigned handle_trap_ecall(unsigned arg0, unsigned arg1,
         case SBI_EXT_TIME:
             if (func_code == SBI_EXT_TIME_SET_TIMER) {
                 __asm__ volatile ("csrc mip, %0" :: "r"(MIP_STIP | MIP_MTIP));
-                *mtimecmp = arg0;
+                mtimecmp = arg0;
                 __asm__ volatile ("csrs mie, %0" :: "r"(MIP_MTIP));
             } else {
                 err = 1;
