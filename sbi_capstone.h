@@ -45,6 +45,13 @@
 #define CAPSTONE_NO_REGION          0x1
 #define CAPSTONE_NO_CMMU_REGION     0x2
 
+/* Capstone debugging counters */
+#define DEBUG_COUNTER_SWITCH_U  0
+#define DEBUG_COUNTER_SWITCH_S  1
+#define DEBUG_COUNTER_SWITCH_C  2
+#define DEBUG_COUNTER_H_INT     3
+#define DEBUG_COUNTER_CMMU_SWAP 4
+
 /* Capstone SBI */
 
 #define SBI_EXT_CAPSTONE 0x12345678

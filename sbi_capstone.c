@@ -22,6 +22,8 @@
 #define cap_base(cap) __capfield((cap), 3)
 #define cap_end(cap) __capfield((cap), 4)
 #define cap_type(cap) __capfield((cap), 1)
+#define debug_counter_inc(counter_no, delta) __asm__ volatile(".insn r 0x5b, 0x1, 0x45, x0, %0, %1" :: "r"(counter_no), "r"(delta))
+#define debug_counter_tick(counter_no) debug_counter_inc((counter_no), 1)
 
 #define __mrev_hack(cap) cap
 #define __revoke__hack(cap) cap
@@ -153,6 +155,8 @@ static unsigned call_domain(unsigned dom_id) {
     if(dom_id >= dom_n) {
         return -1;
     }
+
+    debug_counter_tick(DEBUG_COUNTER_SWITCH_S);
     
     unsigned res;
     __dom void *d = domains[dom_id];
@@ -164,6 +168,8 @@ static unsigned call_domain(unsigned dom_id) {
 
 
 static unsigned call_domain_with_cap(unsigned dom_id, unsigned base, unsigned len, unsigned cursor) {
+    debug_counter_tick(DEBUG_COUNTER_SWITCH_S);
+
     void *region = split_out_cap(base, len, 1);
     __asm__ ("scc(%0, %1, %2)" : "=r"(region) : "r"(region), "r"(cursor));
 
@@ -241,6 +247,7 @@ static unsigned shared_region_annotated(unsigned dom_id, unsigned region_id, uns
         return -1;
     }
 
+    debug_counter_tick(DEBUG_COUNTER_SWITCH_S);
     d = __domcallsaves(d, CAPSTONE_DPI_REGION_SHARE, r);
     domains[dom_id] = d;
 
@@ -251,6 +258,8 @@ static unsigned share_region(unsigned dom_id, unsigned region_id) {
     if(dom_id >= dom_n || region_id >= region_n) {
         return -1;
     }
+
+    debug_counter_tick(DEBUG_COUNTER_SWITCH_S);
 
     __dom void *d = domains[dom_id];
     d = __domcallsaves(d, CAPSTONE_DPI_REGION_SHARE, regions[region_id]);
@@ -294,6 +303,8 @@ static unsigned region_de_linear(unsigned region_id) {
 }
 
 static void return_from_domain(unsigned retval) {
+    debug_counter_tick(DEBUG_COUNTER_SWITCH_S);
+
     *caller_buf = retval;
     __domreturnsaves(caller_dom, DOM_REENTRY_POINT, 0);
 }
@@ -478,6 +489,7 @@ void handle_exception(unsigned cause) {
         case CAUSE_STORE_ACCESS:
         case CAUSE_FETCH_ACCESS:
             C_READ_CSR(mtval, badaddr);
+            debug_counter_tick(DEBUG_COUNTER_CMMU_SWAP);
             swap_cmmu(badaddr);
             break;
         default:
