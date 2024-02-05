@@ -23,10 +23,6 @@
 #define cap_end(cap) __capfield((cap), 4)
 #define cap_type(cap) __capfield((cap), 1)
 
-#define __mrev_hack(cap) cap
-#define __revoke__hack(cap) cap
-
-
 // FIXME: swapping cmmu is currently very slow
 // toggle the following for swapping between cmmu swapping and gen_cap (hack)
 // #define USE_GEN_CAP
@@ -193,14 +189,13 @@ static unsigned shared_region_annotated(unsigned dom_id, unsigned region_id, uns
 
     if (annotation_rev == CAPSTONE_ANNOTATION_REV_DEFAULT) {
         // capability type: non-linear; post-return revoke: yes
-        __rev void *rev = __mrev_hack(r);
+        __rev void *rev = __mrev(r);
         regions[region_id] = rev;
         r = __delin(r);
     }
     else if (annotation_rev == CAPSTONE_ANNOTATION_REV_BORROWED) {
         // capability type: linear; post-return revoke: yes
-        C_PRINT(0xdadada11);
-        __rev void *rev = __mrev_hack(r);
+        __rev void *rev = __mrev(r);
         regions[region_id] = rev;
     }
     else if (annotation_rev == CAPSTONE_ANNOTATION_REV_SHARED) {
@@ -265,7 +260,7 @@ static unsigned revoke_region(unsigned region_id) {
     }
     
     __rev void *rev = regions[region_id];
-    void *r = __revoke__hack(rev);
+    void *r = __revoke(rev);
 
     regions[region_id] = r;
 
