@@ -7,9 +7,10 @@
 
 #define CCSR_CTVEC    0
 #define CCSR_CIH    1
-#define CCSR_CEPC  2
-#define CCSR_CMMU    3
+#define CCSR_CEPC   2
 #define CCSR_CSCRATCH   4
+#define CCSR_CPMP(ind)  0x10 + ind
+
 
 #define CAPENTER(rs1, rs2) .insn r 0x5b, 0x1, 0xd, x0, rs1, rs2
 #define SETCAPMEM(reg) .insn r 0x5b, 0x1, 0x41, x0, reg, x0
@@ -43,14 +44,14 @@
 #define CAPSTONE_ERR_STARTER        0xdeadbeef
 #define CAPSTONE_UNKNOWN_EXCP       0x0
 #define CAPSTONE_NO_REGION          0x1
-#define CAPSTONE_NO_CMMU_REGION     0x2
+#define CAPSTONE_NO_CPMP_REGION     0x2
 
 /* Capstone debugging counters */
 #define DEBUG_COUNTER_SWITCH_U  0
 #define DEBUG_COUNTER_SWITCH_S  1
 #define DEBUG_COUNTER_SWITCH_C  2
 #define DEBUG_COUNTER_H_INT     3
-#define DEBUG_COUNTER_CMMU_SWAP 4
+#define DEBUG_COUNTER_CPMP_SWAP 4
 
 /* Capstone SBI */
 
