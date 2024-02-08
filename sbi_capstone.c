@@ -25,17 +25,24 @@
 #define debug_counter_inc(counter_no, delta) __asm__ volatile(".insn r 0x5b, 0x1, 0x45, x0, %0, %1" :: "r"(counter_no), "r"(delta))
 #define debug_counter_tick(counter_no) debug_counter_inc((counter_no), 1)
 
-// FIXME: swapping cmmu is currently very slow
-// toggle the following for swapping between cmmu swapping and gen_cap (hack)
+#define CPMP_COUNT 16
+#define DOMAIN_DATA_N    96
+#define DOMAIN_DATA_SIZE (16 * DOMAIN_DATA_N)
+
+// toggle the following for swapping between cpmp swapping and gen_cap (hack)
 // #define USE_GEN_CAP
 
 unsigned mtime;
 unsigned mtimecmp;
 
-__dom void* domains[CAPSTONE_MAX_DOM_N];
-void* regions[CAPSTONE_MAX_REGION_N];
+__dom void *domains[CAPSTONE_MAX_DOM_N];
+void *regions[CAPSTONE_MAX_REGION_N];
+/* the cpmp entry each region is associated with; -1 if unassociated */
+unsigned region_cpmp[CAPSTONE_MAX_REGION_N];
+/* the region each cpmp entry is associated with; -1 if unassociated */
+unsigned cpmp_region[CPMP_COUNT];
 unsigned dom_n, region_n;
-unsigned cmmu_region_id; /* the ID of the region currently in cmmu */
+unsigned next_eject_cpmp;
 
 __domret void *caller_dom;
 unsigned* caller_buf;
@@ -45,27 +52,169 @@ unsigned smode_initialised;
 /* saved context of S-mode at the last SBI dom-return call */
 unsigned *smode_saved_context;
 
+static __linear void *read_cpmp(unsigned n) {
+    __linear void *res;
+    switch(n) {
+        case 0:
+            C_READ_CCSR(cpmp(0), res);
+            break;
+        case 1:                                                                                                                                          
+            C_READ_CCSR(cpmp(1), res);                                                                                                              
+            break;                                                                                                                                       
+        case 2:                                                                                                                                          
+            C_READ_CCSR(cpmp(2), res);                                                                                                              
+            break;                                                                                                                                       
+        case 3:                                                                                                                                          
+            C_READ_CCSR(cpmp(3), res);                                                                                                              
+            break;      
+        case 4:
+            C_READ_CCSR(cpmp(4), res);
+            break;
+        case 5:
+            C_READ_CCSR(cpmp(5), res);
+            break;
+        case 6:
+            C_READ_CCSR(cpmp(6), res);
+            break;
+        case 7:
+            C_READ_CCSR(cpmp(7), res);
+            break;
+        case 8:
+            C_READ_CCSR(cpmp(8), res);
+            break;
+        case 9:
+            C_READ_CCSR(cpmp(9), res);
+            break;
+        case 10:
+            C_READ_CCSR(cpmp(10), res);
+            break;
+        case 11:
+            C_READ_CCSR(cpmp(11), res);
+            break;
+        case 12:
+            C_READ_CCSR(cpmp(12), res);
+            break;
+        case 13:
+            C_READ_CCSR(cpmp(13), res);
+            break;
+        case 14:
+            C_READ_CCSR(cpmp(14), res);
+            break;
+        case 15:
+            C_READ_CCSR(cpmp(15), res);
+            break;
+        default:;
+    }
+    return res;
+}
+
+static void write_cpmp(unsigned n, __linear void *v) {
+    switch(n) {
+        case 0:
+            C_WRITE_CCSR(cpmp(0), v);
+            break;
+        case 1:                                                                                                                                          
+            C_WRITE_CCSR(cpmp(1), v);                                                                                                              
+            break;                                                                                                                                       
+        case 2:                                                                                                                                          
+            C_WRITE_CCSR(cpmp(2), v);                                                                                                              
+            break;                                                                                                                                       
+        case 3:                                                                                                                                          
+            C_WRITE_CCSR(cpmp(3), v);                                                                                                              
+            break;      
+        case 4:
+            C_WRITE_CCSR(cpmp(4), v);
+            break;
+        case 5:
+            C_WRITE_CCSR(cpmp(5), v);
+            break;
+        case 6:
+            C_WRITE_CCSR(cpmp(6), v);
+            break;
+        case 7:
+            C_WRITE_CCSR(cpmp(7), v);
+            break;
+        case 8:
+            C_WRITE_CCSR(cpmp(8), v);
+            break;
+        case 9:
+            C_WRITE_CCSR(cpmp(9), v);
+            break;
+        case 10:
+            C_WRITE_CCSR(cpmp(10), v);
+            break;
+        case 11:
+            C_WRITE_CCSR(cpmp(11), v);
+            break;
+        case 12:
+            C_WRITE_CCSR(cpmp(12), v);
+            break;
+        case 13:
+            C_WRITE_CCSR(cpmp(13), v);
+            break;
+        case 14:
+            C_WRITE_CCSR(cpmp(14), v);
+            break;
+        case 15:
+            C_WRITE_CCSR(cpmp(15), v);
+            break;
+        default:;
+    }
+}
+
+static void print_regions(void) {
+    int region_id;
+    void *tmp;
+    for(region_id = 0; region_id < region_n; region_id += 1) {
+        if(region_cpmp[region_id] != -1) {
+            C_PRINT(1);
+            tmp = read_cpmp(region_cpmp[region_id]);
+            C_PRINT(tmp);
+            write_cpmp(region_cpmp[region_id], tmp);
+        } else {
+            C_PRINT(0);
+            tmp = regions[region_id];
+            C_PRINT(tmp);
+            regions[region_id] = tmp;
+        }
+    }
+}
+
+static void print_cpmps(void) {
+    int cpmp_id;
+    void *tmp;
+    for(cpmp_id = 0; cpmp_id < CPMP_COUNT; cpmp_id += 1) {
+        if(cpmp_region[cpmp_id] != -1) {
+            C_PRINT(cpmp_id);
+            tmp = read_cpmp(cpmp_id);
+            C_PRINT(tmp);
+            write_cpmp(cpmp_id, tmp);
+        }
+    }
+}
+
 static void *split_out_cap(unsigned base, unsigned len, unsigned linear) {
-    void *region;
+    __linear void *region;
 
 #ifdef USE_GEN_CAP
     C_GEN_CAP(region, base, base + len);
 #else
-    void *mem_l, *mem_r;
+    __linear void *mem_l;
+    __linear void *mem_r;
     unsigned i;
     unsigned region_base, region_end;
 
     for(i = 0; i < region_n; i += 1) {
-        if(i == cmmu_region_id)
-            C_READ_CCSR(cmmu, mem_l);
+        if(region_cpmp[i] != -1)
+            mem_l = read_cpmp(region_cpmp[i]);
         else
             mem_l = regions[i];
         region_base = cap_base(mem_l);
         region_end = cap_end(mem_l);
         if(base >= region_base && base + len <= region_end)
             break;
-        if(i == cmmu_region_id)
-            C_WRITE_CCSR(cmmu, mem_l);
+        if(region_cpmp[i] != -1)
+            write_cpmp(region_cpmp[i], mem_l);
         else
             regions[i] = mem_l;
     }
@@ -81,15 +230,19 @@ static void *split_out_cap(unsigned base, unsigned len, unsigned linear) {
     mem_r = __split(region, base + len);
 
     if(base == region_base) {
-        regions[i] = mem_r;
+        if(region_cpmp[i] != -1)
+            write_cpmp(region_cpmp[i], mem_r);
+        else
+            regions[i] = mem_r;
     } else {
-        if(i == cmmu_region_id)
-            C_WRITE_CCSR(cmmu, mem_l);
+        if(region_cpmp[i] != -1)
+            write_cpmp(region_cpmp[i], mem_l);
         else
             regions[i] = mem_l;
 
         regions[region_n] = mem_r;
         region_n += 1;
+        /* we load regions into cpmp lazily*/
    }
 #endif
 
@@ -122,10 +275,10 @@ static unsigned create_domain(unsigned base_addr, unsigned code_size,
     dom_code = split_out_cap(base_addr, tot_size, 1);
 
     dom_seal = __split(dom_code, base_addr + code_size);
-    dom_data = __split(dom_seal, base_addr + code_size + (16 * 64));
+    dom_data = __split(dom_seal, base_addr + code_size + DOMAIN_DATA_SIZE);
 
     int i;
-    for(i = 0; i < 64; i += 1) {
+    for(i = 0; i < DOMAIN_DATA_N; i += 1) {
         dom_seal[i] = 0;
     }
 
@@ -277,8 +430,8 @@ static unsigned revoke_region(unsigned region_id) {
 }
 
 static unsigned pop_region(unsigned pop_num) {
-    if (pop_num > region_n) {
-        return -1;
+	if (pop_num > region_n) {
+		return -1;
     }
 
     region_n -= pop_num;
@@ -309,9 +462,9 @@ static unsigned query_region(unsigned region_id, unsigned field) {
         return -1;
     }
 
-    void *region;
-    if(region_id == cmmu_region_id) {
-        C_READ_CCSR(cmmu, region);
+    __linear void *region;
+    if(region_cpmp[region_id] != -1) {
+        region = read_cpmp(region_cpmp[region_id]);
     } else {
         region = regions[region_id];
     }
@@ -331,8 +484,8 @@ static unsigned query_region(unsigned region_id, unsigned field) {
             res = -1;
     }
 
-    if(region_id == cmmu_region_id) {
-        C_WRITE_CCSR(cmmu, region);
+    if(region_cpmp[region_id] != -1) {
+        write_cpmp(region_cpmp[region_id], region);
     } else {
         regions[region_id] = region;
     }
@@ -419,7 +572,6 @@ unsigned handle_trap_ecall(unsigned arg0, unsigned arg1,
                     res = query_region(arg0, arg1);
                     break;
                 case SBI_EXT_CAPSTONE_DOM_SCHEDULE:
-                    // TODO: implement dom-schedule
                     res = schedule_domain(arg0);
                     break;
                 case SBI_EXT_CAPSTONE_REGION_COUNT:
@@ -456,25 +608,47 @@ void handle_interrupt(unsigned int_code) {
     }
 }
 
-static void swap_cmmu(unsigned badaddr) {
-    unsigned i, start_addr, end_addr;
-    void *tmp;
-    for(i = 0; i < region_n; i += 1) {
-        if(i == cmmu_region_id)
+static void swap_cpmp(unsigned badaddr) {
+    unsigned region_id, cpmp_id, start_addr, end_addr;
+    unsigned ejected_region_id;
+    __linear void *tmp;
+    for(region_id = 0; region_id < region_n; region_id += 1) {
+        if(region_cpmp[region_id] != -1) // already loaded
             continue;
-        start_addr = cap_base(regions[i]);
-        end_addr = cap_end(regions[i]);
+        start_addr = cap_base(regions[region_id]);
+        end_addr = cap_end(regions[region_id]);
         if(start_addr <= badaddr && badaddr < end_addr)
             break;
     }
-    if(i >= region_n) {
-        capstone_error(CAPSTONE_NO_CMMU_REGION);
+    if(region_id >= region_n) {
+        C_PRINT(badaddr);
+        C_PRINT(region_n);
+        print_regions();
+        print_cpmps();
+        capstone_error(CAPSTONE_NO_CPMP_REGION);
     }
-    C_READ_CCSR(cmmu, tmp);
-    regions[cmmu_region_id] = tmp;
-    tmp = regions[i];
-    C_WRITE_CCSR(cmmu, tmp);
-    cmmu_region_id = i;
+
+    // check if there is free cpmp entry
+    for(cpmp_id = 0; cpmp_id < CPMP_COUNT; cpmp_id += 1) {
+        if(cpmp_region[cpmp_id] == -1)
+            break;
+    }
+    if(cpmp_id >= CPMP_COUNT) {
+        // no free cpmp entry, round robin to eject
+        tmp = read_cpmp(next_eject_cpmp);
+        ejected_region_id = cpmp_region[next_eject_cpmp];
+        regions[ejected_region_id] = tmp;
+        region_cpmp[ejected_region_id] = -1;
+
+        cpmp_id = next_eject_cpmp;
+        next_eject_cpmp = (next_eject_cpmp + 1) & 0xf;
+    }
+
+    // free cpmp entry, directly use it
+    cpmp_region[cpmp_id] = region_id;
+    region_cpmp[region_id] = cpmp_id;
+    tmp = regions[region_id];
+    write_cpmp(cpmp_id, tmp);
 }
 
 void handle_exception(unsigned cause) {
@@ -484,8 +658,8 @@ void handle_exception(unsigned cause) {
         case CAUSE_STORE_ACCESS:
         case CAUSE_FETCH_ACCESS:
             C_READ_CSR(mtval, badaddr);
-            debug_counter_tick(DEBUG_COUNTER_CMMU_SWAP);
-            swap_cmmu(badaddr);
+            debug_counter_tick(DEBUG_COUNTER_CPMP_SWAP);
+            swap_cpmp(badaddr);
             break;
         default:
             capstone_error(CAPSTONE_UNKNOWN_EXCP);
