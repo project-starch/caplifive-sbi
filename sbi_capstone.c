@@ -345,24 +345,49 @@ static unsigned shared_region_annotated(unsigned dom_id, unsigned region_id, uns
     }
 
     __dom void *d = domains[dom_id];
-    __linear void *r = regions[region_id];
+
+    __linear void *r;
+    if (region_cpmp[region_id] != -1) {
+        r = read_cpmp(region_cpmp[region_id]);
+    }
+    else {
+        r = regions[region_id];
+    }
 
     if (annotation_rev == CAPSTONE_ANNOTATION_REV_DEFAULT) {
         // capability type: non-linear; post-return revoke: yes
         __rev void *rev = __mrev(r);
-        regions[region_id] = rev;
+
+        if (region_cpmp[region_id] != -1) {
+            write_cpmp(region_cpmp[region_id], rev);
+        }
+        else {
+            regions[region_id] = rev;
+        }
         r = __delin(r);
     }
     else if (annotation_rev == CAPSTONE_ANNOTATION_REV_BORROWED) {
         // capability type: linear; post-return revoke: yes
         __rev void *rev = __mrev(r);
-        regions[region_id] = rev;
+
+        if (region_cpmp[region_id] != -1) {
+            write_cpmp(region_cpmp[region_id], rev);
+        }
+        else {
+            regions[region_id] = rev;
+        }
     }
     else if (annotation_rev == CAPSTONE_ANNOTATION_REV_SHARED) {
         // capability type: non-linear; post-return revoke: no
         if (cap_type(r) == 0) {
             r = __delin(r);
-            regions[region_id] = r;
+
+            if (region_cpmp[region_id] != -1) {
+                write_cpmp(region_cpmp[region_id], r);
+            }
+            else {
+                regions[region_id] = r;
+            }
         }
     }
     else if (annotation_rev == CAPSTONE_ANNOTATION_REV_TRANSFERRED) {
@@ -371,6 +396,10 @@ static unsigned shared_region_annotated(unsigned dom_id, unsigned region_id, uns
         if (cap_type(r) != 0) {
             C_PRINT(0xdeadbeef);
             while(1);
+        }
+
+        if (region_cpmp[region_id] != -1) {
+            cpmp_region[region_cpmp[region_id]] = -1;
         }
     }
     else {
@@ -403,6 +432,7 @@ static unsigned shared_region_annotated(unsigned dom_id, unsigned region_id, uns
     return 0;
 }
 
+// This function has been deprecated, use shared_region_annotated instead
 static unsigned share_region(unsigned dom_id, unsigned region_id) {
     if(dom_id >= dom_n || region_id >= region_n) {
         return -1;
@@ -411,7 +441,14 @@ static unsigned share_region(unsigned dom_id, unsigned region_id) {
     debug_counter_tick(DEBUG_COUNTER_SWITCH_S);
 
     __dom void *d = domains[dom_id];
-    d = __domcallsaves(d, CAPSTONE_DPI_REGION_SHARE, regions[region_id]);
+
+    if (region_cpmp[region_id] != -1) {
+        d = __domcallsaves(d, CAPSTONE_DPI_REGION_SHARE, read_cpmp(region_cpmp[region_id]));
+    }
+    else {
+        d = __domcallsaves(d, CAPSTONE_DPI_REGION_SHARE, regions[region_id]);
+    }
+
     domains[dom_id] = d;
     
     return 0;
@@ -421,11 +458,17 @@ static unsigned revoke_region(unsigned region_id) {
     if(region_id >= region_n) {
         return -1;
     }
-    
-    __rev void *rev = regions[region_id];
-    void *r = __revoke(rev);
 
-    regions[region_id] = r;
+    if (region_cpmp[region_id] != -1) {
+        __rev void *rev = read_cpmp(region_cpmp[region_id]);
+        void *r = __revoke(rev);
+        write_cpmp(region_cpmp[region_id], r);
+    }
+    else {
+        __rev void *rev = regions[region_id];
+        void *r = __revoke(rev);
+        regions[region_id] = r;
+    }
 
     return 0;
 }
@@ -433,6 +476,15 @@ static unsigned revoke_region(unsigned region_id) {
 static unsigned pop_region(unsigned pop_num) {
 	if (pop_num > region_n) {
 		return -1;
+    }
+
+    unsigned i;
+    for(i = 0; i < pop_num; i += 1) {
+        unsigned region_i = region_n - i - 1;
+        if (region_cpmp[region_i] != -1) {
+            cpmp_region[region_cpmp[region_i]] = -1;
+            region_cpmp[region_i] = -1;
+        }
     }
 
     region_n -= pop_num;
@@ -445,8 +497,15 @@ static unsigned region_de_linear(unsigned region_id) {
         return -1;
     }
 
-    __linear void *r = regions[region_id];
-    regions[region_id] = __delin(r);
+    if (region_cpmp[region_id] != -1) {
+        __linear void *r = read_cpmp(region_cpmp[region_id]);
+        void *r_delin = __delin(r);
+        write_cpmp(region_cpmp[region_id], r_delin);
+    }
+    else {
+        __linear void *r = regions[region_id];
+        regions[region_id] = __delin(r);
+    }
 
     return 0;
 }
