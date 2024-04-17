@@ -104,7 +104,10 @@ static __linear void *read_cpmp(unsigned n) {
         case 15:
             C_READ_CCSR(cpmp(15), res);
             break;
-        default:;
+        default:
+            C_PRINT(0x8888888);
+            C_PRINT(n);
+            while(1);
     }
     return res;
 }
@@ -159,7 +162,10 @@ static void write_cpmp(unsigned n, __linear void *v) {
         case 15:
             C_WRITE_CCSR(cpmp(15), v);
             break;
-        default:;
+        default:
+            C_PRINT(0x9999999);
+            C_PRINT(n);
+            while(1);
     }
 }
 
@@ -168,12 +174,12 @@ static void print_regions(void) {
     void *tmp;
     for(region_id = 0; region_id < region_n; region_id += 1) {
         if(region_cpmp[region_id] != -1) {
-            C_PRINT(1);
+            C_PRINT(region_cpmp[region_id]);
             tmp = read_cpmp(region_cpmp[region_id]);
             C_PRINT(tmp);
             write_cpmp(region_cpmp[region_id], tmp);
         } else {
-            C_PRINT(0);
+            C_PRINT(-1);
             tmp = regions[region_id];
             C_PRINT(tmp);
             regions[region_id] = tmp;
@@ -228,23 +234,36 @@ static void *split_out_cap(unsigned base, unsigned len, unsigned linear) {
     else
         region = __split(mem_l, base);
 
-    mem_r = __split(region, base + len);
-
-    if(base == region_base) {
-        if(region_cpmp[i] != -1)
-            write_cpmp(region_cpmp[i], mem_r);
-        else
-            regions[i] = mem_r;
+    if (base + len == region_end) {
+        if(base == region_base) {
+            // matching region. We don't support this for now
+            C_PRINT(0x1234);
+            while(1);
+        } else {
+            if(region_cpmp[i] != -1)
+                write_cpmp(region_cpmp[i], mem_l);
+            else
+                regions[i] = mem_l;
+        }
     } else {
-        if(region_cpmp[i] != -1)
-            write_cpmp(region_cpmp[i], mem_l);
-        else
-            regions[i] = mem_l;
+        mem_r = __split(region, base + len);
 
-        regions[region_n] = mem_r;
-        region_n += 1;
-        /* we load regions into cpmp lazily*/
-   }
+        if(base == region_base) {
+            if(region_cpmp[i] != -1)
+                write_cpmp(region_cpmp[i], mem_r);
+            else
+                regions[i] = mem_r;
+        } else {
+            if(region_cpmp[i] != -1)
+                write_cpmp(region_cpmp[i], mem_l);
+            else
+                regions[i] = mem_l;
+
+            regions[region_n] = mem_r;
+            region_n += 1;
+            /* we load regions into cpmp lazily*/
+        }
+    }
 #endif
 
     __linear void *region_linear;
