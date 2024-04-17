@@ -400,6 +400,7 @@ static unsigned shared_region_annotated(unsigned dom_id, unsigned region_id, uns
 
         if (region_cpmp[region_id] != -1) {
             cpmp_region[region_cpmp[region_id]] = -1;
+            region_cpmp[region_id] = -1;
         }
     }
     else {
@@ -483,8 +484,9 @@ static unsigned pop_region(unsigned pop_num) {
         unsigned region_i = region_n - i - 1;
         if (region_cpmp[region_i] != -1) {
             cpmp_region[region_cpmp[region_i]] = -1;
-            region_cpmp[region_i] = -1;
         }
+
+        region_cpmp[region_i] = -1;
     }
 
     region_n -= pop_num;
