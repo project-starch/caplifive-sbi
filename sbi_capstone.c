@@ -324,12 +324,6 @@ static unsigned call_domain(unsigned dom_id) {
     if(dom_id >= dom_n) {
         return -1;
     }
-
-
-    debug_counter_tick(DEBUG_COUNTER_SWITCH_S);
-    
-    
-    debug_counter_tick(DEBUG_COUNTER_SWITCH_S);
     
     unsigned res;
     __dom void *d = domains[dom_id];
