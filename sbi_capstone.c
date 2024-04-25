@@ -325,6 +325,10 @@ static unsigned call_domain(unsigned dom_id) {
         return -1;
     }
 
+
+    debug_counter_tick(DEBUG_COUNTER_SWITCH_S);
+    
+    
     debug_counter_tick(DEBUG_COUNTER_SWITCH_S);
     
     unsigned res;
@@ -337,8 +341,6 @@ static unsigned call_domain(unsigned dom_id) {
 
 
 static unsigned call_domain_with_cap(unsigned dom_id, unsigned base, unsigned len, unsigned cursor) {
-    debug_counter_tick(DEBUG_COUNTER_SWITCH_S);
-
     void *region = split_out_cap(base, len, 1);
     __asm__ ("scc(%0, %1, %2)" : "=r"(region) : "r"(region), "r"(cursor));
 
@@ -445,7 +447,6 @@ static unsigned shared_region_annotated(unsigned dom_id, unsigned region_id, uns
         return -1;
     }
 
-    debug_counter_tick(DEBUG_COUNTER_SWITCH_S);
     d = __domcallsaves(d, CAPSTONE_DPI_REGION_SHARE, r);
     domains[dom_id] = d;
 
@@ -457,8 +458,6 @@ static unsigned share_region(unsigned dom_id, unsigned region_id) {
     if(dom_id >= dom_n || region_id >= region_n) {
         return -1;
     }
-
-    debug_counter_tick(DEBUG_COUNTER_SWITCH_S);
 
     __dom void *d = domains[dom_id];
 
