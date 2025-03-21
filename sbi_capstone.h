@@ -10,6 +10,8 @@
 #define CCSR_CEPC   2
 #define CCSR_CSCRATCH   4
 #define CCSR_CPMP(ind)  0x10 + ind
+#define CCSR_CATP  5
+#define CCSR_CDC   6
 
 
 #define CAPENTER(rs1, rs2) .insn r 0x5b, 0x1, 0xd, x0, rs1, rs2
@@ -24,18 +26,20 @@
 #define CCSRRW(rd, ccsr, rs1) .insn i 0x5b, 0x7, rd, ccsr(rs1)
 #define SCC(rd, rs1, rs2) .insn r 0x5b, 0x1, 0x5, rd, rs1, rs2
 #define LCC(rd, rs, imm) .insn r 0x5b, 0x1, 0x4, rd, rs, x##imm
-#define MOVC(rd, rs) .insn r 0x5b, 0x1, 0xa, rd, rs, x0 
+#define MOVC(rd, rs) .insn r 0x5b, 0x1, 0xa, rd, rs, x0
 #define CALL(rd, rs1) .insn r 0x5b, 0x1, 0x20, rd, rs1, x0
 #define RETURN(rd, rs1, rs2) .insn r 0x5b, 0x1, 0x21, rd, rs1, rs2
 #define CINCOFFSETIMM(rd, rs1, imm) .insn i 0x5b, 0x2, rd, imm(rs1)
 #define CINCOFFSET(rd, rs1, rs2) .insn r 0x5b, 0x1, 0xc, rd, rs1, rs2
 #define DELIN(rd)     .insn r 0x5b, 0x1, 0x3, rd, x0, x0
 #define SPLIT(rd, rs1, rs2) .insn r 0x5b, 0x1, 0x6, rd, rs1, rs2
+#define SHRINK(rd, rs1, rs2) .insn r 0x5b, 0x1, 0x1, rd, rs1, rs2
 
 #define CSR_CIS          0x800
 #define CSR_CID			 0x801
 #define CSR_CIC          0x802
-#define CSR_OFFSETMMU	 0x803
+#define CSR_OFFSETMMU	 0x803 /* TODO: OUTDATED */
+#define CSR_CDCB		 0x803
 
 
 #define CAPSTONE_MAX_DOM_N   64
@@ -63,7 +67,7 @@
 #define SBI_EXT_CAPSTONE_REGION_CREATE   0x3
 #define SBI_EXT_CAPSTONE_REGION_SHARE    0x4
 /* exit from S mode and return to caller domain */
-#define SBI_EXT_CAPSTONE_DOM_RETURN      0x5 
+#define SBI_EXT_CAPSTONE_DOM_RETURN      0x5
 #define SBI_EXT_CAPSTONE_REGION_QUERY    0x6
 #define SBI_EXT_CAPSTONE_DOM_SCHEDULE    0x7
 #define SBI_EXT_CAPSTONE_REGION_COUNT    0x8
