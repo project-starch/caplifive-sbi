@@ -268,9 +268,9 @@ static void *split_out_cap(unsigned base, unsigned len, unsigned linear) {
 
     __linear void *region_linear;
     unsigned ty = __capfield(region, 1);
-    if(linear && ty != 0) {
+    if(linear && ty != 1) {
         capstone_error(CAPSTONE_NO_REGION);
-    } else if(!linear && ty == 0) {
+    } else if(!linear && ty == 1) {
         region_linear = region;
         region = __delin(region_linear);
     }
@@ -394,7 +394,7 @@ static unsigned shared_region_annotated(unsigned dom_id, unsigned region_id, uns
     }
     else if (annotation_rev == CAPSTONE_ANNOTATION_REV_SHARED) {
         // capability type: non-linear; post-return revoke: no
-        if (cap_type(r) == 0) {
+        if (cap_type(r) == 1) {
             r = __delin(r);
 
             if (region_cpmp[region_id] != -1) {
@@ -408,7 +408,7 @@ static unsigned shared_region_annotated(unsigned dom_id, unsigned region_id, uns
     else if (annotation_rev == CAPSTONE_ANNOTATION_REV_TRANSFERRED) {
         // capability type: linear; post-return revoke: no
         // TODO: regions[region_id] should be added to a free list
-        if (cap_type(r) != 0) {
+        if (cap_type(r) != 1) {
             C_PRINT(0xdeadbeef);
             while(1);
         }
