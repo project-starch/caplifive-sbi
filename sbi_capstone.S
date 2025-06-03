@@ -163,7 +163,7 @@ resume_smode:
     CCSRRW(t0, CCSR_CEPC, x0)
     addi t0, t0, 4
     CCSRRW(x0, CCSR_CEPC, t0)
-    
+
     li a0, 0
     li a1, 0
     CINCOFFSETIMM(sp, sp, -16)
