@@ -16,7 +16,7 @@
 #define C_READ_CCSR(ccsr_name, v) __asm__("ccsrrw(%0, " #ccsr_name ", x0)" : "=r"(v))
 #define C_WRITE_CCSR(ccsr_name, v) __asm__("ccsrrw(x0, " #ccsr_name ", %0)" :: "r"(v))
 #define C_SET_CURSOR(dest, cap, cursor) __asm__("scc(%0, %1, %2)" : "=r"(dest) : "r"(cap), "r"(cursor))
-#define C_PRINT(v) __asm__ volatile(".insn r 0x5b, 0x1, 0x43, x0, %0, x0" :: "r"(v))
+#define C_PRINT(v) __asm__ volatile(".insn r 0x7b, 0x0, 0x9, x0, %0, x0" :: "r"(v))
 #define C_GEN_CAP(dest, base, end) __asm__(".insn r 0x5b, 0x1, 0x40, %0, %1, %2" : "=r"(dest) : "r"(base), "r"(end));
 #define capstone_error(err_code) do { C_PRINT(CAPSTONE_ERR_STARTER); C_PRINT(err_code); while(1); } while(0)
 #define cap_base(cap) __capfield((cap), 3)
@@ -117,15 +117,15 @@ static void write_cpmp(unsigned n, __linear void *v) {
         case 0:
             C_WRITE_CCSR(cpmp(0), v);
             break;
-        case 1:                                                                                                                                          
-            C_WRITE_CCSR(cpmp(1), v);                                                                                                              
-            break;                                                                                                                                       
-        case 2:                                                                                                                                          
-            C_WRITE_CCSR(cpmp(2), v);                                                                                                              
-            break;                                                                                                                                       
-        case 3:                                                                                                                                          
-            C_WRITE_CCSR(cpmp(3), v);                                                                                                              
-            break;      
+        case 1:
+            C_WRITE_CCSR(cpmp(1), v);
+            break;
+        case 2:
+            C_WRITE_CCSR(cpmp(2), v);
+            break;
+        case 3:
+            C_WRITE_CCSR(cpmp(3), v);
+            break;
         case 4:
             C_WRITE_CCSR(cpmp(4), v);
             break;
@@ -267,10 +267,11 @@ static void *split_out_cap(unsigned base, unsigned len, unsigned linear) {
 #endif
 
     __linear void *region_linear;
-    unsigned ty = __capfield(region, 1);
-    if(linear && ty != 1) {
+    unsigned ty = cap_type(region);
+    C_PRINT(ty);
+    if(linear && ty != CAP_TYPE_LINEAR) {
         capstone_error(CAPSTONE_NO_REGION);
-    } else if(!linear && ty == 1) {
+    } else if(!linear && ty == CAP_TYPE_LINEAR) {
         region_linear = region;
         region = __delin(region_linear);
     }
@@ -324,12 +325,12 @@ static unsigned call_domain(unsigned dom_id) {
     if(dom_id >= dom_n) {
         return -1;
     }
-    
+
     unsigned res;
     __dom void *d = domains[dom_id];
     d = __domcallsaves(d, CAPSTONE_DPI_CALL, &res);
     domains[dom_id] = d;
-    
+
     return res;
 }
 
@@ -463,7 +464,7 @@ static unsigned share_region(unsigned dom_id, unsigned region_id) {
     }
 
     domains[dom_id] = d;
-    
+
     return 0;
 }
 
