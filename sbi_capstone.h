@@ -49,8 +49,8 @@
 #define CSR_CDCB		 0x803
 
 
-#define CAPSTONE_MAX_DOM_N   64
-#define CAPSTONE_MAX_REGION_N   64
+#define CAPSTONE_MAX_DOM_N   32
+#define CAPSTONE_MAX_REGION_N   32
 
 #define CAPSTONE_ERR_STARTER        0xdeadbeef
 #define CAPSTONE_UNKNOWN_EXCP       0x0
