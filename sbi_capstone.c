@@ -16,9 +16,8 @@
 #define C_READ_CCSR(ccsr_name, v) __asm__("ccsrrw(%0, " #ccsr_name ", x0)" : "=r"(v))
 #define C_WRITE_CCSR(ccsr_name, v) __asm__("ccsrrw(x0, " #ccsr_name ", %0)" :: "r"(v))
 #define C_SET_CURSOR(dest, cap, cursor) __asm__("scc(%0, %1, %2)" : "=r"(dest) : "r"(cap), "r"(cursor))
-#define C_PRINT(v) __asm__ volatile(".insn r 0x7b, 0x0, 0x9, x0, %0, x0" :: "r"(v))
 #define C_GEN_CAP(dest, base, end) __asm__(".insn r 0x5b, 0x1, 0x40, %0, %1, %2" : "=r"(dest) : "r"(base), "r"(end));
-#define capstone_error(err_code) do { C_PRINT(CAPSTONE_ERR_STARTER); C_PRINT(err_code); while(1); } while(0)
+#define capstone_error(err_code) __asm__ ("ebreak");
 #define cap_base(cap) __capfield((cap), 3)
 #define cap_end(cap) __capfield((cap), 4)
 #define cap_type(cap) __capfield((cap), 1)
@@ -105,9 +104,7 @@ static __linear void *read_cpmp(unsigned n) {
             C_READ_CCSR(cpmp(15), res);
             break;
         default:
-            C_PRINT(0x8888888);
-            C_PRINT(n);
-            while(1);
+            __asm__ ("ebreak");
     }
     return res;
 }
@@ -163,9 +160,7 @@ static void write_cpmp(unsigned n, __linear void *v) {
             C_WRITE_CCSR(cpmp(15), v);
             break;
         default:
-            C_PRINT(0x9999999);
-            C_PRINT(n);
-            while(1);
+            __asm__ ("ebreak");;
     }
 }
 
@@ -174,14 +169,10 @@ static void print_regions(void) {
     void *tmp;
     for(region_id = 0; region_id < region_n; region_id += 1) {
         if(region_cpmp[region_id] != -1) {
-            C_PRINT(region_cpmp[region_id]);
             tmp = read_cpmp(region_cpmp[region_id]);
-            C_PRINT(tmp);
             write_cpmp(region_cpmp[region_id], tmp);
         } else {
-            C_PRINT(-1);
             tmp = regions[region_id];
-            C_PRINT(tmp);
             regions[region_id] = tmp;
         }
     }
@@ -192,9 +183,7 @@ static void print_cpmps(void) {
     void *tmp;
     for(cpmp_id = 0; cpmp_id < CPMP_COUNT; cpmp_id += 1) {
         if(cpmp_region[cpmp_id] != -1) {
-            C_PRINT(cpmp_id);
             tmp = read_cpmp(cpmp_id);
-            C_PRINT(tmp);
             write_cpmp(cpmp_id, tmp);
         }
     }
@@ -226,8 +215,7 @@ static void *split_out_cap(unsigned base, unsigned len, unsigned linear) {
             regions[i] = mem_l;
     }
 
-    if(i >= region_n)
-        capstone_error(CAPSTONE_NO_REGION);
+    if(i >= region_n) __asm__ ("ebreak");
 
     if(base == region_base)
         region = mem_l;
@@ -237,8 +225,7 @@ static void *split_out_cap(unsigned base, unsigned len, unsigned linear) {
     if (base + len == region_end) {
         if(base == region_base) {
             // matching region. We don't support this for now
-            C_PRINT(0x1234);
-            while(1);
+            __asm__ ("ebreak");
         } else {
             if(region_cpmp[i] != -1)
                 write_cpmp(region_cpmp[i], mem_l);
@@ -268,7 +255,6 @@ static void *split_out_cap(unsigned base, unsigned len, unsigned linear) {
 
     __linear void *region_linear;
     unsigned ty = cap_type(region);
-    C_PRINT(ty);
     if(linear && ty != CAP_TYPE_LINEAR) {
         capstone_error(CAPSTONE_NO_REGION);
     } else if(!linear && ty == CAP_TYPE_LINEAR) {
@@ -283,8 +269,6 @@ static void *split_out_cap(unsigned base, unsigned len, unsigned linear) {
 
     return region;
 }
-
-
 static unsigned create_domain(unsigned base_addr, unsigned code_size,
                           unsigned tot_size, unsigned entry_offset)
 {
@@ -410,8 +394,9 @@ static unsigned shared_region_annotated(unsigned dom_id, unsigned region_id, uns
         // capability type: linear; post-return revoke: no
         // TODO: regions[region_id] should be added to a free list
         if (cap_type(r) != 1) {
-            C_PRINT(0xdeadbeef);
-            while(1);
+            //C_PRINT(0xdeadbeef);
+            __asm__ ("ebreak");
+            __asm__ ("ebreak");;
         }
 
         if (region_cpmp[region_id] != -1) {
@@ -642,7 +627,7 @@ unsigned handle_trap_ecall(unsigned arg0, unsigned arg1,
                     break;
                 case SBI_EXT_CAPSTONE_DOM_RETURN:
                     return_from_domain(arg0);
-                    while(1); /* should not reach here */
+                    __asm__ ("ebreak");; /* should not reach here */
                 case SBI_EXT_CAPSTONE_REGION_QUERY:
                     res = query_region(arg0, arg1);
                     break;
@@ -696,8 +681,8 @@ static void swap_cpmp(unsigned badaddr) {
             break;
     }
     if(region_id >= region_n) {
-        C_PRINT(badaddr);
-        C_PRINT(region_n);
+        //C_PRINT(badaddr);
+        //C_PRINT(region_n);
         print_regions();
         print_cpmps();
         capstone_error(CAPSTONE_NO_CPMP_REGION);
@@ -765,7 +750,7 @@ unsigned handle_dpi(unsigned func, void *arg) {
     switch(func) {
         case CAPSTONE_DPI_CALL:
             dpi_call(arg);
-            while(1); /* should not reach here */
+            __asm__ ("ebreak");; /* should not reach here */
         case CAPSTONE_DPI_REGION_SHARE:
             dpi_share_region(arg);
             handled = 1;
@@ -777,4 +762,330 @@ unsigned handle_dpi(unsigned func, void *arg) {
 
 static void save_smode_context(unsigned *ctx) {
     smode_saved_context = ctx;
+}
+
+static void *split_out_cap_a(unsigned base, unsigned len, unsigned linear) {
+    __linear void *region;
+
+#ifdef USE_GEN_CAP
+    C_GEN_CAP(region, base, base + len);
+#else
+    __linear void *mem_l;
+    __linear void *mem_r;
+    unsigned i;
+    unsigned region_base, region_end;
+
+    for(i = 0; i < region_n; i += 1) {
+        if(region_cpmp[i] != -1)
+            mem_l = read_cpmp(region_cpmp[i]);
+        else
+            mem_l = regions[i];
+        region_base = cap_base(mem_l);
+        region_end = cap_end(mem_l);
+        if(base >= region_base && base + len <= region_end)
+            break;
+        if(region_cpmp[i] != -1)
+            write_cpmp(region_cpmp[i], mem_l);
+        else
+            regions[i] = mem_l;
+    }
+
+    if(i >= region_n) __asm__ ("ebreak");
+
+    if(base == region_base)
+        region = mem_l;
+    else
+        region = __split(mem_l, base);
+
+    if (base + len == region_end) {
+        if(base == region_base) {
+            // matching region. We don't support this for now
+            __asm__ ("ebreak");
+        } else {
+            if(region_cpmp[i] != -1)
+                write_cpmp(region_cpmp[i], mem_l);
+            else
+                regions[i] = mem_l;
+        }
+    } else {
+        mem_r = __split(region, base + len);
+
+        if(base == region_base) {
+            if(region_cpmp[i] != -1)
+                write_cpmp(region_cpmp[i], mem_r);
+            else
+                regions[i] = mem_r;
+        } else {
+            if(region_cpmp[i] != -1)
+                write_cpmp(region_cpmp[i], mem_l);
+            else
+                regions[i] = mem_l;
+
+            regions[region_n] = mem_r;
+            region_n += 1;
+            /* we load regions into cpmp lazily*/
+        }
+    }
+#endif
+
+    __linear void *region_linear;
+    unsigned ty = cap_type(region);
+    if(linear && ty != CAP_TYPE_LINEAR) {
+        capstone_error(CAPSTONE_NO_REGION);
+    } else if(!linear && ty == CAP_TYPE_LINEAR) {
+        region_linear = region;
+        region = __delin(region_linear);
+    }
+
+    if(!linear) {
+        regions[region_n] = region;
+        region_n += 1;
+    }
+
+    return region;
+}
+
+static void *split_out_cap_b(unsigned base, unsigned len, unsigned linear) {
+    __linear void *region;
+
+#ifdef USE_GEN_CAP
+    C_GEN_CAP(region, base, base + len);
+#else
+    __linear void *mem_l;
+    __linear void *mem_r;
+    unsigned i;
+    unsigned region_base, region_end;
+
+    for(i = 0; i < region_n; i += 1) {
+        if(region_cpmp[i] != -1)
+            mem_l = read_cpmp(region_cpmp[i]);
+        else
+            mem_l = regions[i];
+        region_base = cap_base(mem_l);
+        region_end = cap_end(mem_l);
+        if(base >= region_base && base + len <= region_end)
+            break;
+        if(region_cpmp[i] != -1)
+            write_cpmp(region_cpmp[i], mem_l);
+        else
+            regions[i] = mem_l;
+    }
+
+    if(i >= region_n) __asm__ ("ebreak");
+
+    if(base == region_base)
+        region = mem_l;
+    else
+        region = __split(mem_l, base);
+
+    if (base + len == region_end) {
+        if(base == region_base) {
+            // matching region. We don't support this for now
+            __asm__ ("ebreak");
+        } else {
+            if(region_cpmp[i] != -1)
+                write_cpmp(region_cpmp[i], mem_l);
+            else
+                regions[i] = mem_l;
+        }
+    } else {
+        mem_r = __split(region, base + len);
+
+        if(base == region_base) {
+            if(region_cpmp[i] != -1)
+                write_cpmp(region_cpmp[i], mem_r);
+            else
+                regions[i] = mem_r;
+        } else {
+            if(region_cpmp[i] != -1)
+                write_cpmp(region_cpmp[i], mem_l);
+            else
+                regions[i] = mem_l;
+
+            regions[region_n] = mem_r;
+            region_n += 1;
+            /* we load regions into cpmp lazily*/
+        }
+    }
+#endif
+
+    __linear void *region_linear;
+    unsigned ty = cap_type(region);
+    if(linear && ty != CAP_TYPE_LINEAR) {
+        capstone_error(CAPSTONE_NO_REGION);
+    } else if(!linear && ty == CAP_TYPE_LINEAR) {
+        region_linear = region;
+        region = __delin(region_linear);
+    }
+
+    if(!linear) {
+        regions[region_n] = region;
+        region_n += 1;
+    }
+
+    return region;
+}
+
+
+static void *split_out_cap_c(unsigned base, unsigned len, unsigned linear) {
+    __linear void *region;
+
+#ifdef USE_GEN_CAP
+    C_GEN_CAP(region, base, base + len);
+#else
+    __linear void *mem_l;
+    __linear void *mem_r;
+    unsigned i;
+    unsigned region_base, region_end;
+
+    for(i = 0; i < region_n; i += 1) {
+        if(region_cpmp[i] != -1)
+            mem_l = read_cpmp(region_cpmp[i]);
+        else
+            mem_l = regions[i];
+        region_base = cap_base(mem_l);
+        region_end = cap_end(mem_l);
+        if(base >= region_base && base + len <= region_end)
+            break;
+        if(region_cpmp[i] != -1)
+            write_cpmp(region_cpmp[i], mem_l);
+        else
+            regions[i] = mem_l;
+    }
+
+    if(i >= region_n) __asm__ ("ebreak");
+
+    if(base == region_base)
+        region = mem_l;
+    else
+        region = __split(mem_l, base);
+
+    if (base + len == region_end) {
+        if(base == region_base) {
+            // matching region. We don't support this for now
+            __asm__ ("ebreak");
+        } else {
+            if(region_cpmp[i] != -1)
+                write_cpmp(region_cpmp[i], mem_l);
+            else
+                regions[i] = mem_l;
+        }
+    } else {
+        mem_r = __split(region, base + len);
+
+        if(base == region_base) {
+            if(region_cpmp[i] != -1)
+                write_cpmp(region_cpmp[i], mem_r);
+            else
+                regions[i] = mem_r;
+        } else {
+            if(region_cpmp[i] != -1)
+                write_cpmp(region_cpmp[i], mem_l);
+            else
+                regions[i] = mem_l;
+
+            regions[region_n] = mem_r;
+            region_n += 1;
+            /* we load regions into cpmp lazily*/
+        }
+    }
+#endif
+
+    __linear void *region_linear;
+    unsigned ty = cap_type(region);
+    if(linear && ty != CAP_TYPE_LINEAR) {
+        capstone_error(CAPSTONE_NO_REGION);
+    } else if(!linear && ty == CAP_TYPE_LINEAR) {
+        region_linear = region;
+        region = __delin(region_linear);
+    }
+
+    if(!linear) {
+        regions[region_n] = region;
+        region_n += 1;
+    }
+
+    return region;
+}
+
+
+static void *split_out_cap_d(unsigned base, unsigned len, unsigned linear) {
+    __linear void *region;
+
+#ifdef USE_GEN_CAP
+    C_GEN_CAP(region, base, base + len);
+#else
+    __linear void *mem_l;
+    __linear void *mem_r;
+    unsigned i;
+    unsigned region_base, region_end;
+
+    for(i = 0; i < region_n; i += 1) {
+        if(region_cpmp[i] != -1)
+            mem_l = read_cpmp(region_cpmp[i]);
+        else
+            mem_l = regions[i];
+        region_base = cap_base(mem_l);
+        region_end = cap_end(mem_l);
+        if(base >= region_base && base + len <= region_end)
+            break;
+        if(region_cpmp[i] != -1)
+            write_cpmp(region_cpmp[i], mem_l);
+        else
+            regions[i] = mem_l;
+    }
+
+    if(i >= region_n) __asm__ ("ebreak");
+
+    if(base == region_base)
+        region = mem_l;
+    else
+        region = __split(mem_l, base);
+
+    if (base + len == region_end) {
+        if(base == region_base) {
+            // matching region. We don't support this for now
+            __asm__ ("ebreak");
+        } else {
+            if(region_cpmp[i] != -1)
+                write_cpmp(region_cpmp[i], mem_l);
+            else
+                regions[i] = mem_l;
+        }
+    } else {
+        mem_r = __split(region, base + len);
+
+        if(base == region_base) {
+            if(region_cpmp[i] != -1)
+                write_cpmp(region_cpmp[i], mem_r);
+            else
+                regions[i] = mem_r;
+        } else {
+            if(region_cpmp[i] != -1)
+                write_cpmp(region_cpmp[i], mem_l);
+            else
+                regions[i] = mem_l;
+
+            regions[region_n] = mem_r;
+            region_n += 1;
+            /* we load regions into cpmp lazily*/
+        }
+    }
+#endif
+
+    __linear void *region_linear;
+    unsigned ty = cap_type(region);
+    if(linear && ty != CAP_TYPE_LINEAR) {
+        capstone_error(CAPSTONE_NO_REGION);
+    } else if(!linear && ty == CAP_TYPE_LINEAR) {
+        region_linear = region;
+        region = __delin(region_linear);
+    }
+
+    if(!linear) {
+        regions[region_n] = region;
+        region_n += 1;
+    }
+
+    return region;
 }
