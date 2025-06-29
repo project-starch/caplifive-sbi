@@ -82,6 +82,24 @@ _cap_trap_entry:
 _handle_non_ecall:
     mv a0, t0
     call handle_exception
+    li t1, -1
+    beq a0, t1, _handle_branch_1
+
+    csrr t2, mepc
+    csrr t3, mtval
+
+    srli t4, t3, 7
+    andi t4, t4, 0x1F
+
+    slli t5, t4, 3
+    add  t5, sp, t5
+    sd a0, 16(t5)
+    addi t2, t2, 4
+    csrw mepc, t2
+
+    j return_to_sumode
+
+_handle_branch_1:
     CINCOFFSETIMM(sp, sp, 16)
     RESTORE_REG(a0, sp)
     RESTORE_REG(a1, sp)

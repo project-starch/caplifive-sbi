@@ -17,7 +17,7 @@
 #define C_WRITE_CCSR(ccsr_name, v) __asm__("ccsrrw(x0, " #ccsr_name ", %0)" :: "r"(v))
 #define C_SET_CURSOR(dest, cap, cursor) __asm__("scc(%0, %1, %2)" : "=r"(dest) : "r"(cap), "r"(cursor))
 #define C_GEN_CAP(dest, base, end) __asm__(".insn r 0x5b, 0x1, 0x40, %0, %1, %2" : "=r"(dest) : "r"(base), "r"(end));
-#define capstone_error(err_code) __asm__ ("ebreak");
+#define capstone_error(err_code) while(1);
 #define cap_base(cap) __capfield((cap), 3)
 #define cap_end(cap) __capfield((cap), 4)
 #define cap_type(cap) __capfield((cap), 1)
@@ -27,14 +27,13 @@
 #define CPMP_COUNT 16
 #define DOMAIN_DATA_N    96
 #define DOMAIN_DATA_SIZE (16 * DOMAIN_DATA_N)
-
+// #define CSR_TIME 0xC01
 
 // toggle the following for swapping between cpmp swapping and gen_cap (hack)
 // #define USE_GEN_CAP
 
 unsigned *mtime;
 unsigned *mtimecmp;
-
 __dom void *domains[CAPSTONE_MAX_DOM_N];
 void *regions[CAPSTONE_MAX_REGION_N];
 /* the cpmp entry each region is associated with; -1 if unassociated */
@@ -104,7 +103,7 @@ static __linear void *read_cpmp(unsigned n) {
             C_READ_CCSR(cpmp(15), res);
             break;
         default:
-            __asm__ ("ebreak");
+            while(1);
     }
     return res;
 }
@@ -160,7 +159,7 @@ static void write_cpmp(unsigned n, __linear void *v) {
             C_WRITE_CCSR(cpmp(15), v);
             break;
         default:
-            __asm__ ("ebreak");;
+            while(1);
     }
 }
 
@@ -215,7 +214,7 @@ static void *split_out_cap(unsigned base, unsigned len, unsigned linear) {
             regions[i] = mem_l;
     }
 
-    if(i >= region_n) __asm__ ("ebreak");
+    if(i >= region_n) while(1);
 
     if(base == region_base)
         region = mem_l;
@@ -225,7 +224,7 @@ static void *split_out_cap(unsigned base, unsigned len, unsigned linear) {
     if (base + len == region_end) {
         if(base == region_base) {
             // matching region. We don't support this for now
-            __asm__ ("ebreak");
+            while(1);
         } else {
             if(region_cpmp[i] != -1)
                 write_cpmp(region_cpmp[i], mem_l);
@@ -395,8 +394,7 @@ static unsigned shared_region_annotated(unsigned dom_id, unsigned region_id, uns
         // TODO: regions[region_id] should be added to a free list
         if (cap_type(r) != 1) {
             //C_PRINT(0xdeadbeef);
-            __asm__ ("ebreak");
-            __asm__ ("ebreak");;
+            while(1);
         }
 
         if (region_cpmp[region_id] != -1) {
@@ -585,6 +583,7 @@ unsigned handle_trap_ecall(unsigned arg0, unsigned arg1,
                 case SBI_EXT_BASE_PROBE_EXT:
                     // we only have time and Capstone extensions
                     res = arg0 == SBI_EXT_TIME || arg0 == SBI_EXT_CAPSTONE;
+                    // fake_time = 0;
                     break;
                 case SBI_EXT_BASE_GET_MVENDORID:
                     C_READ_CSR(mvendorid, res);
@@ -627,7 +626,7 @@ unsigned handle_trap_ecall(unsigned arg0, unsigned arg1,
                     break;
                 case SBI_EXT_CAPSTONE_DOM_RETURN:
                     return_from_domain(arg0);
-                    __asm__ ("ebreak");; /* should not reach here */
+                    while(1); /* should not reach here */
                 case SBI_EXT_CAPSTONE_REGION_QUERY:
                     res = query_region(arg0, arg1);
                     break;
@@ -665,6 +664,8 @@ void handle_interrupt(unsigned int_code) {
             __asm__ volatile ("csrc mie, %0" :: "r"(MIP_MTIP));
             __asm__ volatile ("csrs mip, %0" :: "r"(MIP_STIP));
             break;
+        default:
+            while(1);
     }
 }
 
@@ -710,10 +711,24 @@ static void swap_cpmp(unsigned badaddr) {
     tmp = regions[region_id];
     write_cpmp(cpmp_id, tmp);
 }
+// unsigned emulate_time(){
+//     return 0;
+// }
 
-void handle_exception(unsigned cause) {
+unsigned handle_exception(unsigned cause) {
     unsigned badaddr;
     switch(cause) {
+        case CAUSE_ILLEGAL_INSTRUCTION:
+            C_READ_CSR(mtval, badaddr);
+            unsigned time_val = *mtime;
+            if (((badaddr & 0xFFF0707F) == 0xC0102073)) {//handling rdtimeh is left
+                return time_val;
+            }
+            else {
+                // __asm__ ("csrr a5, mtval");
+                return time_val;
+            }
+        break;
         case CAUSE_LOAD_ACCESS:
         case CAUSE_STORE_ACCESS:
         case CAUSE_FETCH_ACCESS:
@@ -722,8 +737,11 @@ void handle_exception(unsigned cause) {
             swap_cpmp(badaddr);
             break;
         default:
+            __asm__ ("csrr a5, mcause");
+            __asm__ ("csrr a6, mepc");
             capstone_error(CAPSTONE_UNKNOWN_EXCP);
     }
+    return -1;
 }
 
 
@@ -750,7 +768,7 @@ unsigned handle_dpi(unsigned func, void *arg) {
     switch(func) {
         case CAPSTONE_DPI_CALL:
             dpi_call(arg);
-            __asm__ ("ebreak");; /* should not reach here */
+            while(1); /* should not reach here */
         case CAPSTONE_DPI_REGION_SHARE:
             dpi_share_region(arg);
             handled = 1;
@@ -790,7 +808,7 @@ static void *split_out_cap_a(unsigned base, unsigned len, unsigned linear) {
             regions[i] = mem_l;
     }
 
-    if(i >= region_n) __asm__ ("ebreak");
+    if(i >= region_n) while(1);
 
     if(base == region_base)
         region = mem_l;
@@ -800,7 +818,7 @@ static void *split_out_cap_a(unsigned base, unsigned len, unsigned linear) {
     if (base + len == region_end) {
         if(base == region_base) {
             // matching region. We don't support this for now
-            __asm__ ("ebreak");
+            while(1);
         } else {
             if(region_cpmp[i] != -1)
                 write_cpmp(region_cpmp[i], mem_l);
@@ -871,7 +889,7 @@ static void *split_out_cap_b(unsigned base, unsigned len, unsigned linear) {
             regions[i] = mem_l;
     }
 
-    if(i >= region_n) __asm__ ("ebreak");
+    if(i >= region_n) while(1);
 
     if(base == region_base)
         region = mem_l;
@@ -881,7 +899,7 @@ static void *split_out_cap_b(unsigned base, unsigned len, unsigned linear) {
     if (base + len == region_end) {
         if(base == region_base) {
             // matching region. We don't support this for now
-            __asm__ ("ebreak");
+            while(1);
         } else {
             if(region_cpmp[i] != -1)
                 write_cpmp(region_cpmp[i], mem_l);
@@ -953,7 +971,7 @@ static void *split_out_cap_c(unsigned base, unsigned len, unsigned linear) {
             regions[i] = mem_l;
     }
 
-    if(i >= region_n) __asm__ ("ebreak");
+    if(i >= region_n) while(1);
 
     if(base == region_base)
         region = mem_l;
@@ -963,7 +981,7 @@ static void *split_out_cap_c(unsigned base, unsigned len, unsigned linear) {
     if (base + len == region_end) {
         if(base == region_base) {
             // matching region. We don't support this for now
-            __asm__ ("ebreak");
+            while(1);
         } else {
             if(region_cpmp[i] != -1)
                 write_cpmp(region_cpmp[i], mem_l);
@@ -1035,7 +1053,7 @@ static void *split_out_cap_d(unsigned base, unsigned len, unsigned linear) {
             regions[i] = mem_l;
     }
 
-    if(i >= region_n) __asm__ ("ebreak");
+    if(i >= region_n) while(1);
 
     if(base == region_base)
         region = mem_l;
@@ -1045,7 +1063,7 @@ static void *split_out_cap_d(unsigned base, unsigned len, unsigned linear) {
     if (base + len == region_end) {
         if(base == region_base) {
             // matching region. We don't support this for now
-            __asm__ ("ebreak");
+            while(1);
         } else {
             if(region_cpmp[i] != -1)
                 write_cpmp(region_cpmp[i], mem_l);
