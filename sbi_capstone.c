@@ -27,7 +27,7 @@
 #define CPMP_COUNT 16
 #define DOMAIN_DATA_N    96
 #define DOMAIN_DATA_SIZE (16 * DOMAIN_DATA_N)
-// #define CSR_TIME 0xC01
+#define CSR_TIME 0xC0102073
 
 // toggle the following for swapping between cpmp swapping and gen_cap (hack)
 // #define USE_GEN_CAP
@@ -583,7 +583,6 @@ unsigned handle_trap_ecall(unsigned arg0, unsigned arg1,
                 case SBI_EXT_BASE_PROBE_EXT:
                     // we only have time and Capstone extensions
                     res = arg0 == SBI_EXT_TIME || arg0 == SBI_EXT_CAPSTONE;
-                    // fake_time = 0;
                     break;
                 case SBI_EXT_BASE_GET_MVENDORID:
                     C_READ_CSR(mvendorid, res);
@@ -711,22 +710,21 @@ static void swap_cpmp(unsigned badaddr) {
     tmp = regions[region_id];
     write_cpmp(cpmp_id, tmp);
 }
-// unsigned emulate_time(){
-//     return 0;
-// }
 
 unsigned handle_exception(unsigned cause) {
     unsigned badaddr;
+    unsigned time_val;
     switch(cause) {
         case CAUSE_ILLEGAL_INSTRUCTION:
             C_READ_CSR(mtval, badaddr);
-            unsigned time_val = *mtime;
-            if (((badaddr & 0xFFF0707F) == 0xC0102073)) {//handling rdtimeh is left
-                return time_val;
+            if (((badaddr & 0xFFF0707F) == CSR_TIME)) {
+                time_val = *mtime*13;
+                break;
             }
             else {
-                // __asm__ ("csrr a5, mtval");
-                return time_val;
+                __asm__ ("csrr a5, mcause");
+                __asm__ ("csrr a6, mepc");
+                while(1);
             }
         break;
         case CAUSE_LOAD_ACCESS:
@@ -735,13 +733,14 @@ unsigned handle_exception(unsigned cause) {
             C_READ_CSR(mtval, badaddr);
             debug_counter_tick(DEBUG_COUNTER_CPMP_SWAP);
             swap_cpmp(badaddr);
+            time_val = -1;
             break;
         default:
             __asm__ ("csrr a5, mcause");
             __asm__ ("csrr a6, mepc");
             capstone_error(CAPSTONE_UNKNOWN_EXCP);
     }
-    return -1;
+    return time_val;
 }
 
 

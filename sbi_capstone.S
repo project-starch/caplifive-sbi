@@ -73,9 +73,9 @@ _cap_trap_entry:
     mv a1, a0
     li a0, 0
 
-    CCSRRW(t0, CCSR_CEPC, x0)
+    csrr t0, mepc
     addi t0, t0, 4
-    CCSRRW(x0, CCSR_CEPC, t0)
+    csrw mepc, t0
 
     j return_to_sumode
 
@@ -83,7 +83,7 @@ _handle_non_ecall:
     mv a0, t0
     call handle_exception
     li t1, -1
-    beq a0, t1, _handle_branch_1
+    beq a0, t1, _handle_branch_2
 
     csrr t2, mepc
     csrr t3, mtval
@@ -96,9 +96,7 @@ _handle_non_ecall:
     sd a0, 16(t5)
     addi t2, t2, 4
     csrw mepc, t2
-
-    j return_to_sumode
-
+    j _handle_branch_1
 _handle_branch_1:
     CINCOFFSETIMM(sp, sp, 16)
     RESTORE_REG(a0, sp)
