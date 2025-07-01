@@ -738,7 +738,7 @@ unsigned handle_exception(unsigned cause) {
         default:
             __asm__ ("csrr a5, mcause");
             __asm__ ("csrr a6, mepc");
-            capstone_error(CAPSTONE_UNKNOWN_EXCP);
+            time_val = -1;
     }
     return time_val;
 }
