@@ -9,6 +9,7 @@ _dom_reentry:
 #endif
 
 _cap_trap_entry:
+    fence.i
     CCSRRW(sp, CCSR_CSCRATCH, sp)
 
     CINCOFFSETIMM(sp, sp, -32 * 8)
@@ -52,6 +53,7 @@ _cap_trap_entry:
 
     # TODO: however, this would require the bottom of the stack to be reserved
     # for storing S-mode context
+    fence.i
     call save_smode_context
     CINCOFFSETIMM(sp, sp, 16)
     RESTORE_REG(a0, sp)
@@ -69,8 +71,10 @@ _cap_trap_entry:
     srli t1, t0, 63
     bne t1, x0, _handle_ints
     li t1, CAUSE_SUPERVISOR_ECALL
+    fence.i
     bne t0, t1, _handle_non_ecall
-
+    
+    fence.i
     call handle_trap_ecall
     mv a1, a0
     li a0, 0
@@ -78,14 +82,15 @@ _cap_trap_entry:
     csrr t0, mepc
     addi t0, t0, 4
     csrw mepc, t0
-
+    fence.i
     j return_to_sumode
 
 _handle_non_ecall:
     mv a0, t0
+    fence.i
     call handle_exception
     li t1, -1
-    beq a0, t1, _get_smode_context
+    beq a0, t1, _handle_branch_1
 
     csrr t2, mepc
     csrr t3, mtval
@@ -98,49 +103,49 @@ _handle_non_ecall:
     sd a0, 16(t5)
     addi t2, t2, 4
     csrw mepc, t2
-    j _handle_branch_1
 _handle_branch_1:
     CINCOFFSETIMM(sp, sp, 16)
     RESTORE_REG(a0, sp)
     RESTORE_REG(a1, sp)
     CINCOFFSETIMM(sp, sp, -16)
+    fence.i
     j return_to_sumode
 
-_get_smode_context:
-    CINCOFFSETIMM(sp, sp, 16)
-    RESTORE_REG(a0, sp)
-    RESTORE_REG(a1, sp)
-    RESTORE_REG(ra, sp)
-    RESTORE_REG(gp, sp)
-    RESTORE_REG(tp, sp)
-    RESTORE_REG(t0, sp)
-    RESTORE_REG(t1, sp)
-    RESTORE_REG(t2, sp)
-    RESTORE_REG(s0, sp)
-    RESTORE_REG(s1, sp)
-    RESTORE_REG(a2, sp)
-    RESTORE_REG(a3, sp)
-    RESTORE_REG(a4, sp)
-    RESTORE_REG(a5, sp)
-    RESTORE_REG(a6, sp)
-    RESTORE_REG(a7, sp)
-    RESTORE_REG(s2, sp)
-    RESTORE_REG(s3, sp)
-    RESTORE_REG(s4, sp)
-    RESTORE_REG(s5, sp)
-    RESTORE_REG(s6, sp)
-    RESTORE_REG(s7, sp)
-    RESTORE_REG(s8, sp)
-    RESTORE_REG(s9, sp)
-    RESTORE_REG(s10, sp)
-    RESTORE_REG(s11, sp)
-    RESTORE_REG(t3, sp)
-    RESTORE_REG(t4, sp)
-    RESTORE_REG(t5, sp)
-    RESTORE_REG(t6, sp)
-    CINCOFFSETIMM(sp, sp, 32 * 8)
-    CCSRRW(sp, CCSR_CSCRATCH, sp)
-    j _dom_reentry
+# _get_smode_context: //Debugging
+#     CINCOFFSETIMM(sp, sp, 16)
+#     RESTORE_REG(a0, sp)
+#     RESTORE_REG(a1, sp)
+#     RESTORE_REG(ra, sp)
+#     RESTORE_REG(gp, sp)
+#     RESTORE_REG(tp, sp)
+#     RESTORE_REG(t0, sp)
+#     RESTORE_REG(t1, sp)
+#     RESTORE_REG(t2, sp)
+#     RESTORE_REG(s0, sp)
+#     RESTORE_REG(s1, sp)
+#     RESTORE_REG(a2, sp)
+#     RESTORE_REG(a3, sp)
+#     RESTORE_REG(a4, sp)
+#     RESTORE_REG(a5, sp)
+#     RESTORE_REG(a6, sp)
+#     RESTORE_REG(a7, sp)
+#     RESTORE_REG(s2, sp)
+#     RESTORE_REG(s3, sp)
+#     RESTORE_REG(s4, sp)
+#     RESTORE_REG(s5, sp)
+#     RESTORE_REG(s6, sp)
+#     RESTORE_REG(s7, sp)
+#     RESTORE_REG(s8, sp)
+#     RESTORE_REG(s9, sp)
+#     RESTORE_REG(s10, sp)
+#     RESTORE_REG(s11, sp)
+#     RESTORE_REG(t3, sp)
+#     RESTORE_REG(t4, sp)
+#     RESTORE_REG(t5, sp)
+#     RESTORE_REG(t6, sp)
+#     CINCOFFSETIMM(sp, sp, 32 * 8)
+#     CCSRRW(sp, CCSR_CSCRATCH, sp)
+#     j _dom_reentry
  
 _handle_ints:
     # handle interrupts
@@ -197,6 +202,7 @@ return_to_sumode:
     # right before returning to S mode:
     # cscratch: sp  ->
     #      sp - 8 * 32 - 16  -> gp
+    fence.i
     mret
 
 call_into_smode:
@@ -207,6 +213,7 @@ call_into_smode:
     STC(gp, sp, -8 * 32 -16)
     CCSRRW(sp, CCSR_CSCRATCH, sp)
     li gp, 0
+    fence.i
 
     mret
 

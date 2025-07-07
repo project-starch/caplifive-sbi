@@ -718,7 +718,7 @@ unsigned handle_exception(unsigned cause) {
         case CAUSE_ILLEGAL_INSTRUCTION:
             C_READ_CSR(mtval, badaddr);
             if (((badaddr & 0xFFF0707F) == CSR_TIME)) {
-                time_val = *mtime*13;
+                time_val = *mtime;
                 break;
             }
             else {
@@ -781,328 +781,328 @@ static void save_smode_context(unsigned *ctx) {
     smode_saved_context = ctx;
 }
 
-static void *split_out_cap_a(unsigned base, unsigned len, unsigned linear) {
-    __linear void *region;
+// static void *split_out_cap_a(unsigned base, unsigned len, unsigned linear) {
+//     __linear void *region;
 
-#ifdef USE_GEN_CAP
-    C_GEN_CAP(region, base, base + len);
-#else
-    __linear void *mem_l;
-    __linear void *mem_r;
-    unsigned i;
-    unsigned region_base, region_end;
+// #ifdef USE_GEN_CAP
+//     C_GEN_CAP(region, base, base + len);
+// #else
+//     __linear void *mem_l;
+//     __linear void *mem_r;
+//     unsigned i;
+//     unsigned region_base, region_end;
 
-    for(i = 0; i < region_n; i += 1) {
-        if(region_cpmp[i] != -1)
-            mem_l = read_cpmp(region_cpmp[i]);
-        else
-            mem_l = regions[i];
-        region_base = cap_base(mem_l);
-        region_end = cap_end(mem_l);
-        if(base >= region_base && base + len <= region_end)
-            break;
-        if(region_cpmp[i] != -1)
-            write_cpmp(region_cpmp[i], mem_l);
-        else
-            regions[i] = mem_l;
-    }
+//     for(i = 0; i < region_n; i += 1) {
+//         if(region_cpmp[i] != -1)
+//             mem_l = read_cpmp(region_cpmp[i]);
+//         else
+//             mem_l = regions[i];
+//         region_base = cap_base(mem_l);
+//         region_end = cap_end(mem_l);
+//         if(base >= region_base && base + len <= region_end)
+//             break;
+//         if(region_cpmp[i] != -1)
+//             write_cpmp(region_cpmp[i], mem_l);
+//         else
+//             regions[i] = mem_l;
+//     }
 
-    if(i >= region_n) while(1);
+//     if(i >= region_n) while(1);
 
-    if(base == region_base)
-        region = mem_l;
-    else
-        region = __split(mem_l, base);
+//     if(base == region_base)
+//         region = mem_l;
+//     else
+//         region = __split(mem_l, base);
 
-    if (base + len == region_end) {
-        if(base == region_base) {
-            // matching region. We don't support this for now
-            while(1);
-        } else {
-            if(region_cpmp[i] != -1)
-                write_cpmp(region_cpmp[i], mem_l);
-            else
-                regions[i] = mem_l;
-        }
-    } else {
-        mem_r = __split(region, base + len);
+//     if (base + len == region_end) {
+//         if(base == region_base) {
+//             // matching region. We don't support this for now
+//             while(1);
+//         } else {
+//             if(region_cpmp[i] != -1)
+//                 write_cpmp(region_cpmp[i], mem_l);
+//             else
+//                 regions[i] = mem_l;
+//         }
+//     } else {
+//         mem_r = __split(region, base + len);
 
-        if(base == region_base) {
-            if(region_cpmp[i] != -1)
-                write_cpmp(region_cpmp[i], mem_r);
-            else
-                regions[i] = mem_r;
-        } else {
-            if(region_cpmp[i] != -1)
-                write_cpmp(region_cpmp[i], mem_l);
-            else
-                regions[i] = mem_l;
+//         if(base == region_base) {
+//             if(region_cpmp[i] != -1)
+//                 write_cpmp(region_cpmp[i], mem_r);
+//             else
+//                 regions[i] = mem_r;
+//         } else {
+//             if(region_cpmp[i] != -1)
+//                 write_cpmp(region_cpmp[i], mem_l);
+//             else
+//                 regions[i] = mem_l;
 
-            regions[region_n] = mem_r;
-            region_n += 1;
-            /* we load regions into cpmp lazily*/
-        }
-    }
-#endif
+//             regions[region_n] = mem_r;
+//             region_n += 1;
+//             /* we load regions into cpmp lazily*/
+//         }
+//     }
+// #endif
 
-    __linear void *region_linear;
-    unsigned ty = cap_type(region);
-    if(linear && ty != CAP_TYPE_LINEAR) {
-        capstone_error(CAPSTONE_NO_REGION);
-    } else if(!linear && ty == CAP_TYPE_LINEAR) {
-        region_linear = region;
-        region = __delin(region_linear);
-    }
+//     __linear void *region_linear;
+//     unsigned ty = cap_type(region);
+//     if(linear && ty != CAP_TYPE_LINEAR) {
+//         capstone_error(CAPSTONE_NO_REGION);
+//     } else if(!linear && ty == CAP_TYPE_LINEAR) {
+//         region_linear = region;
+//         region = __delin(region_linear);
+//     }
 
-    if(!linear) {
-        regions[region_n] = region;
-        region_n += 1;
-    }
+//     if(!linear) {
+//         regions[region_n] = region;
+//         region_n += 1;
+//     }
 
-    return region;
-}
+//     return region;
+// }
 
-static void *split_out_cap_b(unsigned base, unsigned len, unsigned linear) {
-    __linear void *region;
+// static void *split_out_cap_b(unsigned base, unsigned len, unsigned linear) {
+//     __linear void *region;
 
-#ifdef USE_GEN_CAP
-    C_GEN_CAP(region, base, base + len);
-#else
-    __linear void *mem_l;
-    __linear void *mem_r;
-    unsigned i;
-    unsigned region_base, region_end;
+// #ifdef USE_GEN_CAP
+//     C_GEN_CAP(region, base, base + len);
+// #else
+//     __linear void *mem_l;
+//     __linear void *mem_r;
+//     unsigned i;
+//     unsigned region_base, region_end;
 
-    for(i = 0; i < region_n; i += 1) {
-        if(region_cpmp[i] != -1)
-            mem_l = read_cpmp(region_cpmp[i]);
-        else
-            mem_l = regions[i];
-        region_base = cap_base(mem_l);
-        region_end = cap_end(mem_l);
-        if(base >= region_base && base + len <= region_end)
-            break;
-        if(region_cpmp[i] != -1)
-            write_cpmp(region_cpmp[i], mem_l);
-        else
-            regions[i] = mem_l;
-    }
+//     for(i = 0; i < region_n; i += 1) {
+//         if(region_cpmp[i] != -1)
+//             mem_l = read_cpmp(region_cpmp[i]);
+//         else
+//             mem_l = regions[i];
+//         region_base = cap_base(mem_l);
+//         region_end = cap_end(mem_l);
+//         if(base >= region_base && base + len <= region_end)
+//             break;
+//         if(region_cpmp[i] != -1)
+//             write_cpmp(region_cpmp[i], mem_l);
+//         else
+//             regions[i] = mem_l;
+//     }
 
-    if(i >= region_n) while(1);
+//     if(i >= region_n) while(1);
 
-    if(base == region_base)
-        region = mem_l;
-    else
-        region = __split(mem_l, base);
+//     if(base == region_base)
+//         region = mem_l;
+//     else
+//         region = __split(mem_l, base);
 
-    if (base + len == region_end) {
-        if(base == region_base) {
-            // matching region. We don't support this for now
-            while(1);
-        } else {
-            if(region_cpmp[i] != -1)
-                write_cpmp(region_cpmp[i], mem_l);
-            else
-                regions[i] = mem_l;
-        }
-    } else {
-        mem_r = __split(region, base + len);
+//     if (base + len == region_end) {
+//         if(base == region_base) {
+//             // matching region. We don't support this for now
+//             while(1);
+//         } else {
+//             if(region_cpmp[i] != -1)
+//                 write_cpmp(region_cpmp[i], mem_l);
+//             else
+//                 regions[i] = mem_l;
+//         }
+//     } else {
+//         mem_r = __split(region, base + len);
 
-        if(base == region_base) {
-            if(region_cpmp[i] != -1)
-                write_cpmp(region_cpmp[i], mem_r);
-            else
-                regions[i] = mem_r;
-        } else {
-            if(region_cpmp[i] != -1)
-                write_cpmp(region_cpmp[i], mem_l);
-            else
-                regions[i] = mem_l;
+//         if(base == region_base) {
+//             if(region_cpmp[i] != -1)
+//                 write_cpmp(region_cpmp[i], mem_r);
+//             else
+//                 regions[i] = mem_r;
+//         } else {
+//             if(region_cpmp[i] != -1)
+//                 write_cpmp(region_cpmp[i], mem_l);
+//             else
+//                 regions[i] = mem_l;
 
-            regions[region_n] = mem_r;
-            region_n += 1;
-            /* we load regions into cpmp lazily*/
-        }
-    }
-#endif
+//             regions[region_n] = mem_r;
+//             region_n += 1;
+//             /* we load regions into cpmp lazily*/
+//         }
+//     }
+// #endif
 
-    __linear void *region_linear;
-    unsigned ty = cap_type(region);
-    if(linear && ty != CAP_TYPE_LINEAR) {
-        capstone_error(CAPSTONE_NO_REGION);
-    } else if(!linear && ty == CAP_TYPE_LINEAR) {
-        region_linear = region;
-        region = __delin(region_linear);
-    }
+//     __linear void *region_linear;
+//     unsigned ty = cap_type(region);
+//     if(linear && ty != CAP_TYPE_LINEAR) {
+//         capstone_error(CAPSTONE_NO_REGION);
+//     } else if(!linear && ty == CAP_TYPE_LINEAR) {
+//         region_linear = region;
+//         region = __delin(region_linear);
+//     }
 
-    if(!linear) {
-        regions[region_n] = region;
-        region_n += 1;
-    }
+//     if(!linear) {
+//         regions[region_n] = region;
+//         region_n += 1;
+//     }
 
-    return region;
-}
-
-
-static void *split_out_cap_c(unsigned base, unsigned len, unsigned linear) {
-    __linear void *region;
-
-#ifdef USE_GEN_CAP
-    C_GEN_CAP(region, base, base + len);
-#else
-    __linear void *mem_l;
-    __linear void *mem_r;
-    unsigned i;
-    unsigned region_base, region_end;
-
-    for(i = 0; i < region_n; i += 1) {
-        if(region_cpmp[i] != -1)
-            mem_l = read_cpmp(region_cpmp[i]);
-        else
-            mem_l = regions[i];
-        region_base = cap_base(mem_l);
-        region_end = cap_end(mem_l);
-        if(base >= region_base && base + len <= region_end)
-            break;
-        if(region_cpmp[i] != -1)
-            write_cpmp(region_cpmp[i], mem_l);
-        else
-            regions[i] = mem_l;
-    }
-
-    if(i >= region_n) while(1);
-
-    if(base == region_base)
-        region = mem_l;
-    else
-        region = __split(mem_l, base);
-
-    if (base + len == region_end) {
-        if(base == region_base) {
-            // matching region. We don't support this for now
-            while(1);
-        } else {
-            if(region_cpmp[i] != -1)
-                write_cpmp(region_cpmp[i], mem_l);
-            else
-                regions[i] = mem_l;
-        }
-    } else {
-        mem_r = __split(region, base + len);
-
-        if(base == region_base) {
-            if(region_cpmp[i] != -1)
-                write_cpmp(region_cpmp[i], mem_r);
-            else
-                regions[i] = mem_r;
-        } else {
-            if(region_cpmp[i] != -1)
-                write_cpmp(region_cpmp[i], mem_l);
-            else
-                regions[i] = mem_l;
-
-            regions[region_n] = mem_r;
-            region_n += 1;
-            /* we load regions into cpmp lazily*/
-        }
-    }
-#endif
-
-    __linear void *region_linear;
-    unsigned ty = cap_type(region);
-    if(linear && ty != CAP_TYPE_LINEAR) {
-        capstone_error(CAPSTONE_NO_REGION);
-    } else if(!linear && ty == CAP_TYPE_LINEAR) {
-        region_linear = region;
-        region = __delin(region_linear);
-    }
-
-    if(!linear) {
-        regions[region_n] = region;
-        region_n += 1;
-    }
-
-    return region;
-}
+//     return region;
+// }
 
 
-static void *split_out_cap_d(unsigned base, unsigned len, unsigned linear) {
-    __linear void *region;
+// static void *split_out_cap_c(unsigned base, unsigned len, unsigned linear) {
+//     __linear void *region;
 
-#ifdef USE_GEN_CAP
-    C_GEN_CAP(region, base, base + len);
-#else
-    __linear void *mem_l;
-    __linear void *mem_r;
-    unsigned i;
-    unsigned region_base, region_end;
+// #ifdef USE_GEN_CAP
+//     C_GEN_CAP(region, base, base + len);
+// #else
+//     __linear void *mem_l;
+//     __linear void *mem_r;
+//     unsigned i;
+//     unsigned region_base, region_end;
 
-    for(i = 0; i < region_n; i += 1) {
-        if(region_cpmp[i] != -1)
-            mem_l = read_cpmp(region_cpmp[i]);
-        else
-            mem_l = regions[i];
-        region_base = cap_base(mem_l);
-        region_end = cap_end(mem_l);
-        if(base >= region_base && base + len <= region_end)
-            break;
-        if(region_cpmp[i] != -1)
-            write_cpmp(region_cpmp[i], mem_l);
-        else
-            regions[i] = mem_l;
-    }
+//     for(i = 0; i < region_n; i += 1) {
+//         if(region_cpmp[i] != -1)
+//             mem_l = read_cpmp(region_cpmp[i]);
+//         else
+//             mem_l = regions[i];
+//         region_base = cap_base(mem_l);
+//         region_end = cap_end(mem_l);
+//         if(base >= region_base && base + len <= region_end)
+//             break;
+//         if(region_cpmp[i] != -1)
+//             write_cpmp(region_cpmp[i], mem_l);
+//         else
+//             regions[i] = mem_l;
+//     }
 
-    if(i >= region_n) while(1);
+//     if(i >= region_n) while(1);
 
-    if(base == region_base)
-        region = mem_l;
-    else
-        region = __split(mem_l, base);
+//     if(base == region_base)
+//         region = mem_l;
+//     else
+//         region = __split(mem_l, base);
 
-    if (base + len == region_end) {
-        if(base == region_base) {
-            // matching region. We don't support this for now
-            while(1);
-        } else {
-            if(region_cpmp[i] != -1)
-                write_cpmp(region_cpmp[i], mem_l);
-            else
-                regions[i] = mem_l;
-        }
-    } else {
-        mem_r = __split(region, base + len);
+//     if (base + len == region_end) {
+//         if(base == region_base) {
+//             // matching region. We don't support this for now
+//             while(1);
+//         } else {
+//             if(region_cpmp[i] != -1)
+//                 write_cpmp(region_cpmp[i], mem_l);
+//             else
+//                 regions[i] = mem_l;
+//         }
+//     } else {
+//         mem_r = __split(region, base + len);
 
-        if(base == region_base) {
-            if(region_cpmp[i] != -1)
-                write_cpmp(region_cpmp[i], mem_r);
-            else
-                regions[i] = mem_r;
-        } else {
-            if(region_cpmp[i] != -1)
-                write_cpmp(region_cpmp[i], mem_l);
-            else
-                regions[i] = mem_l;
+//         if(base == region_base) {
+//             if(region_cpmp[i] != -1)
+//                 write_cpmp(region_cpmp[i], mem_r);
+//             else
+//                 regions[i] = mem_r;
+//         } else {
+//             if(region_cpmp[i] != -1)
+//                 write_cpmp(region_cpmp[i], mem_l);
+//             else
+//                 regions[i] = mem_l;
 
-            regions[region_n] = mem_r;
-            region_n += 1;
-            /* we load regions into cpmp lazily*/
-        }
-    }
-#endif
+//             regions[region_n] = mem_r;
+//             region_n += 1;
+//             /* we load regions into cpmp lazily*/
+//         }
+//     }
+// #endif
 
-    __linear void *region_linear;
-    unsigned ty = cap_type(region);
-    if(linear && ty != CAP_TYPE_LINEAR) {
-        capstone_error(CAPSTONE_NO_REGION);
-    } else if(!linear && ty == CAP_TYPE_LINEAR) {
-        region_linear = region;
-        region = __delin(region_linear);
-    }
+//     __linear void *region_linear;
+//     unsigned ty = cap_type(region);
+//     if(linear && ty != CAP_TYPE_LINEAR) {
+//         capstone_error(CAPSTONE_NO_REGION);
+//     } else if(!linear && ty == CAP_TYPE_LINEAR) {
+//         region_linear = region;
+//         region = __delin(region_linear);
+//     }
 
-    if(!linear) {
-        regions[region_n] = region;
-        region_n += 1;
-    }
+//     if(!linear) {
+//         regions[region_n] = region;
+//         region_n += 1;
+//     }
 
-    return region;
-}
+//     return region;
+// }
+
+
+// static void *split_out_cap_d(unsigned base, unsigned len, unsigned linear) {
+//     __linear void *region;
+
+// #ifdef USE_GEN_CAP
+//     C_GEN_CAP(region, base, base + len);
+// #else
+//     __linear void *mem_l;
+//     __linear void *mem_r;
+//     unsigned i;
+//     unsigned region_base, region_end;
+
+//     for(i = 0; i < region_n; i += 1) {
+//         if(region_cpmp[i] != -1)
+//             mem_l = read_cpmp(region_cpmp[i]);
+//         else
+//             mem_l = regions[i];
+//         region_base = cap_base(mem_l);
+//         region_end = cap_end(mem_l);
+//         if(base >= region_base && base + len <= region_end)
+//             break;
+//         if(region_cpmp[i] != -1)
+//             write_cpmp(region_cpmp[i], mem_l);
+//         else
+//             regions[i] = mem_l;
+//     }
+
+//     if(i >= region_n) while(1);
+
+//     if(base == region_base)
+//         region = mem_l;
+//     else
+//         region = __split(mem_l, base);
+
+//     if (base + len == region_end) {
+//         if(base == region_base) {
+//             // matching region. We don't support this for now
+//             while(1);
+//         } else {
+//             if(region_cpmp[i] != -1)
+//                 write_cpmp(region_cpmp[i], mem_l);
+//             else
+//                 regions[i] = mem_l;
+//         }
+//     } else {
+//         mem_r = __split(region, base + len);
+
+//         if(base == region_base) {
+//             if(region_cpmp[i] != -1)
+//                 write_cpmp(region_cpmp[i], mem_r);
+//             else
+//                 regions[i] = mem_r;
+//         } else {
+//             if(region_cpmp[i] != -1)
+//                 write_cpmp(region_cpmp[i], mem_l);
+//             else
+//                 regions[i] = mem_l;
+
+//             regions[region_n] = mem_r;
+//             region_n += 1;
+//             /* we load regions into cpmp lazily*/
+//         }
+//     }
+// #endif
+
+//     __linear void *region_linear;
+//     unsigned ty = cap_type(region);
+//     if(linear && ty != CAP_TYPE_LINEAR) {
+//         capstone_error(CAPSTONE_NO_REGION);
+//     } else if(!linear && ty == CAP_TYPE_LINEAR) {
+//         region_linear = region;
+//         region = __delin(region_linear);
+//     }
+
+//     if(!linear) {
+//         regions[region_n] = region;
+//         region_n += 1;
+//     }
+
+//     return region;
+// }
