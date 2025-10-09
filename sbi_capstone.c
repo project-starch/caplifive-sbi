@@ -37,6 +37,7 @@ unsigned *mtime;
 unsigned *mtimecmp;
 
 __dom void *domains[CAPSTONE_MAX_DOM_N];
+__linear void *domain_splits[CAPSTONE_MAX_DOM_N];
 void *regions[CAPSTONE_MAX_REGION_N];
 /* the cpmp entry each region is associated with; -1 if unassociated */
 unsigned region_cpmp[CAPSTONE_MAX_REGION_N];
@@ -59,15 +60,15 @@ static __linear void *read_cpmp(unsigned n) {
         case 0:
             C_READ_CCSR(cpmp(0), res);
             break;
-        case 1:                                                                                                                                          
-            C_READ_CCSR(cpmp(1), res);                                                                                                              
-            break;                                                                                                                                       
-        case 2:                                                                                                                                          
-            C_READ_CCSR(cpmp(2), res);                                                                                                              
-            break;                                                                                                                                       
-        case 3:                                                                                                                                          
-            C_READ_CCSR(cpmp(3), res);                                                                                                              
-            break;      
+        case 1:
+            C_READ_CCSR(cpmp(1), res);
+            break;
+        case 2:
+            C_READ_CCSR(cpmp(2), res);
+            break;
+        case 3:
+            C_READ_CCSR(cpmp(3), res);
+            break;
         case 4:
             C_READ_CCSR(cpmp(4), res);
             break;
@@ -117,15 +118,15 @@ static void write_cpmp(unsigned n, __linear void *v) {
         case 0:
             C_WRITE_CCSR(cpmp(0), v);
             break;
-        case 1:                                                                                                                                          
-            C_WRITE_CCSR(cpmp(1), v);                                                                                                              
-            break;                                                                                                                                       
-        case 2:                                                                                                                                          
-            C_WRITE_CCSR(cpmp(2), v);                                                                                                              
-            break;                                                                                                                                       
-        case 3:                                                                                                                                          
-            C_WRITE_CCSR(cpmp(3), v);                                                                                                              
-            break;      
+        case 1:
+            C_WRITE_CCSR(cpmp(1), v);
+            break;
+        case 2:
+            C_WRITE_CCSR(cpmp(2), v);
+            break;
+        case 3:
+            C_WRITE_CCSR(cpmp(3), v);
+            break;
         case 4:
             C_WRITE_CCSR(cpmp(4), v);
             break;
@@ -285,17 +286,24 @@ static void *split_out_cap(unsigned base, unsigned len, unsigned linear) {
 
 
 static unsigned create_domain(unsigned base_addr, unsigned code_size,
-                          unsigned tot_size, unsigned entry_offset)
+                          unsigned tot_size, unsigned entry_offset,
+                          unsigned split_offset)
 {
     // alignment requirement
     code_size = (((code_size - 1) >> 4) + 1) << 4;
-    __linear void *mem_l, *dom_code, *dom_data, *mem_r;
+    __linear void *mem_l, *dom_code, *dom_data, *dom_split, *mem_r;
     __linear void **dom_seal;
 
     dom_code = split_out_cap(base_addr, tot_size, 1);
 
     dom_seal = __split(dom_code, base_addr + code_size);
     dom_data = __split(dom_seal, base_addr + code_size + DOMAIN_DATA_SIZE);
+
+    if (split_offset != 0) {
+        dom_split = __split(dom_code, base_addr + split_offset);
+    } else {
+        dom_split = 0;
+    }
 
     int i;
     for(i = 0; i < DOMAIN_DATA_N; i += 1) {
@@ -307,13 +315,14 @@ static unsigned create_domain(unsigned base_addr, unsigned code_size,
     // construct the sealed region of the domain
     dom_seal[0] = dom_code;
     dom_seal[2] = dom_data;
-    dom_seal[3] = (3 << 38) | (2 << 34);
+    dom_seal[5] = (3 << 38) | (2 << 34) | (1 << 23); // FIXME: somehow (1<<23) does not stick
 
     __dom void *dom = __seal(dom_seal);
 
     // PRINT(dom);
 
     domains[dom_n] = dom;
+    domain_splits[dom_n] = dom_split;
 
     dom_n += 1;
 
@@ -324,16 +333,37 @@ static unsigned call_domain(unsigned dom_id) {
     if(dom_id >= dom_n) {
         return -1;
     }
-    
+
     unsigned res;
     __dom void *d = domains[dom_id];
     d = __domcallsaves(d, CAPSTONE_DPI_CALL, &res);
     domains[dom_id] = d;
-    
+
     return res;
 }
 
+static unsigned call_domain_split(unsigned dom_id, unsigned region_id) {
+    if(dom_id >= dom_n) {
+        return -1;
+    }
 
+    void *region = 0;
+    if(region_id != -1) {
+        region = regions[region_id];
+    }
+    __dom void *d = domains[dom_id];
+    __linear void *split = domain_splits[dom_id];
+    d = __domcallsaves(d, split, region);
+    domains[dom_id] = d;
+    domain_splits[dom_id] = split;
+    if(region_id != -1) {
+        regions[region_id] = region;
+    }
+
+    return 0;
+}
+
+/* Create a capability from given address range and pass it to the domain through a call. */
 static unsigned call_domain_with_cap(unsigned dom_id, unsigned base, unsigned len, unsigned cursor) {
     void *region = split_out_cap(base, len, 1);
     __asm__ ("scc(%0, %1, %2)" : "=r"(region) : "r"(region), "r"(cursor));
@@ -463,7 +493,7 @@ static unsigned share_region(unsigned dom_id, unsigned region_id) {
     }
 
     domains[dom_id] = d;
-    
+
     return 0;
 }
 
@@ -625,7 +655,7 @@ unsigned handle_trap_ecall(unsigned arg0, unsigned arg1,
         case SBI_EXT_CAPSTONE:
             switch(func_code) {
                 case SBI_EXT_CAPSTONE_DOM_CREATE:
-                    res = create_domain(arg0, arg1, arg2, arg3);
+                    res = create_domain(arg0, arg1, arg2, arg3, arg4);
                     break;
                 case SBI_EXT_CAPSTONE_DOM_CALL:
                     res = call_domain(arg0);
@@ -662,6 +692,9 @@ unsigned handle_trap_ecall(unsigned arg0, unsigned arg1,
                     break;
                 case SBI_EXT_CAPSTONE_REGION_POP:
                     res = pop_region(arg0);
+                    break;
+                case SBI_EXT_CAPSTONE_DOM_CALL_SPLIT:
+                    res = call_domain_split(arg0, arg1);
                     break;
                 default:
                     err = 1;
