@@ -404,10 +404,10 @@ static unsigned create_region(unsigned base, unsigned len) {
 }
 
 static unsigned create_shared_region(unsigned base, unsigned len) {
-    void *region = split_out_cap(base, len, 1);
+    __linear void *region = split_out_cap(base, len, 1);
     region = __delin(region);
     regions[region_n] = region;
-    region_n += 1;
+    region_n = region_n + 1;
     // Put the region in one of cpmp entries
     unsigned cpmp_id;
     for(cpmp_id = 0; cpmp_id < CPMP_COUNT; cpmp_id += 1) {

@@ -73,7 +73,7 @@
 #define SBI_EXT_CAPSTONE_REGION_POP   0xc
 /* call with the split capability */
 #define SBI_EXT_CAPSTONE_DOM_CALL_SPLIT 0xd
-
+#define SBI_EXT_CAPSTONE_SHARED_REGION_CREATE 0xe
 #define CAPSTONE_REGION_FIELD_BASE    0x0
 #define CAPSTONE_REGION_FIELD_END     0x1
 #define CAPSTONE_REGION_FIELD_LEN     0x2
