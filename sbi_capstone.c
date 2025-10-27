@@ -285,26 +285,38 @@ static void *split_out_cap(unsigned base, unsigned len, unsigned linear) {
 }
 
 
-static unsigned create_domain(unsigned base_addr, unsigned code_size,
+static unsigned create_domain(unsigned base_addr, unsigned mem_size,
                           unsigned tot_size, unsigned entry_offset,
                           unsigned split_offset)
-{
+{ 
+
     // alignment requirement
-    code_size = (((code_size - 1) >> 4) + 1) << 4;
+    mem_size = (((mem_size - 1) >> 4) + 1) << 4;
     __linear void *mem_l, *dom_code, *dom_data, *dom_split, *mem_r;
     __linear void **dom_seal;
-
+    C_PRINT(base_addr);
+    C_PRINT(tot_size);
+    C_PRINT(mem_size);
+    
     dom_code = split_out_cap(base_addr, tot_size, 1);
-
-    dom_seal = __split(dom_code, base_addr + code_size);
-    dom_data = __split(dom_seal, base_addr + code_size + DOMAIN_DATA_SIZE);
-
+    
+    C_PRINT(dom_code);
+    
+    dom_seal = __split(dom_code, base_addr + mem_size);
+    C_PRINT(dom_seal);
+    dom_data = __split(dom_seal, base_addr + mem_size + DOMAIN_DATA_SIZE);
+    
+    
     if (split_offset != 0) {
         dom_split = __split(dom_code, base_addr + split_offset);
     } else {
         dom_split = 0;
     }
-
+    C_PRINT(dom_split);
+    C_PRINT(split_offset);
+    C_PRINT(dom_data);
+    C_PRINT(4);
+    
     int i;
     for(i = 0; i < DOMAIN_DATA_N; i += 1) {
         dom_seal[i] = 0;
@@ -342,26 +354,33 @@ static unsigned call_domain(unsigned dom_id) {
     return res;
 }
 
-static unsigned call_domain_split(unsigned dom_id, unsigned region_id) {
+static unsigned call_domain_split(unsigned dom_id, unsigned region_id, unsigned shared_region_id) {
     if(dom_id >= dom_n) {
         return -1;
     }
-
+    unsigned call_id;
     void *region = 0;
+    void *shared_region;
     if(region_id != -1) {
         region = regions[region_id];
     }
+    if(shared_region_id != -1){
+        shared_region = regions[shared_region_id];
+    }
     __dom void *d = domains[dom_id];
     __linear void *split = domain_splits[dom_id];
-    d = __domcallsaves(d, split, region);
+    
+    d = __domcallsaves(d, split, region, shared_region);
+    __asm__ ("mv %0, a7" : "=r"(call_id));
     domains[dom_id] = d;
     domain_splits[dom_id] = split;
     if(region_id != -1) {
         regions[region_id] = region;
     }
-
-    return 0;
+    
+    return call_id;
 }
+
 
 /* Create a capability from given address range and pass it to the domain through a call. */
 static unsigned call_domain_with_cap(unsigned dom_id, unsigned base, unsigned len, unsigned cursor) {
@@ -381,6 +400,28 @@ static unsigned create_region(unsigned base, unsigned len) {
     regions[region_n] = region;
     region_n += 1;
 
+    return region_n - 1;
+}
+
+static unsigned create_shared_region(unsigned base, unsigned len) {
+    void *region = split_out_cap(base, len, 1);
+    region = __delin(region);
+    regions[region_n] = region;
+    region_n += 1;
+    // Put the region in one of cpmp entries
+    unsigned cpmp_id;
+    for(cpmp_id = 0; cpmp_id < CPMP_COUNT; cpmp_id += 1) {
+        if(cpmp_region[cpmp_id] == -1)
+            break;
+    }
+    if(cpmp_id < CPMP_COUNT){
+        cpmp_region[cpmp_id] = region_n - 1;
+        region_cpmp[region_n - 1] = cpmp_id;
+        write_cpmp(cpmp_id, region);
+    }
+    else{
+        capstone_error(CAPSTONE_NO_CPMP_REGION);
+    }
     return region_n - 1;
 }
 
@@ -613,8 +654,14 @@ unsigned handle_trap_ecall(unsigned arg0, unsigned arg1,
                            unsigned arg2, unsigned arg3,
                            unsigned arg4, unsigned arg5,
                            unsigned func_code, unsigned ext_code) {
-    // PRINT(ext_code);
-    // PRINT(func_code);
+     //PRINT(ext_code);
+     //PRINT(func_code);
+     if(ext_code == SBI_EXT_CAPSTONE){
+         if(func_code == SBI_EXT_CAPSTONE_DOM_CREATE){
+             //C_PRINT(0x111);
+             //while(1){}
+         }
+     }
     unsigned res = 0, err = 0;
     switch(ext_code) {
         case SBI_EXT_BASE:
@@ -655,6 +702,7 @@ unsigned handle_trap_ecall(unsigned arg0, unsigned arg1,
         case SBI_EXT_CAPSTONE:
             switch(func_code) {
                 case SBI_EXT_CAPSTONE_DOM_CREATE:
+                    
                     res = create_domain(arg0, arg1, arg2, arg3, arg4);
                     break;
                 case SBI_EXT_CAPSTONE_DOM_CALL:
@@ -665,6 +713,9 @@ unsigned handle_trap_ecall(unsigned arg0, unsigned arg1,
                     break;
                 case SBI_EXT_CAPSTONE_REGION_CREATE:
                     res = create_region(arg0, arg1);
+                    break;
+                case SBI_EXT_CAPSTONE_SHARED_REGION_CREATE:
+                    res = create_shared_region(arg0, arg1);
                     break;
                 case SBI_EXT_CAPSTONE_REGION_SHARE:
                     res = share_region(arg0, arg1);
@@ -694,7 +745,7 @@ unsigned handle_trap_ecall(unsigned arg0, unsigned arg1,
                     res = pop_region(arg0);
                     break;
                 case SBI_EXT_CAPSTONE_DOM_CALL_SPLIT:
-                    res = call_domain_split(arg0, arg1);
+                    res = call_domain_split(arg0, arg1, arg2);
                     break;
                 default:
                     err = 1;

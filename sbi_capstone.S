@@ -7,6 +7,7 @@ _dom_reentry:
 #endif
 
 _cap_trap_entry:
+     //.insn r 0x5b, 0x1, 0x43, x0,x0, x0
     CCSRRW(sp, CCSR_CSCRATCH, sp)
 
     CINCOFFSETIMM(sp, sp, -32 * 8)
@@ -68,7 +69,12 @@ _cap_trap_entry:
     bne t1, x0, _handle_ints
     li t1, CAUSE_SUPERVISOR_ECALL
     bne t0, t1, _handle_non_ecall
-
+    bne a6, x0, normal
+    li t0, 0x12345678 
+    bne a7, t0, normal
+    
+ 
+normal:
     call handle_trap_ecall
     mv a1, a0
     li a0, 0
