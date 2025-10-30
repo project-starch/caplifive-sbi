@@ -402,12 +402,22 @@ static unsigned create_region(unsigned base, unsigned len) {
 
     return region_n - 1;
 }
+static unsigned delinearize_region(unsigned region_id){
+    __linear void *region = regions[region_id];
+    void *shared_region;
+    shared_region = __delin(region);
+    regions[region_id] = shared_region;
+    return 0;
+}
 
 static unsigned create_shared_region(unsigned base, unsigned len) {
     __linear void *region = split_out_cap(base, len, 1);
+   
     region = __delin(region);
     regions[region_n] = region;
     region_n = region_n + 1;
+    
+    
     // Put the region in one of cpmp entries
     unsigned cpmp_id;
     for(cpmp_id = 0; cpmp_id < CPMP_COUNT; cpmp_id += 1) {
@@ -746,6 +756,9 @@ unsigned handle_trap_ecall(unsigned arg0, unsigned arg1,
                     break;
                 case SBI_EXT_CAPSTONE_DOM_CALL_SPLIT:
                     res = call_domain_split(arg0, arg1, arg2);
+                    break;
+                case SBI_EXT_CAPSTONE_DELINEARIZE_REGION:
+                    res = delinearize_region(arg0);
                     break;
                 default:
                     err = 1;
