@@ -54,6 +54,9 @@ unsigned smode_initialised;
 /* saved context of S-mode at the last SBI dom-return call */
 unsigned *smode_saved_context;
 
+void *nested_dom_code;
+void *nested_dom_vm;
+void **nested_dom_seal;
 static __linear void *read_cpmp(unsigned n) {
     __linear void *res;
     switch(n) {
@@ -217,6 +220,7 @@ static void *split_out_cap(unsigned base, unsigned len, unsigned linear) {
             mem_l = read_cpmp(region_cpmp[i]);
         else
             mem_l = regions[i];
+        
         region_base = cap_base(mem_l);
         region_end = cap_end(mem_l);
         if(base >= region_base && base + len <= region_end)
@@ -341,6 +345,58 @@ static unsigned create_domain(unsigned base_addr, unsigned mem_size,
     return dom_n - 1;
 }
 
+static void create_nested_domain(unsigned base_addr, unsigned mem_size,
+                          unsigned tot_size, unsigned entry_offset,
+                          unsigned split_offset)
+{
+
+    // alignment requirement
+    mem_size = (((mem_size - 1) >> 4) + 1) << 4;
+    __linear void *mem_l, *dom_code, *dom_data, *dom_split, *mem_r;
+    __linear void **dom_seal;
+    
+    dom_code = split_out_cap(base_addr, tot_size, 1);
+
+    dom_seal = __split(dom_code, base_addr + mem_size);
+    
+
+    if (split_offset != 0) {
+        dom_split = __split(dom_code, base_addr + split_offset);
+    } else {
+        dom_split = 0;
+    }
+    C_SET_CURSOR(dom_code, dom_code, base_addr + entry_offset);
+    C_PRINT(dom_split);
+    C_PRINT(split_offset);
+    C_PRINT(dom_data);
+    C_PRINT(4);
+    nested_dom_code = dom_code;
+    nested_dom_vm = dom_split;
+    nested_dom_seal = dom_seal;
+    
+
+    
+}
+
+static unsigned call_nested_domain(unsigned dom_id)
+{
+    if(dom_id >= dom_n) {
+        return -1;
+    }
+    unsigned call_id;
+    void *cepc;
+    __dom void *d = domains[dom_id];
+    __asm__("ccsrrw(%0, cepc, x0)" : "=r"(cepc));
+    d = __domcallsaves(d, nested_dom_code, nested_dom_vm, nested_dom_seal);
+    __asm__("ccsrrw(x0, cepc, %0)" :: "r"(cepc));
+
+    __asm__ ("mv %0, a7" : "=r"(call_id));
+    domains[dom_id] = d;
+    C_PRINT(call_id);
+    C_PRINT(0x86);
+    return call_id;
+}
+
 static unsigned call_domain(unsigned dom_id) {
     if(dom_id >= dom_n) {
         return -1;
@@ -368,9 +424,10 @@ static unsigned call_domain_split(unsigned dom_id, unsigned region_id, unsigned 
     if(shared_region_id != -1){
         shared_region = regions[shared_region_id];
     }
+    
     __dom void *d = domains[dom_id];
     __linear void *split = domain_splits[dom_id];
-
+    C_PRINT(split);
     // save CEPC
     // TODO: potentially other things need to be saved too
     __asm__("ccsrrw(%0, cepc, x0)" : "=r"(cepc));
@@ -383,7 +440,8 @@ static unsigned call_domain_split(unsigned dom_id, unsigned region_id, unsigned 
     if(region_id != -1) {
         regions[region_id] = region;
     }
-
+    C_PRINT(call_id);
+    C_PRINT(0x87);
     return call_id;
 }
 
@@ -766,6 +824,13 @@ unsigned handle_trap_ecall(unsigned arg0, unsigned arg1,
                 case SBI_EXT_CAPSTONE_DELINEARIZE_REGION:
                     res = delinearize_region(arg0);
                     break;
+                case SBI_EXT_CAPSTONE_NESTED_DOM_CREATE:
+                    res = create_nested_domain(arg0, arg1, arg2, arg3, arg4);
+                    C_PRINT(0x122);
+                    break;
+                case SBI_EXT_CAPSTONE_NESTED_DOM_CALL:
+                    res = call_nested_domain(arg0);
+                    break;
                 default:
                     err = 1;
             }
@@ -773,6 +838,7 @@ unsigned handle_trap_ecall(unsigned arg0, unsigned arg1,
         default:
             err = 1;
     }
+    
     return res;
 }
 
