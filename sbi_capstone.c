@@ -57,6 +57,7 @@ unsigned *smode_saved_context;
 void *nested_dom_code;
 void *nested_dom_vm;
 void **nested_dom_seal;
+__dom void *child_dom;
 static __linear void *read_cpmp(unsigned n) {
     __linear void *res;
     switch(n) {
@@ -298,16 +299,16 @@ static unsigned create_domain(unsigned base_addr, unsigned mem_size,
     mem_size = (((mem_size - 1) >> 4) + 1) << 4;
     __linear void *mem_l, *dom_code, *dom_data, *dom_split, *mem_r;
     __linear void **dom_seal;
-    C_PRINT(base_addr);
-    C_PRINT(tot_size);
-    C_PRINT(mem_size);
+    //C_PRINT(base_addr);
+    //C_PRINT(tot_size);
+    //C_PRINT(mem_size);
 
     dom_code = split_out_cap(base_addr, tot_size, 1);
 
-    C_PRINT(dom_code);
+    //C_PRINT(dom_code);
 
     dom_seal = __split(dom_code, base_addr + mem_size);
-    C_PRINT(dom_seal);
+    //C_PRINT(dom_seal);
     dom_data = __split(dom_seal, base_addr + mem_size + DOMAIN_DATA_SIZE);
 
 
@@ -316,10 +317,10 @@ static unsigned create_domain(unsigned base_addr, unsigned mem_size,
     } else {
         dom_split = 0;
     }
-    C_PRINT(dom_split);
-    C_PRINT(split_offset);
-    C_PRINT(dom_data);
-    C_PRINT(4);
+    //C_PRINT(dom_split);
+    //C_PRINT(split_offset);
+    //C_PRINT(dom_data);
+    //C_PRINT(4);
 
     int i;
     for(i = 0; i < DOMAIN_DATA_N; i += 1) {
@@ -370,6 +371,7 @@ static void create_nested_domain(unsigned base_addr, unsigned mem_size,
     C_PRINT(split_offset);
     C_PRINT(dom_data);
     C_PRINT(4);
+    while(1){}
     nested_dom_code = dom_code;
     nested_dom_vm = dom_split;
     nested_dom_seal = dom_seal;
@@ -394,6 +396,27 @@ static unsigned call_nested_domain(unsigned dom_id)
     domains[dom_id] = d;
     C_PRINT(call_id);
     C_PRINT(0x86);
+    return call_id;
+}
+
+static unsigned call_child_domain(unsigned dom_id, unsigned shared_region_id){
+    if(dom_id >= dom_n) {
+        return -1;
+    }
+    unsigned call_id;
+    void *cepc;
+    __dom void *d = child_dom;
+    __asm__("ccsrrw(%0, cepc, x0)" : "=r"(cepc));
+    d = __domcallsaves(d, 1);
+    __asm__("ccsrrw(x0, cepc, %0)" :: "r"(cepc));
+
+    __asm__ ("mv %0, a7" : "=r"(call_id));
+    if(call_id == 220){
+        while(1){}
+    }
+    domains[dom_id] = d;
+    C_PRINT(call_id);
+    //C_PRINT(0x86);
     return call_id;
 }
 
@@ -424,10 +447,10 @@ static unsigned call_domain_split(unsigned dom_id, unsigned region_id, unsigned 
     if(shared_region_id != -1){
         shared_region = regions[shared_region_id];
     }
-    
+    __dom void *child_dom_cap_local;
     __dom void *d = domains[dom_id];
     __linear void *split = domain_splits[dom_id];
-    C_PRINT(split);
+    //C_PRINT(split);
     // save CEPC
     // TODO: potentially other things need to be saved too
     __asm__("ccsrrw(%0, cepc, x0)" : "=r"(cepc));
@@ -435,13 +458,22 @@ static unsigned call_domain_split(unsigned dom_id, unsigned region_id, unsigned 
     __asm__("ccsrrw(x0, cepc, %0)" :: "r"(cepc));
 
     __asm__ ("mv %0, a7" : "=r"(call_id));
+    
+    __asm__ ("STC(a0, sp, -16)");
+    if(call_id == 220){
+        __asm__ ("LDC(%0, sp, -16)": "=r"(child_dom_cap_local));
+        child_dom = child_dom_cap_local;
+        C_PRINT(child_dom_cap_local);
+        C_PRINT(0x123);
+        
+    }
     domains[dom_id] = d;
     domain_splits[dom_id] = split;
     if(region_id != -1) {
         regions[region_id] = region;
     }
-    C_PRINT(call_id);
-    C_PRINT(0x87);
+    //C_PRINT(call_id);
+    //C_PRINT(0x87);
     return call_id;
 }
 
@@ -830,6 +862,9 @@ unsigned handle_trap_ecall(unsigned arg0, unsigned arg1,
                     break;
                 case SBI_EXT_CAPSTONE_NESTED_DOM_CALL:
                     res = call_nested_domain(arg0);
+                    break;
+                case SBI_EXT_CAPSTONE_CHILD_DOM_CALL:
+                    res = call_child_domain(arg0, arg1);
                     break;
                 default:
                     err = 1;
