@@ -22,6 +22,7 @@
 #define cap_base(cap) __capfield((cap), 3)
 #define cap_end(cap) __capfield((cap), 4)
 #define cap_type(cap) __capfield((cap), 1)
+#define cap_valid(cap) __capfield((cap), 0)
 #define debug_counter_inc(counter_no, delta) __asm__ volatile(".insn r 0x5b, 0x1, 0x45, x0, %0, %1" :: "r"(counter_no), "r"(delta))
 #define debug_counter_tick(counter_no) debug_counter_inc((counter_no), 1)
 
@@ -58,6 +59,7 @@ void *nested_dom_code;
 void *nested_dom_vm;
 void **nested_dom_seal;
 __dom void *child_dom;
+void *sql_cap;
 static __linear void *read_cpmp(unsigned n) {
     __linear void *res;
     switch(n) {
@@ -399,15 +401,23 @@ static unsigned call_nested_domain(unsigned dom_id)
     return call_id;
 }
 
-static unsigned call_child_domain(unsigned dom_id, unsigned shared_region_id){
+static unsigned call_child_domain(unsigned dom_id, unsigned region_id){
     if(dom_id >= dom_n) {
         return -1;
     }
     unsigned call_id;
     void *cepc;
+    void *region;
+    if(region_id != -1){
+        region = regions[region_id];
+    }
+     C_PRINT(region);
     __dom void *d = child_dom;
     __asm__("ccsrrw(%0, cepc, x0)" : "=r"(cepc));
-    d = __domcallsaves(d, 1);
+    if(region_id == -1)
+    	d = __domcallsaves(d, 1);
+    else
+    	d = __domcallsaves(d, 1, region);
     __asm__("ccsrrw(x0, cepc, %0)" :: "r"(cepc));
 
     __asm__ ("mv %0, a7" : "=r"(call_id));
@@ -454,7 +464,13 @@ static unsigned call_domain_split(unsigned dom_id, unsigned region_id, unsigned 
     // save CEPC
     // TODO: potentially other things need to be saved too
     __asm__("ccsrrw(%0, cepc, x0)" : "=r"(cepc));
-    d = __domcallsaves(d, split, region, shared_region);
+    if(cap_valid(sql_cap) == 0){
+    	d = __domcallsaves(d, split, region, shared_region);
+    }
+    else{
+        d = __domcallsaves(d, split, region, shared_region, sql_cap);
+        sql_cap = 0;
+    }
     __asm__("ccsrrw(x0, cepc, %0)" :: "r"(cepc));
 
     __asm__ ("mv %0, a7" : "=r"(call_id));
@@ -529,6 +545,11 @@ static unsigned create_shared_region(unsigned base, unsigned len) {
         capstone_error(CAPSTONE_NO_CPMP_REGION);
     }
     return region_n - 1;
+}
+
+static void create_sql_region(unsigned base, unsigned len) {
+    __linear void *region = split_out_cap(base, len, 1);
+    sql_cap = region;
 }
 
 static unsigned shared_region_annotated(unsigned dom_id, unsigned region_id, unsigned annotation_perm, unsigned annotation_rev) {
@@ -865,6 +886,10 @@ unsigned handle_trap_ecall(unsigned arg0, unsigned arg1,
                     break;
                 case SBI_EXT_CAPSTONE_CHILD_DOM_CALL:
                     res = call_child_domain(arg0, arg1);
+                    break;
+                case SBI_EXT_CAPSTONE_SQL_REGION_CREATE:
+                    create_sql_region(arg0, arg1);
+                    res = 0;
                     break;
                 default:
                     err = 1;
