@@ -246,6 +246,12 @@ static void *split_out_cap(unsigned base, unsigned len, unsigned linear) {
         if(base == region_base) {
             // matching region. We don't support this for now
             C_PRINT(0x1234);
+            C_PRINT(0x5678);
+            C_PRINT(base);
+            C_PRINT(len);
+            C_PRINT(region_base);
+            C_PRINT(region_end);
+            C_PRINT(region);
             while(1);
         } else {
             if(region_cpmp[i] != -1)
@@ -357,23 +363,18 @@ static void create_nested_domain(unsigned base_addr, unsigned mem_size,
     mem_size = (((mem_size - 1) >> 4) + 1) << 4;
     __linear void *mem_l, *dom_code, *dom_data, *dom_split, *mem_r;
     __linear void **dom_seal;
-    
+   
     dom_code = split_out_cap(base_addr, tot_size, 1);
-
     dom_seal = __split(dom_code, base_addr + mem_size);
     
-
     if (split_offset != 0) {
         dom_split = __split(dom_code, base_addr + split_offset);
     } else {
         dom_split = 0;
     }
     C_SET_CURSOR(dom_code, dom_code, base_addr + entry_offset);
-    C_PRINT(dom_split);
-    C_PRINT(split_offset);
-    C_PRINT(dom_data);
-    C_PRINT(4);
-    while(1){}
+  
+   
     nested_dom_code = dom_code;
     nested_dom_vm = dom_split;
     nested_dom_seal = dom_seal;
@@ -405,6 +406,7 @@ static unsigned call_child_domain(unsigned dom_id, unsigned region_id){
     if(dom_id >= dom_n) {
         return -1;
     }
+    C_PRINT(0x21);
     unsigned call_id;
     void *cepc;
     void *region;
@@ -482,6 +484,9 @@ static unsigned call_domain_split(unsigned dom_id, unsigned region_id, unsigned 
         C_PRINT(child_dom_cap_local);
         C_PRINT(0x123);
         
+    }
+    if(call_id == 63){
+        C_PRINT(0x124);
     }
     domains[dom_id] = d;
     domain_splits[dom_id] = split;
