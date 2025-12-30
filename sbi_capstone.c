@@ -406,28 +406,26 @@ static unsigned call_child_domain(unsigned dom_id, unsigned region_id){
     if(dom_id >= dom_n) {
         return -1;
     }
-    C_PRINT(0x21);
     unsigned call_id;
     void *cepc;
     void *region;
     if(region_id != -1){
         region = regions[region_id];
     }
-     C_PRINT(region);
+     
     __dom void *d = child_dom;
     __asm__("ccsrrw(%0, cepc, x0)" : "=r"(cepc));
     if(region_id == -1)
-    	d = __domcallsaves(d, 1);
+    	d = __domcallsaves(d, 0);
     else
-    	d = __domcallsaves(d, 1, region);
+    	d = __domcallsaves(d, 0, region);
     __asm__("ccsrrw(x0, cepc, %0)" :: "r"(cepc));
 
     __asm__ ("mv %0, a7" : "=r"(call_id));
     if(call_id == 220){
         while(1){}
     }
-    domains[dom_id] = d;
-    C_PRINT(call_id);
+    //domains[dom_id] = d;
     //C_PRINT(0x86);
     return call_id;
 }
@@ -462,39 +460,48 @@ static unsigned call_domain_split(unsigned dom_id, unsigned region_id, unsigned 
     __dom void *child_dom_cap_local;
     __dom void *d = domains[dom_id];
     __linear void *split = domain_splits[dom_id];
+    domain_splits[dom_id] = 0;
+    unsigned timer;
     //C_PRINT(split);
     // save CEPC
     // TODO: potentially other things need to be saved too
     __asm__("ccsrrw(%0, cepc, x0)" : "=r"(cepc));
     if(cap_valid(sql_cap) == 0){
-    	d = __domcallsaves(d, split, region, shared_region);
+        if(cap_valid(split) == 0){
+           
+            d = __domcallsaves(d, 1, region, shared_region);
+        }
+    	else{
+    	    d = __domcallsaves(d, split, region, shared_region);
+    	}
     }
     else{
+    	C_PRINT(0x11111);while(1){}
         d = __domcallsaves(d, split, region, shared_region, sql_cap);
         sql_cap = 0;
     }
     __asm__("ccsrrw(x0, cepc, %0)" :: "r"(cepc));
-
+    __asm__ ("rdcycle %0" : "=r"(timer));
+    C_PRINT(timer);
+    
     __asm__ ("mv %0, a7" : "=r"(call_id));
     
     __asm__ ("STC(a0, sp, -16)");
     if(call_id == 220){
         __asm__ ("LDC(%0, sp, -16)": "=r"(child_dom_cap_local));
         child_dom = child_dom_cap_local;
-        C_PRINT(child_dom_cap_local);
-        C_PRINT(0x123);
+        
         
     }
     if(call_id == 63){
-        C_PRINT(0x124);
+        //C_PRINT(0x124);
     }
     domains[dom_id] = d;
-    domain_splits[dom_id] = split;
+    //domain_splits[dom_id] = split;
     if(region_id != -1) {
         regions[region_id] = region;
     }
-    //C_PRINT(call_id);
-    //C_PRINT(0x87);
+    
     return call_id;
 }
 
