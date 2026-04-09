@@ -8,6 +8,7 @@ _dom_reentry:
 
 _cap_trap_entry:
      //.insn r 0x5b, 0x1, 0x43, x0,x0, x0
+    
     CCSRRW(sp, CCSR_CSCRATCH, sp)
 
     CINCOFFSETIMM(sp, sp, -32 * 8)
@@ -52,6 +53,7 @@ _cap_trap_entry:
     # TODO: however, this would require the bottom of the stack to be reserved
     # for storing S-mode context
     call save_smode_context
+    
     CINCOFFSETIMM(sp, sp, 16)
     RESTORE_REG(a0, sp)
     RESTORE_REG(a1, sp)
@@ -64,17 +66,19 @@ _cap_trap_entry:
     CINCOFFSETIMM(sp, sp, -16)
 
     csrr t0, mcause
-
+    
     srli t1, t0, 63
     bne t1, x0, _handle_ints
     li t1, CAUSE_SUPERVISOR_ECALL
     bne t0, t1, _handle_non_ecall
     bne a6, x0, normal
     li t0, 0x12345678 
+    
     bne a7, t0, normal
     
  
 normal:
+    
     call handle_trap_ecall
     mv a1, a0
     li a0, 0
@@ -159,6 +163,7 @@ call_into_smode:
     STC(gp, sp, -8 * 32 -16)
     CCSRRW(sp, CCSR_CSCRATCH, sp)
     li gp, 0
+    
 
     mret
 

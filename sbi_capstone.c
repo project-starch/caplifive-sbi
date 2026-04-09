@@ -60,6 +60,11 @@ void *nested_dom_vm;
 void **nested_dom_seal;
 __dom void *child_dom;
 void *sql_cap;
+
+//unsigned finish_init;
+unsigned os_total_time;
+//unsigned os_time_begin;
+//unsigned syscall_id;
 static __linear void *read_cpmp(unsigned n) {
     __linear void *res;
     switch(n) {
@@ -302,14 +307,20 @@ static unsigned create_domain(unsigned base_addr, unsigned mem_size,
                           unsigned tot_size, unsigned entry_offset,
                           unsigned split_offset)
 {
-
+    //__asm__ volatile ("csrw 0x811, x0");
+    unsigned time;
+    __asm__ volatile("rdinstret %0":"=r"(time));
+    
+   //C_PRINT(0x1111);
+   C_PRINT(time);
+   //while(1){}
     // alignment requirement
     mem_size = (((mem_size - 1) >> 4) + 1) << 4;
     __linear void *mem_l, *dom_code, *dom_data, *dom_split, *mem_r;
     __linear void **dom_seal;
-    //C_PRINT(base_addr);
-    //C_PRINT(tot_size);
-    //C_PRINT(mem_size);
+    C_PRINT(base_addr);
+    C_PRINT(tot_size);
+    C_PRINT(mem_size);
 
     dom_code = split_out_cap(base_addr, tot_size, 1);
 
@@ -325,10 +336,10 @@ static unsigned create_domain(unsigned base_addr, unsigned mem_size,
     } else {
         dom_split = 0;
     }
-    //C_PRINT(dom_split);
-    //C_PRINT(split_offset);
-    //C_PRINT(dom_data);
-    //C_PRINT(4);
+    C_PRINT(dom_split);
+    C_PRINT(split_offset);
+    C_PRINT(dom_data);
+    C_PRINT(4);
 
     int i;
     for(i = 0; i < DOMAIN_DATA_N; i += 1) {
@@ -344,7 +355,7 @@ static unsigned create_domain(unsigned base_addr, unsigned mem_size,
 
     __dom void *dom = __seal(dom_seal);
 
-    // PRINT(dom);
+//     PRINT(dom);
 
     domains[dom_n] = dom;
     domain_splits[dom_n] = dom_split;
@@ -383,22 +394,29 @@ static void create_nested_domain(unsigned base_addr, unsigned mem_size,
     
 }
 
-static unsigned call_nested_domain(unsigned dom_id)
+static unsigned call_nested_domain(unsigned dom_id, unsigned region_id)
 {
     if(dom_id >= dom_n) {
         return -1;
+    }
+    void *region;
+    if(region_id != -1){
+        region = regions[region_id];
     }
     unsigned call_id;
     void *cepc;
     __dom void *d = domains[dom_id];
     __asm__("ccsrrw(%0, cepc, x0)" : "=r"(cepc));
-    d = __domcallsaves(d, nested_dom_code, nested_dom_vm, nested_dom_seal);
+    d = __domcallsaves(d, nested_dom_code, nested_dom_vm, nested_dom_seal, region);
     __asm__("ccsrrw(x0, cepc, %0)" :: "r"(cepc));
-
-    __asm__ ("mv %0, a7" : "=r"(call_id));
     domains[dom_id] = d;
-    C_PRINT(call_id);
-    C_PRINT(0x86);
+    C_PRINT(0x1223);
+    __asm__ ("mv %0, a7" : "=r"(call_id));
+    
+    //C_PRINT(call_id);
+    //C_PRINT(dom_id);
+    //C_PRINT(0x86);
+    //C_PRINT(d);
     return call_id;
 }
 
@@ -426,7 +444,7 @@ static unsigned call_child_domain(unsigned dom_id, unsigned region_id){
         while(1){}
     }
     //domains[dom_id] = d;
-    //C_PRINT(0x86);
+    //
     return call_id;
 }
 
@@ -447,7 +465,7 @@ static unsigned call_domain_split(unsigned dom_id, unsigned region_id, unsigned 
     if(dom_id >= dom_n) {
         return -1;
     }
-    unsigned call_id;
+    
     void *region = 0;
     void *shared_region;
     void *cepc;
@@ -457,44 +475,46 @@ static unsigned call_domain_split(unsigned dom_id, unsigned region_id, unsigned 
     if(shared_region_id != -1){
         shared_region = regions[shared_region_id];
     }
-    __dom void *child_dom_cap_local;
+    //__dom void *child_dom_cap_local;
     __dom void *d = domains[dom_id];
     __linear void *split = domain_splits[dom_id];
     domain_splits[dom_id] = 0;
-    unsigned timer;
-    //C_PRINT(split);
+    
     // save CEPC
     // TODO: potentially other things need to be saved too
+    unsigned call_id;
     __asm__("ccsrrw(%0, cepc, x0)" : "=r"(cepc));
+   
     if(cap_valid(sql_cap) == 0){
         if(cap_valid(split) == 0){
            
             d = __domcallsaves(d, 1, region, shared_region);
         }
     	else{
+    	    
+    	       
     	    d = __domcallsaves(d, split, region, shared_region);
     	}
+    	
     }
     else{
-    	C_PRINT(0x11111);while(1){}
+    	
         d = __domcallsaves(d, split, region, shared_region, sql_cap);
         sql_cap = 0;
     }
     __asm__("ccsrrw(x0, cepc, %0)" :: "r"(cepc));
-    __asm__ ("rdcycle %0" : "=r"(timer));
-    C_PRINT(timer);
+   // __asm__ ("rdcycle %0" : "=r"(timer));
+   /// C_PRINT(timer);
     
     __asm__ ("mv %0, a7" : "=r"(call_id));
     
     __asm__ ("STC(a0, sp, -16)");
+    
     if(call_id == 220){
         __asm__ ("LDC(%0, sp, -16)": "=r"(child_dom_cap_local));
         child_dom = child_dom_cap_local;
-        
-        
-    }
-    if(call_id == 63){
-        //C_PRINT(0x124);
+        C_PRINT(0x767);    
+        while(1){}
     }
     domains[dom_id] = d;
     //domain_splits[dom_id] = split;
@@ -505,6 +525,9 @@ static unsigned call_domain_split(unsigned dom_id, unsigned region_id, unsigned 
     return call_id;
 }
 
+static unsigned get_os_dom_execution_time() {
+    return os_total_time;
+}
 
 /* Create a capability from given address range and pass it to the domain through a call. */
 static unsigned call_domain_with_cap(unsigned dom_id, unsigned base, unsigned len, unsigned cursor) {
@@ -561,6 +584,7 @@ static unsigned create_shared_region(unsigned base, unsigned len) {
 
 static void create_sql_region(unsigned base, unsigned len) {
     __linear void *region = split_out_cap(base, len, 1);
+    //C_PRINT(region);C_PRINT(0x2345678);
     sql_cap = region;
 }
 
@@ -795,6 +819,7 @@ unsigned handle_trap_ecall(unsigned arg0, unsigned arg1,
                            unsigned func_code, unsigned ext_code) {
      //PRINT(ext_code);
      //PRINT(func_code);
+     
      if(ext_code == SBI_EXT_CAPSTONE){
          if(func_code == SBI_EXT_CAPSTONE_DOM_CREATE){
              //C_PRINT(0x111);
@@ -894,7 +919,7 @@ unsigned handle_trap_ecall(unsigned arg0, unsigned arg1,
                     C_PRINT(0x122);
                     break;
                 case SBI_EXT_CAPSTONE_NESTED_DOM_CALL:
-                    res = call_nested_domain(arg0);
+                    res = call_nested_domain(arg0, arg1);
                     break;
                 case SBI_EXT_CAPSTONE_CHILD_DOM_CALL:
                     res = call_child_domain(arg0, arg1);
