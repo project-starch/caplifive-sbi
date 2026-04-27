@@ -21,8 +21,15 @@
 #define cap_base(cap) __capfield((cap), 3)
 #define cap_end(cap) __capfield((cap), 4)
 #define cap_type(cap) __capfield((cap), 1)
+#ifdef CAPSTONE_DEBUG_ENABLE
 #define debug_counter_inc(counter_no, delta) __asm__ volatile(".insn r 0x5b, 0x1, 0x45, x0, %0, %1" :: "r"(counter_no), "r"(delta))
 #define debug_counter_tick(counter_no) debug_counter_inc((counter_no), 1)
+#else
+#define debug_counter_inc(counter_no, delta)
+#define debug_counter_tick(counter_no)
+#endif
+
+#define C_PRINT(v) __asm__ (".insn r 0x0B, 0, 0x7c, x0, %0, x0" : : "r"(v))
 
 #define CPMP_COUNT 16
 #define DOMAIN_DATA_N    96
@@ -57,15 +64,15 @@ static __linear void *read_cpmp(unsigned n) {
         case 0:
             C_READ_CCSR(cpmp(0), res);
             break;
-        case 1:                                                                                                                                          
-            C_READ_CCSR(cpmp(1), res);                                                                                                              
-            break;                                                                                                                                       
-        case 2:                                                                                                                                          
-            C_READ_CCSR(cpmp(2), res);                                                                                                              
-            break;                                                                                                                                       
-        case 3:                                                                                                                                          
-            C_READ_CCSR(cpmp(3), res);                                                                                                              
-            break;      
+        case 1:
+            C_READ_CCSR(cpmp(1), res);
+            break;
+        case 2:
+            C_READ_CCSR(cpmp(2), res);
+            break;
+        case 3:
+            C_READ_CCSR(cpmp(3), res);
+            break;
         case 4:
             C_READ_CCSR(cpmp(4), res);
             break;
@@ -738,6 +745,7 @@ unsigned handle_exception(unsigned cause) {
         default:
             __asm__ ("csrr a5, mcause");
             __asm__ ("csrr a6, mepc");
+            __asm__ ("1: j 1b");
             time_val = -1;
     }
     return time_val;

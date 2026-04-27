@@ -73,7 +73,7 @@ _cap_trap_entry:
     li t1, CAUSE_SUPERVISOR_ECALL
     fence.i
     bne t0, t1, _handle_non_ecall
-    
+
     fence.i
     call handle_trap_ecall
     mv a1, a0
@@ -146,7 +146,7 @@ _handle_branch_1:
 #     CINCOFFSETIMM(sp, sp, 32 * 8)
 #     CCSRRW(sp, CCSR_CSCRATCH, sp)
 #     j _dom_reentry
- 
+
 _handle_ints:
     # handle interrupts
     slli t0, t0, 1
