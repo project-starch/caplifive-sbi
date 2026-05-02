@@ -113,7 +113,7 @@ _handle_ints:
 return_to_sumode:
 
     STC(gp, sp, 0)
-
+    
     CINCOFFSETIMM(sp, sp, 16)
 
     RESTORE_REG(ra, sp)

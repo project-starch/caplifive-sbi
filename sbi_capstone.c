@@ -39,9 +39,11 @@ unsigned *mtimecmp;
 
 __dom void *domains[CAPSTONE_MAX_DOM_N];
 __linear void *domain_splits[CAPSTONE_MAX_DOM_N];
-void *regions[CAPSTONE_MAX_REGION_N];
+//void *regions[CAPSTONE_MAX_REGION_N];
+void *regions[128];
 /* the cpmp entry each region is associated with; -1 if unassociated */
-unsigned region_cpmp[CAPSTONE_MAX_REGION_N];
+//unsigned region_cpmp[CAPSTONE_MAX_REGION_N];
+unsigned region_cpmp[128];
 /* the region each cpmp entry is associated with; -1 if unassociated */
 unsigned cpmp_region[CPMP_COUNT];
 unsigned dom_n, region_n;
@@ -60,9 +62,11 @@ void *nested_dom_vm;
 void **nested_dom_seal;
 __dom void *child_dom;
 void *sql_cap;
-
+__dom void *dom_authenticated;
 //unsigned finish_init;
 unsigned os_total_time;
+unsigned current_dom_id;
+unsigned max_dom_id;
 //unsigned os_time_begin;
 //unsigned syscall_id;
 static __linear void *read_cpmp(unsigned n) {
@@ -228,7 +232,7 @@ static void *split_out_cap(unsigned base, unsigned len, unsigned linear) {
             mem_l = read_cpmp(region_cpmp[i]);
         else
             mem_l = regions[i];
-        
+        //C_PRINT(mem_l);
         region_base = cap_base(mem_l);
         region_end = cap_end(mem_l);
         if(base >= region_base && base + len <= region_end)
@@ -266,25 +270,29 @@ static void *split_out_cap(unsigned base, unsigned len, unsigned linear) {
         }
     } else {
         mem_r = __split(region, base + len);
-
+	
         if(base == region_base) {
             if(region_cpmp[i] != -1)
                 write_cpmp(region_cpmp[i], mem_r);
             else
                 regions[i] = mem_r;
         } else {
+            
             if(region_cpmp[i] != -1)
                 write_cpmp(region_cpmp[i], mem_l);
             else
                 regions[i] = mem_l;
-
+	    
             regions[region_n] = mem_r;
+            region_cpmp[region_n] = -1;
             region_n += 1;
+            
             /* we load regions into cpmp lazily*/
         }
+        
     }
 #endif
-
+    
     __linear void *region_linear;
     unsigned ty = __capfield(region, 1);
     if(linear && ty != 0) {
@@ -293,12 +301,17 @@ static void *split_out_cap(unsigned base, unsigned len, unsigned linear) {
         region_linear = region;
         region = __delin(region_linear);
     }
-
+    
     if(!linear) {
         regions[region_n] = region;
         region_n += 1;
     }
-
+    //if(region_n > 63){
+    //	C_PRINT(0x64);
+    //	C_PRINT(region_n);
+    //	C_PRINT(regions[64]);
+    	
+    //}
     return region;
 }
 
@@ -308,12 +321,8 @@ static unsigned create_domain(unsigned base_addr, unsigned mem_size,
                           unsigned split_offset)
 {
     //__asm__ volatile ("csrw 0x811, x0");
-    unsigned time;
-    __asm__ volatile("rdinstret %0":"=r"(time));
     
-   //C_PRINT(0x1111);
-   C_PRINT(time);
-   //while(1){}
+    
     // alignment requirement
     mem_size = (((mem_size - 1) >> 4) + 1) << 4;
     __linear void *mem_l, *dom_code, *dom_data, *dom_split, *mem_r;
@@ -408,11 +417,21 @@ static unsigned call_nested_domain(unsigned dom_id, unsigned region_id)
     __dom void *d = domains[dom_id];
     __asm__("ccsrrw(%0, cepc, x0)" : "=r"(cepc));
     d = __domcallsaves(d, nested_dom_code, nested_dom_vm, nested_dom_seal, region);
-    __asm__("ccsrrw(x0, cepc, %0)" :: "r"(cepc));
-    domains[dom_id] = d;
-    C_PRINT(0x1223);
+    __asm__ ("STC(a0, sp, -16)");
+    
+   
     __asm__ ("mv %0, a7" : "=r"(call_id));
     
+    if(call_id == 2300){
+    	__dom void *cap;
+        //__asm__ ("movc(%0, a0)" : "=r"(dom_authenticated));
+        __asm__ ("LDC(%0, sp, -16)": "=r"(cap));
+        C_PRINT(cap);
+        dom_authenticated = cap;
+        C_PRINT(dom_authenticated);
+    }
+    __asm__("ccsrrw(x0, cepc, %0)" :: "r"(cepc));
+    domains[dom_id] = d;
     //C_PRINT(call_id);
     //C_PRINT(dom_id);
     //C_PRINT(0x86);
@@ -440,6 +459,7 @@ static unsigned call_child_domain(unsigned dom_id, unsigned region_id){
     __asm__("ccsrrw(x0, cepc, %0)" :: "r"(cepc));
 
     __asm__ ("mv %0, a7" : "=r"(call_id));
+    
     if(call_id == 220){
         while(1){}
     }
@@ -447,7 +467,17 @@ static unsigned call_child_domain(unsigned dom_id, unsigned region_id){
     //
     return call_id;
 }
-
+ 
+static void call_receiver_domain(unsigned dom_id){
+    if(dom_id >= dom_n) {
+        return -1;
+    }
+    __dom void *d = domains[dom_id];
+    C_PRINT(dom_authenticated);
+    C_PRINT(0x22);
+    d = __domcallsaves(d, CAPSTONE_DPI_CALL, dom_authenticated);
+    while(1){}
+}
 static unsigned call_domain(unsigned dom_id) {
     if(dom_id >= dom_n) {
         return -1;
@@ -462,40 +492,49 @@ static unsigned call_domain(unsigned dom_id) {
 }
 
 static unsigned call_domain_split(unsigned dom_id, unsigned region_id, unsigned shared_region_id) {
-    if(dom_id >= dom_n) {
-        return -1;
-    }
+    //if(dom_id >= dom_n) {
+    //    return -1;
+    //}
     
     void *region = 0;
     void *shared_region;
     void *cepc;
+    unsigned time;
+    
     if(region_id != -1) {
         region = regions[region_id];
+    //    C_PRINT(region);
     }
     if(shared_region_id != -1){
         shared_region = regions[shared_region_id];
     }
-    //__dom void *child_dom_cap_local;
     __dom void *d = domains[dom_id];
     __linear void *split = domain_splits[dom_id];
     domain_splits[dom_id] = 0;
-    
+     
     // save CEPC
     // TODO: potentially other things need to be saved too
     unsigned call_id;
     __asm__("ccsrrw(%0, cepc, x0)" : "=r"(cepc));
-   
+    //C_PRINT(d);
+   // __asm__("rdcycle %0" : "=r"(time));
+   // 	C_PRINT(time);
     if(cap_valid(sql_cap) == 0){
         if(cap_valid(split) == 0){
-           
-            d = __domcallsaves(d, 1, region, shared_region);
+            if(dom_id == 0)
+            	d = __domcallsaves(d, 1, region, shared_region);
+            else{
+            	d = __domcallsaves(d, 0, region, shared_region);
+            }
+            	
         }
     	else{
     	    
     	       
     	    d = __domcallsaves(d, split, region, shared_region);
     	}
-    	
+    	//__asm__("rdcycle %0" : "=r"(time));
+    	//C_PRINT(time);
     }
     else{
     	
@@ -503,25 +542,35 @@ static unsigned call_domain_split(unsigned dom_id, unsigned region_id, unsigned 
         sql_cap = 0;
     }
     __asm__("ccsrrw(x0, cepc, %0)" :: "r"(cepc));
-   // __asm__ ("rdcycle %0" : "=r"(timer));
-   /// C_PRINT(timer);
+   
     
     __asm__ ("mv %0, a7" : "=r"(call_id));
     
     __asm__ ("STC(a0, sp, -16)");
-    
+    // If fork
     if(call_id == 220){
-        __asm__ ("LDC(%0, sp, -16)": "=r"(child_dom_cap_local));
-        child_dom = child_dom_cap_local;
-        C_PRINT(0x767);    
-        while(1){}
+        __dom void *child_dom_cap;
+        __asm__ ("LDC(%0, sp, -16)": "=r"(child_dom_cap));
+        if(max_dom_id == 0)
+            max_dom_id = dom_id;
+        max_dom_id = max_dom_id + 1;
+        //C_PRINT(0x767);
+        //C_PRINT(child_dom_cap);
+        domains[max_dom_id] = child_dom_cap;
+            
+        
     }
     domains[dom_id] = d;
     //domain_splits[dom_id] = split;
-    if(region_id != -1) {
-        regions[region_id] = region;
-    }
-    
+    //if(region_id != -1) {
+    //    regions[region_id] = region;
+    //}
+    //if(region_n > 63){
+    //	C_PRINT(0x66);
+   // 	C_PRINT(region_n);
+    //	C_PRINT(regions[64]);
+    //	C_PRINT(region_cpmp[64]);
+    //}
     return call_id;
 }
 
@@ -542,11 +591,24 @@ static unsigned call_domain_with_cap(unsigned dom_id, unsigned base, unsigned le
 }
 
 static unsigned create_region(unsigned base, unsigned len) {
+    
+    
+    if(base == 0x1024a4000){
+        void *cap;
+        if(region_cpmp[65] != -1)
+            cap = read_cpmp(region_cpmp[65]);
+        else
+            cap = regions[65];
+        
+        if(region_cpmp[65] != -1)
+            write_cpmp(region_cpmp[65], cap);
+        else
+            regions[65] = cap;
+    }
     void *region = split_out_cap(base, len, 1);
-
     regions[region_n] = region;
     region_n += 1;
-
+    
     return region_n - 1;
 }
 static unsigned delinearize_region(unsigned region_id){
@@ -564,7 +626,7 @@ static unsigned create_shared_region(unsigned base, unsigned len) {
     regions[region_n] = region;
     region_n = region_n + 1;
 
-
+    
     // Put the region in one of cpmp entries
     unsigned cpmp_id;
     for(cpmp_id = 0; cpmp_id < CPMP_COUNT; cpmp_id += 1) {
@@ -766,17 +828,18 @@ static void return_from_domain(unsigned retval) {
 }
 
 static unsigned query_region(unsigned region_id, unsigned field) {
+    //C_PRINT(region_id);
     if(region_id >= region_n) {
         return -1;
     }
-
+    
     __linear void *region;
     if(region_cpmp[region_id] != -1) {
         region = read_cpmp(region_cpmp[region_id]);
     } else {
         region = regions[region_id];
     }
-
+    //C_PRINT(region);
     unsigned res;
     switch(field) {
         case CAPSTONE_REGION_FIELD_BASE:
@@ -791,7 +854,7 @@ static unsigned query_region(unsigned region_id, unsigned field) {
         default:
             res = -1;
     }
-
+    //C_PRINT(res);
     if(region_cpmp[region_id] != -1) {
         write_cpmp(region_cpmp[region_id], region);
     } else {
@@ -877,6 +940,7 @@ unsigned handle_trap_ecall(unsigned arg0, unsigned arg1,
                     break;
                 case SBI_EXT_CAPSTONE_REGION_CREATE:
                     res = create_region(arg0, arg1);
+                    
                     break;
                 case SBI_EXT_CAPSTONE_SHARED_REGION_CREATE:
                     res = create_shared_region(arg0, arg1);
@@ -916,7 +980,7 @@ unsigned handle_trap_ecall(unsigned arg0, unsigned arg1,
                     break;
                 case SBI_EXT_CAPSTONE_NESTED_DOM_CREATE:
                     res = create_nested_domain(arg0, arg1, arg2, arg3, arg4);
-                    C_PRINT(0x122);
+                    
                     break;
                 case SBI_EXT_CAPSTONE_NESTED_DOM_CALL:
                     res = call_nested_domain(arg0, arg1);
@@ -926,6 +990,10 @@ unsigned handle_trap_ecall(unsigned arg0, unsigned arg1,
                     break;
                 case SBI_EXT_CAPSTONE_SQL_REGION_CREATE:
                     create_sql_region(arg0, arg1);
+                    res = 0;
+                    break;
+                case SBI_EXT_CAPSTONE_AUTHEN_DOM_CALL:
+                    call_receiver_domain(arg0);
                     res = 0;
                     break;
                 default:
