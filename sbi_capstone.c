@@ -29,7 +29,8 @@
 #define debug_counter_tick(counter_no)
 #endif
 
-#define C_PRINT(v) __asm__ (".insn r 0x0B, 0, 0x7c, x0, %0, x0" : : "r"(v))
+// #define C_PRINT(v) __asm__ (".insn r 0x0B, 0, 0x7c, x0, %0, x0" : : "r"(v))
+#define C_PRINT(v) __asm__ volatile("csrw 0x800, %0" :: "r"(v))
 
 #define CPMP_COUNT 16
 #define DOMAIN_DATA_N    96
@@ -682,8 +683,10 @@ static void swap_cpmp(unsigned badaddr) {
     for(region_id = 0; region_id < region_n; region_id += 1) {
         if(region_cpmp[region_id] != -1) // already loaded
             continue;
-        start_addr = cap_base(regions[region_id]);
-        end_addr = cap_end(regions[region_id]);
+        tmp = regions[region_id];
+        start_addr = cap_base(tmp);
+        end_addr = cap_end(tmp);
+        regions[region_id] = tmp;
         if(start_addr <= badaddr && badaddr < end_addr)
             break;
     }
