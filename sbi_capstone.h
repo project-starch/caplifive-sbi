@@ -18,8 +18,8 @@
    Note that this definition is for the RTL implementation
    and different from the specification.
 */
-#define CAP_TYPE_LINEAR  1
-#define CAP_TYPE_NONLIN  2
+#define CAP_TYPE_LINEAR  0
+#define CAP_TYPE_NONLIN  1
 
 #define CAPENTER(rs1, rs2) .insn r 0x5b, 0x1, 0xd, x0, rs1, rs2
 #define SETCAPMEM(reg) .insn r 0x5b, 0x1, 0x41, x0, reg, x0

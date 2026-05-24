@@ -386,7 +386,7 @@ static unsigned shared_region_annotated(unsigned dom_id, unsigned region_id, uns
     }
     else if (annotation_rev == CAPSTONE_ANNOTATION_REV_SHARED) {
         // capability type: non-linear; post-return revoke: no
-        if (cap_type(r) == 1) {
+        if (cap_type(r) == CAP_TYPE_LINEAR) {
             r = __delin(r);
 
             if (region_cpmp[region_id] != -1) {
@@ -400,7 +400,7 @@ static unsigned shared_region_annotated(unsigned dom_id, unsigned region_id, uns
     else if (annotation_rev == CAPSTONE_ANNOTATION_REV_TRANSFERRED) {
         // capability type: linear; post-return revoke: no
         // TODO: regions[region_id] should be added to a free list
-        if (cap_type(r) != 1) {
+        if (cap_type(r) != CAP_TYPE_LINEAR) {
             //C_PRINT(0xdeadbeef);
             while(1);
         }
