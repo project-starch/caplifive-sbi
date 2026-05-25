@@ -722,7 +722,7 @@ static void swap_cpmp(unsigned badaddr) {
 }
 
 unsigned handle_exception(unsigned cause) {
-    unsigned badaddr, epc;
+    unsigned badaddr;
     unsigned time_val;
     switch(cause) {
         case CAUSE_ILLEGAL_INSTRUCTION:
@@ -730,9 +730,6 @@ unsigned handle_exception(unsigned cause) {
             C_READ_CSR(mtval, badaddr);
             if (((badaddr & 0xFFF0707F) == CSR_TIME)) {
                 time_val = *mtime;
-                // __asm__ ("csrr %0, mepc" : "=r"(epc));
-                // epc += 4;
-                // __asm__ ("csrw mepc, %0" :: "r"(epc));
                 break;
             }
             else {
