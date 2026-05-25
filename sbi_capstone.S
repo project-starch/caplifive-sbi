@@ -9,6 +9,7 @@ _dom_reentry:
 #endif
 
 _cap_trap_entry:
+    fence.i
     CCSRRW(sp, CCSR_CSCRATCH, sp)
 
     CINCOFFSETIMM(sp, sp, -32 * 8)
@@ -52,6 +53,7 @@ _cap_trap_entry:
 
     # TODO: however, this would require the bottom of the stack to be reserved
     # for storing S-mode context
+    fence.i
     call save_smode_context
     CINCOFFSETIMM(sp, sp, 16)
     RESTORE_REG(a0, sp)
@@ -69,8 +71,10 @@ _cap_trap_entry:
     srli t1, t0, 63
     bne t1, x0, _handle_ints
     li t1, CAUSE_SUPERVISOR_ECALL
+    fence.i
     bne t0, t1, _handle_non_ecall
 
+    fence.i
     call handle_trap_ecall
     mv a1, a0
     li a0, 0
@@ -78,10 +82,12 @@ _cap_trap_entry:
     CCSRRW(t0, CCSR_CEPC, x0)
     addi t0, t0, 4
     CCSRRW(x0, CCSR_CEPC, t0)
+    fence.i
     j return_to_sumode
 
 _handle_non_ecall:
     mv a0, t0
+    fence.i
     call handle_exception
     li t1, -1
     beq a0, t1, _handle_branch_1
@@ -102,6 +108,7 @@ _handle_branch_1:
     RESTORE_REG(a0, sp)
     RESTORE_REG(a1, sp)
     CINCOFFSETIMM(sp, sp, -16)
+    fence.i
     j return_to_sumode
 
 # _get_smode_context: //Debugging
@@ -195,6 +202,7 @@ return_to_sumode:
     # right before returning to S mode:
     # cscratch: sp  ->
     #      sp - 8 * 32 - 16  -> gp
+    fence.i
     mret
 
 call_into_smode:
@@ -205,7 +213,7 @@ call_into_smode:
     STC(gp, sp, -8 * 32 -16)
     CCSRRW(sp, CCSR_CSCRATCH, sp)
     li gp, 0
-
+    fence.i
     mret
 
 resume_smode:
