@@ -18,6 +18,10 @@
 #define C_SET_CURSOR(dest, cap, cursor) __asm__("scc(%0, %1, %2)" : "=r"(dest) : "r"(cap), "r"(cursor))
 #define C_PRINT(v) __asm__ volatile(".insn r 0x5b, 0x1, 0x43, x0, %0, x0" :: "r"(v))
 #define C_GEN_CAP(dest, base, end) __asm__(".insn r 0x5b, 0x1, 0x40, %0, %1, %2" : "=r"(dest) : "r"(base), "r"(end));
+/* csinit rd, rs1, rs2: UNINIT(cursor==end) -> LIN with cursor = base + rs2.
+ * No __init builtin exists, so emit the instruction directly (funct7 0x9),
+ * same style as C_PRINT/C_GEN_CAP. */
+#define C_INIT(dest, cap, offset) __asm__(".insn r 0x5b, 0x1, 0x9, %0, %1, %2" : "=r"(dest) : "r"(cap), "r"(offset))
 #define capstone_error(err_code) do { C_PRINT(CAPSTONE_ERR_STARTER); C_PRINT(err_code); while(1); } while(0)
 #define cap_base(cap) __capfield((cap), 3)
 #define cap_end(cap) __capfield((cap), 4)
@@ -383,6 +387,14 @@ static unsigned shared_region_annotated(unsigned dom_id, unsigned region_id, uns
     }
     else if (annotation_rev == CAPSTONE_ANNOTATION_REV_BORROWED) {
         // capability type: linear; post-return revoke: yes
+        /* Re-share after a prior revoke: revoking the linear borrow left the
+         * retained handle UNINIT (with cursor==end, per helper_csrevoke). mrev
+         * requires a LIN input, so re-initialise first: csinit(offset 0) ->
+         * LIN, cursor=base. On the first share r is already LIN, so skip. This
+         * is the explicit owner reclaim step for a linear borrow. */
+        if (cap_type(r) == 3 /* CAP_TYPE_UNINIT */) {
+            C_INIT(r, r, 0);
+        }
         __rev void *rev = __mrev(r);
 
         if (region_cpmp[region_id] != -1) {
@@ -529,6 +541,20 @@ static void return_from_domain(unsigned retval) {
 
     *caller_buf = retval;
     __domreturnsaves(caller_dom, DOM_REENTRY_POINT, 0);
+}
+
+/* Step B: terminate the currently-running domain because it hit an
+ * unrecoverable capability/access fault, and return control cleanly to the
+ * caller (the lender/host) with a fault sentinel -- rather than spinning in
+ * capstone_error(). This reuses the exact domain-return path a normal
+ * DOM_RETURN ecall takes (return_from_domain -> __domreturnsaves), which is
+ * already invoked from inside _cap_trap_entry, so it composes with the trap
+ * context. The cause is emitted for the log but the caller only needs to see
+ * that the call faulted (CAPSTONE_DOMAIN_FAULT_RETVAL). Does not return. */
+static void fault_return_from_domain(unsigned cause) {
+    C_PRINT(CAPSTONE_ERR_STARTER);
+    C_PRINT(cause);
+    return_from_domain(CAPSTONE_DOMAIN_FAULT_RETVAL);
 }
 
 static unsigned query_region(unsigned region_id, unsigned field) {
@@ -695,11 +721,14 @@ static void swap_cpmp(unsigned badaddr) {
             break;
     }
     if(region_id >= region_n) {
+        /* No region covers badaddr: this is not a recoverable CPMP miss but an
+         * unrecoverable domain fault (e.g. a use-after-revoke store, whose
+         * region was revoked, or an out-of-bounds access). Terminate the domain
+         * and return the fault to the caller instead of spinning. */
         C_PRINT(badaddr);
         C_PRINT(region_n);
-        print_regions();
-        print_cpmps();
-        capstone_error(CAPSTONE_NO_CPMP_REGION);
+        fault_return_from_domain(CAPSTONE_NO_CPMP_REGION);
+        return; /* not reached: fault_return_from_domain switches domains */
     }
 
     // check if there is free cpmp entry
@@ -736,7 +765,12 @@ void handle_exception(unsigned cause) {
             swap_cpmp(badaddr);
             break;
         default:
-            capstone_error(CAPSTONE_UNKNOWN_EXCP);
+            /* A non-access-fault synchronous cause reaching the monitor from a
+             * domain (e.g. RISCV_EXCP_INVALID_CAP from a use-after-revoke, a
+             * bounds/tag violation) is an unrecoverable domain fault. Terminate
+             * the domain and return the fault to the caller instead of spinning
+             * in capstone_error(). */
+            fault_return_from_domain(cause);
     }
 }
 
