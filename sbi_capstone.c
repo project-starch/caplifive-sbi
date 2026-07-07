@@ -459,6 +459,108 @@ static unsigned shared_region_annotated(unsigned dom_id, unsigned region_id, uns
     return 0;
 }
 
+/* Share a child sub-region [offset, offset+len) split-derived from parent_id so a
+ * later revoke_region(parent_id) cascades to it (the paper's H primitive:
+ * sqlite3_close revokes the connection and every statement/value pointer beneath
+ * it). The parent's senior revocation handle is minted with __mrev and retained
+ * under parent_id; the child (and the split-off head/tail fragments) are junior in
+ * the parent's rev lineage, so __revoke(parent_rev) invalidates them. Unlike two
+ * independent create_region()s (independent rev roots -- no cascade), the child
+ * here is __split out of the parent's own cap. */
+static unsigned share_child_region(unsigned dom_id, unsigned parent_id,
+                                   unsigned offset, unsigned len, unsigned perm) {
+    if(dom_id >= dom_n || parent_id >= region_n) {
+        return -1;
+    }
+
+    __dom void *d = domains[dom_id];
+
+    __linear void *r;
+    if (region_cpmp[parent_id] != -1) {
+        r = read_cpmp(region_cpmp[parent_id]);
+    }
+    else {
+        r = regions[parent_id];
+    }
+
+    /* A prior revoke may have left the retained parent handle UNINIT; re-init so
+     * __mrev sees a LIN input (same reclaim step as REV_BORROWED). */
+    if (cap_type(r) == 3 /* CAP_TYPE_UNINIT */) {
+        C_INIT(r, r, 0);
+    }
+
+    unsigned pbase = cap_base(r);
+    unsigned pend = cap_end(r);
+    unsigned cstart = pbase + offset;
+    unsigned cend = cstart + len;
+    if (len == 0 || offset > pend - pbase || cend > pend) {
+        return -1;
+    }
+
+    /* 1. Mint the senior revocation handle and retain it under parent_id, so
+     *    revoke_region(parent_id) -> __revoke(rev) invalidates the junior run. */
+    __rev void *rev = __mrev(r); /* rev: senior (depth d); r: junior (depth d+1) */
+
+    /* 2. Carve the child [cstart, cend) out of the now-junior parent cap. The
+     *    split products stay junior to rev, so a parent revoke cascades to them.
+     *    Retain the head/tail fragments in regions[] the same way split_out_cap
+     *    does (do not drop linear caps); the child is shared last so the
+     *    borrower's REGION_COUNT-1 query resolves to it. */
+    __linear void *head = 0;
+    __linear void *body;
+    if (offset != 0) {
+        body = __split(r, cstart); /* r -> [pbase,cstart); body -> [cstart,pend) */
+        head = r;
+    }
+    else {
+        body = r;
+    }
+
+    __linear void *tail = 0;
+    if (cend != pend) {
+        tail = __split(body, cend); /* body -> [cstart,cend); tail -> [cend,pend) */
+    }
+
+    if (region_cpmp[parent_id] != -1) {
+        write_cpmp(region_cpmp[parent_id], rev);
+    }
+    else {
+        regions[parent_id] = rev;
+    }
+
+    if (head) {
+        regions[region_n] = head;
+        region_n += 1;
+    }
+    if (tail) {
+        regions[region_n] = tail;
+        region_n += 1;
+    }
+
+    /* 3. Tighten permission and share the child (linear borrow). */
+    __linear void *child = body;
+    if (perm == CAPSTONE_ANNOTATION_PERM_IN) {
+        child = __tighten(child, 4);
+    }
+    else if (perm == CAPSTONE_ANNOTATION_PERM_INOUT) {
+        child = __tighten(child, 6);
+    }
+    else if (perm == CAPSTONE_ANNOTATION_PERM_OUT) {
+        child = __tighten(child, 2);
+    }
+    else if (perm == CAPSTONE_ANNOTATION_PERM_FULL) {
+        child = __tighten(child, 7);
+    }
+    else {
+        return -1;
+    }
+
+    d = __domcallsaves(d, CAPSTONE_DPI_REGION_SHARE, child);
+    domains[dom_id] = d;
+
+    return 0;
+}
+
 // This function has been deprecated, use shared_region_annotated instead
 static unsigned share_region(unsigned dom_id, unsigned region_id) {
     if(dom_id >= dom_n || region_id >= region_n) {
@@ -688,6 +790,9 @@ unsigned handle_trap_ecall(unsigned arg0, unsigned arg1,
                     break;
                 case SBI_EXT_CAPSTONE_REGION_POP:
                     res = pop_region(arg0);
+                    break;
+                case SBI_EXT_CAPSTONE_REGION_SHARE_CHILD:
+                    res = share_child_region(arg0, arg1, arg2, arg3, arg4);
                     break;
                 default:
                     err = 1;
