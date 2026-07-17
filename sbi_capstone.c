@@ -39,8 +39,8 @@ unsigned *mtimecmp;
 
 __dom void *domains[CAPSTONE_MAX_DOM_N];
 __linear void *domain_splits[CAPSTONE_MAX_DOM_N];
-//void *regions[CAPSTONE_MAX_REGION_N];
-void *regions[128];
+__linear void *regions[CAPSTONE_MAX_REGION_N];
+
 /* the cpmp entry each region is associated with; -1 if unassociated */
 //unsigned region_cpmp[CAPSTONE_MAX_REGION_N];
 unsigned region_cpmp[128];
@@ -63,12 +63,10 @@ void **nested_dom_seal;
 __dom void *child_dom;
 void *sql_cap;
 __dom void *dom_authenticated;
-//unsigned finish_init;
-unsigned os_total_time;
+
 unsigned current_dom_id;
 unsigned max_dom_id;
-//unsigned os_time_begin;
-//unsigned syscall_id;
+
 static __linear void *read_cpmp(unsigned n) {
     __linear void *res;
     switch(n) {
@@ -306,12 +304,7 @@ static void *split_out_cap(unsigned base, unsigned len, unsigned linear) {
         regions[region_n] = region;
         region_n += 1;
     }
-    //if(region_n > 63){
-    //	C_PRINT(0x64);
-    //	C_PRINT(region_n);
-    //	C_PRINT(regions[64]);
-    	
-    //}
+    
     return region;
 }
 
@@ -320,23 +313,18 @@ static unsigned create_domain(unsigned base_addr, unsigned mem_size,
                           unsigned tot_size, unsigned entry_offset,
                           unsigned split_offset)
 {
-    //__asm__ volatile ("csrw 0x811, x0");
-    
     
     // alignment requirement
     mem_size = (((mem_size - 1) >> 4) + 1) << 4;
     __linear void *mem_l, *dom_code, *dom_data, *dom_split, *mem_r;
     __linear void **dom_seal;
-    C_PRINT(base_addr);
-    C_PRINT(tot_size);
-    C_PRINT(mem_size);
+    
 
     dom_code = split_out_cap(base_addr, tot_size, 1);
 
     //C_PRINT(dom_code);
 
     dom_seal = __split(dom_code, base_addr + mem_size);
-    //C_PRINT(dom_seal);
     dom_data = __split(dom_seal, base_addr + mem_size + DOMAIN_DATA_SIZE);
 
 
@@ -574,10 +562,6 @@ static unsigned call_domain_split(unsigned dom_id, unsigned region_id, unsigned 
     return call_id;
 }
 
-static unsigned get_os_dom_execution_time() {
-    return os_total_time;
-}
-
 /* Create a capability from given address range and pass it to the domain through a call. */
 static unsigned call_domain_with_cap(unsigned dom_id, unsigned base, unsigned len, unsigned cursor) {
     void *region = split_out_cap(base, len, 1);
@@ -593,18 +577,6 @@ static unsigned call_domain_with_cap(unsigned dom_id, unsigned base, unsigned le
 static unsigned create_region(unsigned base, unsigned len) {
     
     
-    if(base == 0x1024a4000){
-        void *cap;
-        if(region_cpmp[65] != -1)
-            cap = read_cpmp(region_cpmp[65]);
-        else
-            cap = regions[65];
-        
-        if(region_cpmp[65] != -1)
-            write_cpmp(region_cpmp[65], cap);
-        else
-            regions[65] = cap;
-    }
     void *region = split_out_cap(base, len, 1);
     regions[region_n] = region;
     region_n += 1;

@@ -5,6 +5,14 @@
 
 /* Capstone-specific definitions */
 
+/*
+   Note that this definition is for the RTL implementation
+   and different from the specification.
+*/
+#define CAP_TYPE_LINEAR  0
+#define CAP_TYPE_NONLIN  1
+
+
 #define CCSR_CTVEC    0
 #define CCSR_CIH    1
 #define CCSR_CEPC   2
@@ -31,6 +39,7 @@
 #define CINCOFFSET(rd, rs1, rs2) .insn r 0x5b, 0x1, 0xc, rd, rs1, rs2
 #define DELIN(rd)     .insn r 0x5b, 0x1, 0x3, rd, x0, x0
 #define SPLIT(rd, rs1, rs2) .insn r 0x5b, 0x1, 0x6, rd, rs1, rs2
+#define SHRINK(rd, rs1, rs2) .insn r 0x5b, 0x1, 0x1, rd, rs1, rs2
 
 #define CSR_CIS          0x800
 #define CSR_CID			 0x801
