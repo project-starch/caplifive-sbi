@@ -16,7 +16,8 @@
 #define C_READ_CCSR(ccsr_name, v) __asm__("ccsrrw(%0, " #ccsr_name ", x0)" : "=r"(v))
 #define C_WRITE_CCSR(ccsr_name, v) __asm__("ccsrrw(x0, " #ccsr_name ", %0)" :: "r"(v))
 #define C_SET_CURSOR(dest, cap, cursor) __asm__("scc(%0, %1, %2)" : "=r"(dest) : "r"(cap), "r"(cursor))
-#define C_PRINT(v) __asm__ volatile(".insn r 0x5b, 0x1, 0x43, x0, %0, x0" :: "r"(v))
+//#define C_PRINT(v) __asm__ volatile(".insn r 0x5b, 0x1, 0x43, x0, %0, x0" :: "r"(v))
+#define C_PRINT(v) __asm__ volatile("csrw 0x800, %0" :: "r"(v))
 #define C_GEN_CAP(dest, base, end) __asm__(".insn r 0x5b, 0x1, 0x40, %0, %1, %2" : "=r"(dest) : "r"(base), "r"(end));
 #define capstone_error(err_code) do { C_PRINT(CAPSTONE_ERR_STARTER); C_PRINT(err_code); while(1); } while(0)
 #define cap_base(cap) __capfield((cap), 3)
@@ -29,7 +30,7 @@
 #define CPMP_COUNT 16
 #define DOMAIN_DATA_N    96
 #define DOMAIN_DATA_SIZE (16 * DOMAIN_DATA_N)
-
+#define CSR_TIME 0xC0102073
 
 // toggle the following for swapping between cpmp swapping and gen_cap (hack)
 // #define USE_GEN_CAP
@@ -39,11 +40,11 @@ unsigned *mtimecmp;
 
 __dom void *domains[CAPSTONE_MAX_DOM_N];
 __linear void *domain_splits[CAPSTONE_MAX_DOM_N];
-__linear void *regions[CAPSTONE_MAX_REGION_N];
+void *regions[CAPSTONE_MAX_REGION_N];
 
 /* the cpmp entry each region is associated with; -1 if unassociated */
-//unsigned region_cpmp[CAPSTONE_MAX_REGION_N];
-unsigned region_cpmp[128];
+unsigned region_cpmp[CAPSTONE_MAX_REGION_N];
+//unsigned region_cpmp[128];
 /* the region each cpmp entry is associated with; -1 if unassociated */
 unsigned cpmp_region[CPMP_COUNT];
 unsigned dom_n, region_n;
@@ -252,13 +253,7 @@ static void *split_out_cap(unsigned base, unsigned len, unsigned linear) {
     if (base + len == region_end) {
         if(base == region_base) {
             // matching region. We don't support this for now
-            C_PRINT(0x1234);
-            C_PRINT(0x5678);
-            C_PRINT(base);
-            C_PRINT(len);
-            C_PRINT(region_base);
-            C_PRINT(region_end);
-            C_PRINT(region);
+            
             while(1);
         } else {
             if(region_cpmp[i] != -1)
@@ -282,7 +277,7 @@ static void *split_out_cap(unsigned base, unsigned len, unsigned linear) {
                 regions[i] = mem_l;
 	    
             regions[region_n] = mem_r;
-            region_cpmp[region_n] = -1;
+            //region_cpmp[region_n] = -1;
             region_n += 1;
             
             /* we load regions into cpmp lazily*/
@@ -293,9 +288,9 @@ static void *split_out_cap(unsigned base, unsigned len, unsigned linear) {
     
     __linear void *region_linear;
     unsigned ty = __capfield(region, 1);
-    if(linear && ty != 0) {
+    if(linear && ty != CAP_TYPE_LINEAR) {
         capstone_error(CAPSTONE_NO_REGION);
-    } else if(!linear && ty == 0) {
+    } else if(!linear && ty == CAP_TYPE_LINEAR) {
         region_linear = region;
         region = __delin(region_linear);
     }
@@ -793,7 +788,7 @@ static unsigned region_de_linear(unsigned region_id) {
 }
 
 static void return_from_domain(unsigned retval) {
-    debug_counter_tick(DEBUG_COUNTER_SWITCH_S);
+    //debug_counter_tick(DEBUG_COUNTER_SWITCH_S);
 
     *caller_buf = retval;
     __domreturnsaves(caller_dom, DOM_REENTRY_POINT, 0);
@@ -985,6 +980,8 @@ void handle_interrupt(unsigned int_code) {
             __asm__ volatile ("csrc mie, %0" :: "r"(MIP_MTIP));
             __asm__ volatile ("csrs mip, %0" :: "r"(MIP_STIP));
             break;
+        default:
+            while(1);
     }
 }
 
@@ -995,14 +992,16 @@ static void swap_cpmp(unsigned badaddr) {
     for(region_id = 0; region_id < region_n; region_id += 1) {
         if(region_cpmp[region_id] != -1) // already loaded
             continue;
-        start_addr = cap_base(regions[region_id]);
-        end_addr = cap_end(regions[region_id]);
+        tmp = regions[region_id];
+        start_addr = cap_base(tmp);
+        end_addr = cap_end(tmp);
+        regions[region_id] = tmp;
         if(start_addr <= badaddr && badaddr < end_addr)
             break;
     }
     if(region_id >= region_n) {
-        C_PRINT(badaddr);
-        C_PRINT(region_n);
+        //C_PRINT(badaddr);
+        //C_PRINT(region_n);
         print_regions();
         print_cpmps();
         capstone_error(CAPSTONE_NO_CPMP_REGION);
@@ -1031,19 +1030,38 @@ static void swap_cpmp(unsigned badaddr) {
     write_cpmp(cpmp_id, tmp);
 }
 
-void handle_exception(unsigned cause) {
+unsigned handle_exception(unsigned cause) {
     unsigned badaddr;
+    unsigned time_val;
     switch(cause) {
+        case CAUSE_ILLEGAL_INSTRUCTION:
+            // __asm__ ("1: j 1b");
+            C_READ_CSR(mtval, badaddr);
+            if (((badaddr & 0xFFF0707F) == CSR_TIME)) {
+                time_val = *mtime;
+                break;
+            }
+            else {
+                __asm__ ("csrr a5, mcause");
+                __asm__ ("csrr a6, mepc");
+                while(1);
+            }
+        break;
         case CAUSE_LOAD_ACCESS:
         case CAUSE_STORE_ACCESS:
         case CAUSE_FETCH_ACCESS:
             C_READ_CSR(mtval, badaddr);
-            debug_counter_tick(DEBUG_COUNTER_CPMP_SWAP);
+            //debug_counter_tick(DEBUG_COUNTER_CPMP_SWAP);
             swap_cpmp(badaddr);
+            time_val = -1;
             break;
         default:
-            capstone_error(CAPSTONE_UNKNOWN_EXCP);
+            __asm__ ("csrr a5, mcause");
+            __asm__ ("csrr a6, mepc");
+            __asm__ ("1: j 1b");
+            time_val = -1;
     }
+    return time_val;
 }
 
 
