@@ -17,7 +17,137 @@
 #define C_WRITE_CCSR(ccsr_name, v) __asm__("ccsrrw(x0, " #ccsr_name ", %0)" :: "r"(v))
 #define C_SET_CURSOR(dest, cap, cursor) __asm__("scc(%0, %1, %2)" : "=r"(dest) : "r"(cap), "r"(cursor))
 #define C_GEN_CAP(dest, base, end) __asm__(".insn r 0x5b, 0x1, 0x40, %0, %1, %2" : "=r"(dest) : "r"(base), "r"(end));
-#define capstone_error(err_code) while(1);
+/* Was `while(1);` -- the error code was DISCARDED and the monitor spun silently, so
+   every monitor-detected failure on the FPGA looked identical to a domain hang. That
+   cost a board session: SQLite's first run stopped after "Loadable size" with no
+   output, and "blob does not fit" could not be distinguished from "domain hung".
+   Matches the QEMU monitor's definition now, so the two agree. */
+#define CAPSTONE_ERR_STARTER 0xdeadbeef
+/* I-4: C_PRINT is `csrw 0x800` -- it reaches the RTL TRACE, never the UART, so on the
+   FPGA every monitor error looked identical (output stops, board dead, nothing printed)
+   and cost several board sessions of guessing. capstone_error now ALSO writes a 4-char
+   site TAG plus the code in hex to the 16550 UART (capstone_report(), below) before it
+   spins. The C_PRINTs are unchanged, so the RTL trace is byte-for-byte what it was.
+   `capstone_error_tag(tag, code)` lets a site name itself; `capstone_error(code)` is the
+   historical one-argument form and reports the generic "CERR" tag.
+   Tags are 4 ASCII characters packed into an integer -- deliberately NOT string
+   literals, so this needs no .rodata (monitor .rodata delivery is its own open issue)
+   and no varargs. Each printed line is TAG ':' 8-hex CRLF = 15 bytes, i.e. it fits in
+   one 16-byte TX FIFO, and is flushed before the next line starts, so a console that
+   truncates at 16 characters still shows every line whole. */
+#define CAPSTONE_TAG_CERR 0x43455252 /* "CERR" generic capstone_error() */
+#define CAPSTONE_TAG_IRQX 0x49525158 /* "IRQX" handle_interrupt: unhandled interrupt */
+#define CAPSTONE_TAG_EXCX 0x45584358 /* "EXCX" handle_exception: unhandled cause */
+#define CAPSTONE_TAG_ILLX 0x494c4c58 /* "ILLX" illegal instruction that is not CSR time */
+#define CAPSTONE_TAG_CPMX 0x43504d58 /* "CPMX" swap_cpmp: no region covers the fault addr */
+#define CAPSTONE_TAG_SPLA 0x53504c41 /* "SPLA" split_out_cap: no region covers the request */
+#define CAPSTONE_TAG_SPLB 0x53504c42 /* "SPLB" split_out_cap: exact-fit region unsupported */
+/* context lines, printed after a site tag */
+#define CAPSTONE_TAG_MCAU 0x4d434155 /* "MCAU" mcause */
+#define CAPSTONE_TAG_MEPC 0x4d455043 /* "MEPC" mepc */
+#define CAPSTONE_TAG_MTVL 0x4d54564c /* "MTVL" mtval */
+#define CAPSTONE_TAG_BASE 0x42415345 /* "BASE" requested base address */
+#define CAPSTONE_TAG_ALEN 0x414c454e /* "ALEN" requested length */
+/* Error codes for sites that previously had none (they spun with no code at all).
+   0x1/0x2 (CAPSTONE_NO_REGION / CAPSTONE_NO_CPMP_REGION) keep their existing values so
+   the RTL trace does not change. */
+#define CAPSTONE_ERR_IRQ_UNHANDLED   0xe001
+#define CAPSTONE_ERR_EXC_UNHANDLED   0xe002
+#define CAPSTONE_ERR_ILLEGAL_INSN    0xe003
+#define CAPSTONE_ERR_SPLIT_NO_REGION 0xe005
+#define CAPSTONE_ERR_SPLIT_EXACT     0xe006
+#define CAPSTONE_ERR_SPLIT_EXACT_MID 0xe007 /* exact fit, but NOT the tail slot */
+
+/* ENABLED 2026-08-01 after the exact-fit spin was shown to be the BACKGROUND WEDGE.
+   Measured: running the trivial control domain repeatedly in one boot wedges at run 6-7 in
+   4 of 4 boots, and every one of those boots ends with `SPLB:0000E006` at `SQ: B/mkregion1`,
+   i.e. in split_out_cap's unimplemented exact-fit case -- not in the domain under test. That
+   spin is what limited every board session to ~5 useful domains and produced a large share of
+   this campaign's "random" wedges. See split_out_cap() for what the handling does and why only
+   the tail case is handled. */
+/* A/B TEST 2026-08-02: exact-fit fix disabled to test whether it caused
+   the share1/SHA5 wedge. Re-enable by uncommenting. */
+/* #define CAPSTONE_SPLIT_EXACT_FIT 1 */
+/* ---- I-4, REGION-SHARE path -------------------------------------------------
+   SQLite hangs inside its FIRST shared_region_annotated() call with NO monitor
+   tag at all -- not ILLX, not SPLA, not SPLB -- so the wedge is at a site that
+   none of the five original tags covers. The share path had exactly zero output
+   of its own: every rejection returned -1 into a kernel-module caller that
+   DISCARDS it, and the three spins it can reach (read_cpmp/write_cpmp default,
+   the TRANSFERRED type check) were bare `while(1);`.
+   Two kinds of tag are added below.
+     * SITE tags, always compiled in, one per error/spin, printed with the
+       operands that site has in scope. These follow SPLA/SPLB exactly:
+       capstone_report(...) lines, then capstone_uart_flush(), then the spin.
+     * PROGRESS tags (capstone_trace), at the handler entry and after each major
+       step. An error tag only helps if control REACHES a tagged error; a hang
+       with no output is localised by entry/step markers, which is precisely the
+       situation here. The most load-bearing pair is SHA5/SHA6: SHA5 is the last
+       thing printed before control leaves M-mode for the domain, so
+       "SHA5 then silence" means the hang is inside the DOMAIN's region-share
+       entry and NOT in the monitor, while "no SHA0" means the ecall never
+       arrived.
+   Progress tags are switchable because they are not free: up to 10 lines per
+   share call, and capstone_puts_hex now prints 16 digits, so a line is
+   4 + 1 + 16 + 2 = 23 bytes -- ~230 bytes, ~40 ms at 57600 baud per share. That
+   would swamp any borrow-cost cycle measurement. Build a perf firmware with
+   CAPSTONE_SHARE_TRACE_ENABLE undefined; the site tags stay on either way.
+   NOTE for whoever reads the console: at 23 bytes a line no longer fits in the
+   16-byte TX FIFO the comment above assumes (that text predates the 8->16 digit
+   widening). capstone_putc polls THRE per character so nothing is dropped by the
+   UART, but a console that truncates at 16 characters will now cut the low hex
+   digits off every line. */
+#define CAPSTONE_SHARE_TRACE_ENABLE
+/* share-path site tags */
+#define CAPSTONE_TAG_EXTC 0x45585443 /* "EXTC" ext_code  (a7) -- positive control */
+#define CAPSTONE_TAG_FNCC 0x464e4343 /* "FNCC" func_code (a6) -- positive control */
+#define CAPSTONE_TAG_ARG1 0x41524731 /* "ARG1" arg1 at DISPATCH, before the handler */
+#define CAPSTONE_TAG_ARG4 0x41524734 /* "ARG4" arg4 -- expected 0, sanity */
+#define CAPSTONE_TAG_ECSA 0x45435341 /* "ECSA" ecall dispatch: REGION_SHARE_ANNOTATED entered */
+#define CAPSTONE_TAG_ECSZ 0x4543535a /* "ECSZ" ecall dispatch: handler returned, value = res */
+#define CAPSTONE_TAG_SHA0 0x53484130 /* "SHA0" shared_region_annotated: entered */
+#define CAPSTONE_TAG_SHA1 0x53484131 /* "SHA1" ids accepted; value = region_cpmp[region_id] */
+#define CAPSTONE_TAG_SHA2 0x53484132 /* "SHA2" region capability in hand; value = cap type */
+#define CAPSTONE_TAG_SHA3 0x53484133 /* "SHA3" revocation annotation applied */
+#define CAPSTONE_TAG_SHA4 0x53484134 /* "SHA4" permission annotation applied */
+#define CAPSTONE_TAG_SHA5 0x53484135 /* "SHA5" about to leave M-mode for the domain */
+#define CAPSTONE_TAG_SHA6 0x53484136 /* "SHA6" the domain returned from the share entry */
+#define CAPSTONE_TAG_SHAB 0x53484142 /* "SHAB" bad dom_id/region_id (returns -1) */
+#define CAPSTONE_TAG_SHAV 0x53484156 /* "SHAV" unknown annotation_rev (returns -1) */
+#define CAPSTONE_TAG_SHAP 0x53484150 /* "SHAP" unknown annotation_perm (returns -1) */
+#define CAPSTONE_TAG_SHAX 0x53484158 /* "SHAX" TRANSFERRED on a non-linear cap: spin */
+#define CAPSTONE_TAG_RCPX 0x52435058 /* "RCPX" read_cpmp: cpmp index out of range: spin */
+#define CAPSTONE_TAG_WCPX 0x57435058 /* "WCPX" write_cpmp: cpmp index out of range: spin */
+#define CAPSTONE_TAG_DPIS 0x44504953 /* "DPIS" dpi_share_region entered; value = region_n */
+#define CAPSTONE_TAG_RGNO 0x52474e4f /* "RGNO" region table full: spin (was silent overrun) */
+#define CAPSTONE_TAG_DPIC 0x44504943 /* "DPIC" handle_dpi: dpi_call returned: spin */
+#define CAPSTONE_TAG_DPIX 0x44504958 /* "DPIX" handle_dpi: unimplemented DPI function */
+#define CAPSTONE_TAG_DRET 0x44524554 /* "DRET" DOM_RETURN: return_from_domain returned: spin */
+/* extra context lines for the share path */
+#define CAPSTONE_TAG_DOMN 0x444f4d4e /* "DOMN" dom_n */
+#define CAPSTONE_TAG_RGNN 0x52474e4e /* "RGNN" region_n */
+#define CAPSTONE_TAG_RGID 0x52474944 /* "RGID" region_id */
+#define CAPSTONE_TAG_CPID 0x43504944 /* "CPID" cpmp index */
+#define CAPSTONE_TAG_AREV 0x41524556 /* "AREV" annotation_rev */
+#define CAPSTONE_TAG_APRM 0x4150524d /* "APRM" annotation_perm */
+#define CAPSTONE_TAG_CTYP 0x43545950 /* "CTYP" capability type (0 = linear) */
+#define CAPSTONE_TAG_DPIF 0x44504946 /* "DPIF" DPI function code */
+#define CAPSTONE_ERR_SHARE_BAD_ID    0xe007
+#define CAPSTONE_ERR_SHARE_BAD_REV   0xe008
+#define CAPSTONE_ERR_SHARE_BAD_PERM  0xe009
+#define CAPSTONE_ERR_SHARE_NOT_LIN   0xe00a
+#define CAPSTONE_ERR_CPMP_INDEX      0xe00b
+#define CAPSTONE_ERR_REGION_OVERFLOW 0xe00c
+#define CAPSTONE_ERR_DPI_CALL_RET    0xe00d
+#define CAPSTONE_ERR_DPI_UNKNOWN     0xe00e
+#define CAPSTONE_ERR_DOM_RETURN_RET  0xe00f
+#ifdef CAPSTONE_SHARE_TRACE_ENABLE
+#define capstone_trace(tag, v) capstone_report((tag), (v))
+#else
+#define capstone_trace(tag, v)
+#endif
+#define capstone_error_tag(tag, err_code) do { C_PRINT(CAPSTONE_ERR_STARTER); C_PRINT(err_code); capstone_report((tag), (err_code)); while(1); } while(0)
+#define capstone_error(err_code) capstone_error_tag(CAPSTONE_TAG_CERR, (err_code))
 #define cap_base(cap) __capfield((cap), 3)
 #define cap_end(cap) __capfield((cap), 4)
 #define cap_type(cap) __capfield((cap), 1)
@@ -35,6 +165,11 @@
 #define CPMP_COUNT 16
 #define DOMAIN_DATA_N    96
 #define DOMAIN_DATA_SIZE (16 * DOMAIN_DATA_N)
+// gp-free domain ABI (silicon): fixed image offset where the domain's globals
+// begin (must equal the value in tests/runtime-qemu/gp-free-domain/link-gpfree.ld).
+// The monitor SPLITs the code image here into an execute code cap (PCC) and an
+// R/W globals cap (gp). .text must fit in [0, GPFREE_GLOBALS_OFFSET).
+#define GPFREE_GLOBALS_OFFSET 0x1000
 #define CSR_TIME 0xC0102073
 
 // toggle the following for swapping between cpmp swapping and gen_cap (hack)
@@ -58,6 +193,126 @@ unsigned* caller_buf;
 unsigned smode_initialised;
 /* saved context of S-mode at the last SBI dom-return call */
 unsigned *smode_saved_context;
+
+/* ---------------------------------------------------------------------------
+ * I-4: making monitor errors VISIBLE on the FPGA console.
+ *
+ * The monitor runs in capability memory mode, so it cannot just dereference
+ * 0x10000000 -- it needs a capability over the UART, minted exactly the way
+ * `mtime` already is: split_out_cap(base, len, 0) out of the genesis region
+ * (see cap_env_init in ../sbi_capstone_dom.c). `capstone_uart` is that
+ * capability; `capstone_uart_ready` is a plain scalar flag so that an error
+ * raised BEFORE the capability exists (e.g. inside cap_env_init's own
+ * split_out_cap calls) degrades to a silent no-op instead of faulting.
+ *
+ * Register layout, from platform/fpga/ariane/platform.c:21-26
+ *     ARIANE_UART_ADDR 0x10000000, REG_SHIFT 2, REG_WIDTH 4
+ * and lib/utils/serial/uart8250.c get_reg()/set_reg(): register N sits at
+ * base + (N << 2) and is accessed 32 bits wide (readl/writel). So
+ *     THR = +0x00   (offset 0)
+ *     LSR = +0x14   (offset 20)   bit 5 = THRE, bit 6 = TEMT
+ * The TX FIFO is 16 bytes deep; THRE means it will accept a byte.
+ *
+ * Deliberately plain C: this runs in M-mode on an already-wedged machine, and
+ * it is compiled by capstone-c (a C-subset compiler that accumulates `*`
+ * across declarators on one line and has miscompiled nested ternaries). So:
+ * one declarator per line, no ternaries, no varargs, no early `return`, no
+ * string literals, and every poll loop is BOUNDED so a dead UART can never
+ * turn a diagnosable wedge into a hang inside the diagnostic.
+ */
+#define CAPSTONE_UART_BASE 0x10000000
+#define CAPSTONE_UART_LEN  0x100
+#define CAPSTONE_UART_THRE 0x20
+#define CAPSTONE_UART_TEMT 0x40
+/* ~200k MMIO polls; one character at 57600 baud is ~174 us, so this is a wide
+   margin over the worst case (a full FIFO drain) and still bounded. */
+#define CAPSTONE_UART_SPIN 200000
+
+unsigned *capstone_uart;
+unsigned capstone_uart_ready;
+
+static void capstone_putc(unsigned c) {
+    unsigned *u;
+    unsigned lsr;
+    unsigned i;
+    if(capstone_uart_ready != 0) {
+        u = capstone_uart;
+        for(i = 0; i < CAPSTONE_UART_SPIN; i += 1) {
+            /* LSR at +20, 32-bit read through the UART capability */
+            __asm__ volatile ("lw %0, 20(%1)" : "=r"(lsr) : "r"(u));
+            if((lsr & CAPSTONE_UART_THRE) != 0)
+                break;
+        }
+        /* THR at +0, 32-bit write */
+        __asm__ volatile ("sw %0, 0(%1)" :: "r"(c), "r"(u));
+    }
+}
+
+/* Wait for the transmitter to go completely empty (TEMT), so the message
+   survives the `while(1)` that follows it. */
+static void capstone_uart_flush(void) {
+    unsigned *u;
+    unsigned lsr;
+    unsigned i;
+    if(capstone_uart_ready != 0) {
+        u = capstone_uart;
+        for(i = 0; i < CAPSTONE_UART_SPIN; i += 1) {
+            __asm__ volatile ("lw %0, 20(%1)" : "=r"(lsr) : "r"(u));
+            if((lsr & CAPSTONE_UART_TEMT) != 0)
+                break;
+        }
+    }
+}
+
+/* 8 hex digits, most significant first. Max shift is 28: capstone-c evaluates
+   `>> 32` at 32 bits and yields 0 (see the create_domain comment below), so a
+   64-bit-wide printer would need two halves -- 8 digits is what every code and
+   CSR value used here needs. */
+/* 8 digits (low 32 bits), NOT 16. A 16-digit line is "TAG:" + 16 + CRLF = 23 bytes, past
+   the 16-byte 16550 TX FIFO this reporting depends on, so the console would truncate the
+   low hex digits off EVERY operand -- silently corrupting the numbers the tags exist to
+   deliver. An earlier widening here was never exercised because the on-disk .c.S was
+   stale; it would have shipped that corruption the moment the wrapper was regenerated.
+   The 32-bit truncation that motivated widening is a non-problem in practice: the faulting
+   pc was attributed by printing a known load base from the host and subtracting, which
+   needs only the low half. If a full 64-bit value is ever required, print it as two
+   8-digit halves under separate tags rather than one long line. */
+static void capstone_puts_hex(unsigned long v) {
+    unsigned i;
+    unsigned sh;
+    unsigned nib;
+    for(i = 0; i < 8; i += 1) {
+        sh = (7 - i) * 4;
+        nib = (v >> sh) & 0xf;
+        if(nib < 10)
+            capstone_putc(nib + 0x30);
+        else
+            capstone_putc(nib + 0x37);
+    }
+}
+
+/* 4 ASCII characters packed into `tag`, most significant byte first. */
+static void capstone_puts_tag(unsigned tag) {
+    unsigned i;
+    unsigned sh;
+    unsigned ch;
+    for(i = 0; i < 4; i += 1) {
+        sh = (3 - i) * 8;
+        ch = (tag >> sh) & 0xff;
+        if(ch != 0)
+            capstone_putc(ch);
+    }
+}
+
+/* One line: TAG ':' 8-hex CRLF == 15 bytes, then flush. */
+static void capstone_report(unsigned tag, unsigned long v) {
+    capstone_puts_tag(tag);
+    capstone_putc(0x3a);
+    capstone_puts_hex(v);
+    capstone_putc(0x0d);
+    capstone_putc(0x0a);
+    capstone_uart_flush();
+}
 
 static __linear void *read_cpmp(unsigned n) {
     __linear void *res;
@@ -111,6 +366,13 @@ static __linear void *read_cpmp(unsigned n) {
             C_READ_CCSR(cpmp(15), res);
             break;
         default:
+            /* I-4 site RCPX: a cpmp index outside [0, CPMP_COUNT). Reached from the
+               region-share path as read_cpmp(region_cpmp[region_id]), so a corrupt
+               region_cpmp[] entry used to wedge the board here with no output at
+               all. n is the offending index. */
+            capstone_report(CAPSTONE_TAG_RCPX, CAPSTONE_ERR_CPMP_INDEX);
+            capstone_report(CAPSTONE_TAG_CPID, n);
+            capstone_uart_flush();
             while(1);
     }
     return res;
@@ -167,6 +429,11 @@ static void write_cpmp(unsigned n, __linear void *v) {
             C_WRITE_CCSR(cpmp(15), v);
             break;
         default:
+            /* I-4 site WCPX: same as RCPX, on the write-back leg. The share path
+               writes the mrev'd / de-linearised region back through here. */
+            capstone_report(CAPSTONE_TAG_WCPX, CAPSTONE_ERR_CPMP_INDEX);
+            capstone_report(CAPSTONE_TAG_CPID, n);
+            capstone_uart_flush();
             while(1);
     }
 }
@@ -222,7 +489,16 @@ static void *split_out_cap(unsigned base, unsigned len, unsigned linear) {
             regions[i] = mem_l;
     }
 
-    if(i >= region_n) while(1);
+    /* I-4 site SPLA: no existing region covers [base, base+len). Printing the
+       request is what makes this actionable -- the address tells you which
+       split_out_cap() call failed. */
+    if(i >= region_n) {
+        capstone_report(CAPSTONE_TAG_SPLA, CAPSTONE_ERR_SPLIT_NO_REGION);
+        capstone_report(CAPSTONE_TAG_BASE, base);
+        capstone_report(CAPSTONE_TAG_ALEN, len);
+        capstone_uart_flush();
+        while(1);
+    }
 
     if(base == region_base)
         region = mem_l;
@@ -231,8 +507,42 @@ static void *split_out_cap(unsigned base, unsigned len, unsigned linear) {
 
     if (base + len == region_end) {
         if(base == region_base) {
+            /* EXACT FIT: the request consumes the WHOLE region, so there is no leftover to
+               store back and slot i simply leaves the pool. This used to be an unimplemented
+               case that spun forever (site SPLB), hanging the board whenever the host
+               allocator happened to hand back an exactly-matching region -- a layout
+               coincidence, not a capability error. That hang was misattributed to silicon
+               during the 2026-08-01 investigation and corrupted a measurement.
+
+               `region` is already `mem_l` (assigned just above), i.e. the whole region, and
+               the search loop broke WITHOUT writing slot i back, so the slot is already
+               logically empty. All that remains is to shrink the pool.
+
+               ONLY THE TAIL CASE IS HANDLED, deliberately. When i is the last slot, dropping
+               it is just `region_n -= 1` and cannot disturb any other slot or any hardware
+               CPMP register. Moving a different slot into i would mean migrating a LINEAR
+               capability between a CPMP register and the array, and those move semantics are
+               not verified here -- so that case still reports and stops rather than guessing,
+               with a distinct code so the log tells the two apart. */
+#ifdef CAPSTONE_SPLIT_EXACT_FIT
+            if(i + 1 == region_n) {
+                region_n -= 1;
+            } else {
+                capstone_report(CAPSTONE_TAG_SPLB, CAPSTONE_ERR_SPLIT_EXACT_MID);
+                capstone_report(CAPSTONE_TAG_BASE, base);
+                capstone_report(CAPSTONE_TAG_ALEN, len);
+                capstone_uart_flush();
+                while(1);
+            }
+#else
             // matching region. We don't support this for now
+            /* I-4 site SPLB */
+            capstone_report(CAPSTONE_TAG_SPLB, CAPSTONE_ERR_SPLIT_EXACT);
+            capstone_report(CAPSTONE_TAG_BASE, base);
+            capstone_report(CAPSTONE_TAG_ALEN, len);
+            capstone_uart_flush();
             while(1);
+#endif
         } else {
             if(region_cpmp[i] != -1)
                 write_cpmp(region_cpmp[i], mem_l);
@@ -277,24 +587,237 @@ static void *split_out_cap(unsigned base, unsigned len, unsigned linear) {
     return region;
 }
 static unsigned create_domain(unsigned base_addr, unsigned code_size,
-                          unsigned tot_size, unsigned entry_offset)
+                          unsigned tot_size, unsigned entry_offset,
+                          unsigned globals_off)
 {
+    /* entry_offset carries the GLOBALS OFFSET in its high 32 bits (packed by
+       libcapstone; the kernel module forwards the word untouched). 0 in the high half
+       means "not supplied" and falls back to the historical 0x1000, so any domain
+       built before this creates exactly as it used to. */
+    /* TWO 16-BIT SHIFTS, not one 32-bit shift. capstone-c holds the full 64-bit value
+       (the print above shows 0x800000000000 arriving intact) but `>> 32` yields 0 --
+       the shift is evaluated at 32 bits. Measured, not assumed: with `>> 32` the
+       monitor computed gpoff = 0x1000 from an entry_offset of 0x800000000000. */
+    unsigned packed_gpoff = (entry_offset >> 16) >> 16;
+    entry_offset = entry_offset & 0xffffffff;
+    /* Plain if/else, not a nested ternary. With the ternary form capstone-c produced
+       gpoff = 0x1000 even though packed_gpoff printed as 0x8000 immediately above --
+       i.e. the conditional did not select the branch its own condition implied. */
+    unsigned gpoff = GPFREE_GLOBALS_OFFSET;
+    if (globals_off) {
+        gpoff = globals_off;
+    }
+    if (packed_gpoff) {
+        gpoff = packed_gpoff;
+    }
     // alignment requirement
     code_size = (((code_size - 1) >> 4) + 1) << 4;
-    __linear void *mem_l, *dom_code, *dom_data, *mem_r;
+
+    /* CAPABILITY-BOUNDS REPRESENTABILITY (issue C-13, root-caused 2026-07-29).
+       The register file stores capability metadata COMPRESSED. compress_bounds
+       (capstone-ariane core/include/ariane_pkg.sv:749-800) has an exact "cursorless"
+       encoding only while start == cursor; otherwise it truncates the BASE DOWNWARD to
+       a 2^(E+3) granule (:788 `B[13:3] = {bounds.start >> E}[13:3]`, with no round-up,
+       unlike the top at :790).
+
+       dom_data leaves SPLIT cursorless-exact, but the C_SET_CURSOR below (used to park
+       gp at the top of the region) moves the cursor off the start, so the very next
+       writeback re-encodes with the lossy form and PERMANENTLY truncates the base. With
+       code_size rounded only to 16, base+code_size+DOMAIN_DATA_SIZE was 96 bytes past a
+       128-byte granule, so the domain's sp reported a base 96 bytes BELOW where the
+       monitor had copied the blob. The glue then read its own base+8 for `count`, landed
+       in the zeroed seal tail, got 0, skipped the entire table build, never established
+       gp, and the domain faulted on its first `ldc gp[i]`. Verified numerically: a
+       line-for-line model of compress_bounds reproduces the board's measured
+       sp.base (+5632) and size (125440) exactly.
+
+       So round code_size up to the region's REPRESENTABILITY granule, not to 16. The
+       granule depends on the region length, so it must be computed: 128 bytes for a
+       128 KiB domain, 1024 for SQLite's 2 MiB one. Hardcoding 128 would silently fail
+       at SQLite scale, which is the case this whole fix exists to unblock.
+
+       Only the SPLIT geometry moves. The blob extent stays (code_size - gpoff) off the
+       ORIGINAL 16-rounded size, so the copy still reads exactly the image bytes and
+       never past the loaded image. */
+    unsigned repr_len;
+    unsigned repr_tmp;
+    unsigned repr_hb;
+    unsigned repr_e;
+    unsigned repr_gran;
+    unsigned split_size;
+    unsigned data_off;
+    repr_len = tot_size - code_size - DOMAIN_DATA_SIZE;
+    repr_hb = 0;
+    repr_tmp = repr_len;
+    for (repr_tmp = repr_len; repr_tmp > 1; repr_tmp = repr_tmp >> 1) {
+        repr_hb = repr_hb + 1;
+    }
+    repr_e = 0;
+    if (repr_hb > 12) {
+        repr_e = repr_hb - 12;
+    }
+    repr_gran = 1 << (repr_e + 3);
+    split_size = code_size + repr_gran - 1;
+    split_size = split_size - (split_size & (repr_gran - 1));
+
+    /* ALIGN THE SEAL SIZE TOO, not just split_size. dom_data starts at
+       split_size + <seal size>, so BOTH terms must be granule multiples or the sum is
+       not representable and the base slides down exactly as it did before.
+       DOMAIN_DATA_SIZE is 1536: a multiple of 128, so a 128 KiB domain (granule 128) is
+       unaffected and keeps byte-identical geometry -- but NOT a multiple of 1024, so a
+       2 MiB domain (granule 1024) lands 512 bytes past a boundary and dom_data.start
+       truncates DOWN 512 bytes into the seal region. That is the same defect as the
+       96-byte one, one size class up, and it is why every ladder rung passes while
+       SQLite (the only 2 MiB domain) does not.
+       Verified: 128 KiB data_off stays 1536 and dom_data.start stays 5760; 2 MiB goes
+       1536 -> 2048 and dom_data.start 1391104 -> 1391616, which is 1024-aligned. The
+       seal region only grows (2048 B), staying above SEAL's 1024-byte minimum. */
+    data_off = DOMAIN_DATA_SIZE + repr_gran - 1;
+    data_off = data_off - (data_off & (repr_gran - 1));
+    /* ONE DECLARATOR PER DECLARATION -- do not merge these back into one line.
+       capstone-c accumulates the `*` across declarators (dag_builder.rs mutates the
+       shared decl_type in place and never resets it between declarators), so
+       `__linear void *a, *b, *c, *d;` declares a as void*, b as void**, c as void***,
+       and d as void****. Only the FIRST name gets the intended type.
+       That is what made the globals copy below emit ldc/stc: dereferencing dom_code /
+       dom_data yielded a POINTER (16 B) rather than a word (8 B). On real silicon a
+       16-byte capability store puts the high 8 bytes through compress_cap(), a LOSSY
+       encoder, so plain scalar data in the high half of every granule was corrupted --
+       board-confirmed as the root cause of C-13 (see ISSUES R-10). */
+    __linear void *mem_l;
+    __linear void *dom_code;
+    __linear void *dom_data;
+    __linear void *mem_r;
     __linear void **dom_seal;
 
     dom_code = split_out_cap(base_addr, tot_size, 1);
 
-    dom_seal = __split(dom_code, base_addr + code_size);
-    dom_data = __split(dom_seal, base_addr + code_size + DOMAIN_DATA_SIZE);
+    dom_seal = __split(dom_code, base_addr + split_size);
+    dom_data = __split(dom_seal, base_addr + split_size + data_off);
+
+    /* Large-.rodata delivery (issue C-4b). Copy the initialized-globals bytes of the
+       loaded image, [base+GPFREE_GLOBALS_OFFSET, base+code_size), into the FRONT of
+       dom_data, so that dom_data[k] == image[base+GPFREE_GLOBALS_OFFSET + k].
+
+       WHY THIS IS NEEDED. The cap-table glue otherwise materializes an initialized
+       global with an unrolled li/sd immediate sequence. That has a hard ceiling: a
+       single global must be a multiple of 8 bytes and fit a 12-bit store offset
+       (~2 KB), and the code it emits competes for the domain's PCC window. beebs_ns
+       hit it exactly -- "2512 B of *initialized* data overflows the 12-bit store
+       offset and is not copy-eligible" -- and SQLite's static tables are far past it.
+       With the bytes present in dom_data the glue can copy them instead, which scales
+       to any table size.
+
+       WHY THE MONITOR DOES IT. The initializer bytes physically exist in the loaded
+       image, but after the dom_gp split below the image is covered for the domain only
+       by an EXECUTE-authority cap, and the 2026-07-22 root cause established that a
+       code-authority cap cannot load data on captype-fixed CVA6. The monitor runs in
+       M-mode with authority over the image, so it can read it and write into the
+       fresh dom_data region -- the data-authority-over-a-data-region case that already
+       works on the board. The domain therefore never reads data through an execute cap.
+
+       PLACEMENT is load-bearing, in three ways:
+         - BEFORE the dom_gp __split below, while dom_code still spans
+           [base, base+code_size) and so still covers the globals.
+         - BEFORE the C_SET_CURSOR calls that move dom_code's and dom_data's cursors:
+           indexed access here is cursor-relative.
+         - AFTER the dom_data __split, so dom_data is the fresh region and index 0 is
+           its front.
+
+       The word-copy idiom (cap-to-cap, the same shape capstone-c uses for enclave
+       setup) is exact for this payload: .rodata const tables carry no capability tags,
+       so there is nothing for a plain word copy to lose.
+
+       Board owner's stated preference is for the HOST USERSPACE process to do this
+       rather than the monitor ("but for now whatever works is fine"). This is the
+       prototype; keeping it as one self-contained block is what makes moving it out of
+       M-mode later a local change. */
+    /* Bounds guard, deliberately explicit. dom_data spans
+       [base+code_size+DOMAIN_DATA_SIZE, base+tot_size), so it holds
+       tot_size - code_size - DOMAIN_DATA_SIZE bytes, while the blob is
+       code_size - GPFREE_GLOBALS_OFFSET bytes. A domain with a large image and a
+       small data region would otherwise run the copy past dom_data's end, and an
+       out-of-bounds capability store HERE is an M-mode fault -- i.e. it takes the
+       whole machine down, not just the domain. Skipping the copy instead is safe:
+       the glue only reads the blob for globals that took the copy path, and a
+       domain that does not fit simply keeps the old unrolled-immediate behaviour. */
+    if(code_size > gpoff
+       && tot_size > split_size + data_off
+       && (code_size - gpoff) > (tot_size - split_size - DOMAIN_DATA_SIZE)) {
+        /* The blob does not fit in dom_data. This used to SKIP the copy silently,
+           on the reasoning that "the glue only reads the blob for globals that took
+           the copy path" -- which is exactly backwards once a global DOES take it:
+           the domain then runs with uninitialized globals, computes wrong answers and
+           never faults. A domain whose globals were not delivered is not a degraded
+           domain, it is a wrong one, so fail loudly and let the build-time budget
+           check (which is where this belongs) catch it earlier next time. */
+        capstone_error(0xB10B);
+    }
+    /* DIAGNOSTIC MAGIC (2026-07-29, C-13). Written UNCONDITIONALLY, before the copy
+       guard, into the first word of dom_data -- the exact word the blobpeek probe reads.
+       It discriminates the only two surviving hypotheses, which need opposite fixes:
+         domain reads 0x5A5A5A5A -> the monitor CAN write where the domain reads, so the
+                                    destination is fine and the COPY GUARD or the loop is
+                                    what fails (the guard is silent when false)
+         domain reads 0          -> the monitor's dom_data is NOT the region the domain's
+                                    sp covers: a genuine destination mismatch
+       Board measurement says dom_data.base sits 96 bytes below where this source computes
+       it (sp.base mod 128K = 5632, source implies code_size+DOMAIN_DATA_SIZE = 5728), and
+       96 is exactly the blob size -- unexplained, hence measuring instead of deriving.
+       REMOVE once C-13 is closed. */
+    if(code_size > gpoff
+       && tot_size > split_size + data_off) {
+        /* Index in 16-BYTE units, not 8. These are `__linear void *`, so subscripting
+           steps one CAPABILITY (16 B) and the generated access is a 16-byte ldc/stc --
+           `dom_seal`'s own zeroing loop runs to DOMAIN_DATA_N with
+           DOMAIN_DATA_SIZE = 16 * DOMAIN_DATA_N, which is the same convention.
+           Computing the trip count with `>> 3` (as the earlier draft of this copy did)
+           walks TWICE the intended distance and stores past dom_data's end. That is not
+           a theoretical concern: it faulted on the first run --
+             Cap mem access OOB: cursor = 101562000, size = 16,
+                                 bounds = (101560000, 101561020)
+           i.e. it reached +0x2000 into a 0x1020-byte region.
+           Both endpoints are 16-aligned by construction: code_size is rounded up to a
+           multiple of 16 at the top of this function, and GPFREE_GLOBALS_OFFSET is
+           0x1000, so the byte count is always a whole number of capabilities.
+           Copying through capability-sized accesses is exact for this payload: the
+           image bytes here are const initializer data with no capability tags, so the
+           128 bits round-trip unchanged. */
+        /* 8-BYTE UNITS now, not 16. With dom_code/dom_data correctly typed as
+           `__linear void *`, subscripting steps ONE WORD and the loop body emits a
+           scalar ld/sd -- which is the whole point: it never touches compress_cap, so
+           plain data round-trips exactly. Byte extent and start offset are unchanged
+           (gpoff_c*8 == gpoff), and both endpoints stay 8-aligned because code_size is
+           rounded up to 16 and gpoff is 0x1000. */
+        unsigned gpoff_c = gpoff >> 3;                          /* image offset, in words */
+        unsigned glob_c  = (code_size - gpoff) >> 3;
+        unsigned ci;
+        for(ci = 0; ci < glob_c; ci += 1)
+            dom_data[ci] = dom_code[gpoff_c + ci];
+    }
 
     int i;
     for(i = 0; i < DOMAIN_DATA_N; i += 1) {
         dom_seal[i] = 0;
     }
 
+    // gp-free domain ABI (silicon): derive the domain's `gp` from real authority
+    // by SPLITting the code image at the fixed globals boundary
+    // (GPFREE_GLOBALS_OFFSET, matching link-gpfree.ld) into an execute code cap
+    // (PCC) and an R/W globals cap (gp). SPLIT only partitions existing authority,
+    // so -- unlike the QEMU-only debug op C_GEN_CAP (funct 0x40, absent on the RTL,
+    // which fabricates a cap and hangs the monitor on silicon) -- this works on
+    // real hardware. gp is delivered via the cscratch (dom_data) top-16 slot; the
+    // entry glue does `ldc gp, END-16; delin`.
+    __linear void *dom_gp = __split(dom_code, base_addr + gpoff);
+    // dom_code -> [base, base+GPFREE_GLOBALS_OFFSET) (code); dom_gp -> [.., +code_size) (globals)
+
     C_SET_CURSOR(dom_code, dom_code, base_addr + entry_offset);
+
+    // store gp (linear; glue delins on first entry) into the cscratch top slot
+    C_SET_CURSOR(dom_data, dom_data, base_addr + tot_size - 16);
+    *(__linear void **)dom_data = dom_gp;
+    C_SET_CURSOR(dom_data, dom_data, base_addr + split_size + data_off);
 
     // construct the sealed region of the domain
     dom_seal[0] = dom_code;
@@ -347,9 +870,43 @@ static unsigned create_region(unsigned base, unsigned len) {
 }
 
 static unsigned shared_region_annotated(unsigned dom_id, unsigned region_id, unsigned annotation_perm, unsigned annotation_rev) {
+    /* I-4 progress SHA0: the handler was entered at all. If SHA0 never appears the
+       ecall did not reach the monitor and the problem is kernel-module side. */
+    /* Snapshot the incoming arguments into locals BEFORE any call. The first
+       instrumented run printed dom_id=0 (correct) then region_id/perm/rev all 0
+       (wrong -- the host passed 12/0x1/0x2), which is exactly what a clobber of the
+       argument registers across the first capstone_trace() call looks like: the first
+       value survives, every later one reads whatever a1-a3 now hold. capstone-c is a
+       custom compiler for a C subset and its handling of live argument registers
+       across calls is not something to assume. If these locals print correctly, the
+       arguments were always fine and the tags were destroying their own evidence. */
+    unsigned t_dom;
+    unsigned t_rgn;
+    unsigned t_prm;
+    unsigned t_rev;
+    t_dom = dom_id;
+    t_rgn = region_id;
+    t_prm = annotation_perm;
+    t_rev = annotation_rev;
+    capstone_trace(CAPSTONE_TAG_SHA0, t_dom);
+    capstone_trace(CAPSTONE_TAG_RGID, t_rgn);
+    capstone_trace(CAPSTONE_TAG_APRM, t_prm);
+    capstone_trace(CAPSTONE_TAG_AREV, t_rev);
     if(dom_id >= dom_n || region_id >= region_n) {
+        /* I-4 site SHAB: the request is rejected. This RETURNS rather than spinning,
+           and ioctl_share_region_annotated() drops the return value on the floor, so
+           without a tag a rejected share is indistinguishable from a successful one
+           on the console. dom_n/region_n say which of the two bounds failed. */
+        capstone_report(CAPSTONE_TAG_SHAB, CAPSTONE_ERR_SHARE_BAD_ID);
+        capstone_report(CAPSTONE_TAG_DOMN, dom_n);
+        capstone_report(CAPSTONE_TAG_RGNN, region_n);
+        capstone_uart_flush();
         return -1;
     }
+    /* I-4 progress SHA1: ids accepted. The value is region_cpmp[region_id], which
+       selects the cpmp-resident vs table-resident branch below -- the one thing that
+       differs between two callers passing byte-identical ioctl arguments. */
+    capstone_trace(CAPSTONE_TAG_SHA1, region_cpmp[region_id]);
 
     __dom void *d = domains[dom_id];
 
@@ -360,6 +917,11 @@ static unsigned shared_region_annotated(unsigned dom_id, unsigned region_id, uns
     else {
         r = regions[region_id];
     }
+    /* I-4 progress SHA2: the region capability is in hand. Type (0 = linear) decides
+       the REV_SHARED/REV_TRANSFERRED branches; base/length identify WHICH region. */
+    capstone_trace(CAPSTONE_TAG_SHA2, cap_type(r));
+    capstone_trace(CAPSTONE_TAG_BASE, cap_base(r));
+    capstone_trace(CAPSTONE_TAG_ALEN, cap_end(r) - cap_base(r));
 
     if (annotation_rev == CAPSTONE_ANNOTATION_REV_DEFAULT) {
         // capability type: non-linear; post-return revoke: yes
@@ -402,6 +964,14 @@ static unsigned shared_region_annotated(unsigned dom_id, unsigned region_id, uns
         // TODO: regions[region_id] should be added to a free list
         if (cap_type(r) != CAP_TYPE_LINEAR) {
             //C_PRINT(0xdeadbeef);
+            /* I-4 site SHAX: a TRANSFERRED share needs a linear capability and this
+               one is not linear (it was already de-linearised by an earlier SHARED or
+               DEFAULT share of the same region). Previously a bare `while(1);` with
+               the C_PRINT commented out, i.e. a completely silent wedge. */
+            capstone_report(CAPSTONE_TAG_SHAX, CAPSTONE_ERR_SHARE_NOT_LIN);
+            capstone_report(CAPSTONE_TAG_RGID, region_id);
+            capstone_report(CAPSTONE_TAG_CTYP, cap_type(r));
+            capstone_uart_flush();
             while(1);
         }
 
@@ -411,8 +981,15 @@ static unsigned shared_region_annotated(unsigned dom_id, unsigned region_id, uns
         }
     }
     else {
+        /* I-4 site SHAV: annotation_rev is not one of the four defined values. */
+        capstone_report(CAPSTONE_TAG_SHAV, CAPSTONE_ERR_SHARE_BAD_REV);
+        capstone_report(CAPSTONE_TAG_AREV, annotation_rev);
+        capstone_uart_flush();
         return -1;
     }
+    /* I-4 progress SHA3: the revocation annotation has been applied (mrev/delin done,
+       region table or cpmp updated). */
+    capstone_trace(CAPSTONE_TAG_SHA3, annotation_rev);
 
     if (annotation_perm == CAPSTONE_ANNOTATION_PERM_IN) {
         r = __tighten(r, 4);
@@ -430,10 +1007,24 @@ static unsigned shared_region_annotated(unsigned dom_id, unsigned region_id, uns
         r = __tighten(r, 7);
     }
     else {
+        /* I-4 site SHAP: annotation_perm is not one of the five defined values. */
+        capstone_report(CAPSTONE_TAG_SHAP, CAPSTONE_ERR_SHARE_BAD_PERM);
+        capstone_report(CAPSTONE_TAG_APRM, annotation_perm);
+        capstone_uart_flush();
         return -1;
     }
+    /* I-4 progress SHA4: the permission annotation has been applied (tighten done). */
+    capstone_trace(CAPSTONE_TAG_SHA4, annotation_perm);
 
+    /* I-4 progress SHA5: everything the MONITOR does is finished; the next
+       instruction leaves M-mode for the domain's region-share entry. This is the
+       split that the SQLite hang needs: SHA5 followed by silence means the domain
+       never came back and the monitor is exonerated; no SHA5 means the wedge is in
+       one of the monitor steps above. */
+    capstone_trace(CAPSTONE_TAG_SHA5, dom_id);
     d = __domcallsaves(d, CAPSTONE_DPI_REGION_SHARE, r);
+    /* I-4 progress SHA6: the domain returned from the share entry. */
+    capstone_trace(CAPSTONE_TAG_SHA6, dom_id);
     domains[dom_id] = d;
 
     return 0;
@@ -617,7 +1208,7 @@ unsigned handle_trap_ecall(unsigned arg0, unsigned arg1,
         case SBI_EXT_CAPSTONE:
             switch(func_code) {
                 case SBI_EXT_CAPSTONE_DOM_CREATE:
-                    res = create_domain(arg0, arg1, arg2, arg3);
+                    res = create_domain(arg0, arg1, arg2, arg3, arg4);
                     break;
                 case SBI_EXT_CAPSTONE_DOM_CALL:
                     res = call_domain(arg0);
@@ -633,6 +1224,11 @@ unsigned handle_trap_ecall(unsigned arg0, unsigned arg1,
                     break;
                 case SBI_EXT_CAPSTONE_DOM_RETURN:
                     return_from_domain(arg0);
+                    /* I-4 site DRET: return_from_domain() ends in __domreturnsaves
+                       and must not come back. Reached on the return leg of every
+                       domain call, including the region-share entry. */
+                    capstone_report(CAPSTONE_TAG_DRET, CAPSTONE_ERR_DOM_RETURN_RET);
+                    capstone_uart_flush();
                     while(1); /* should not reach here */
                 case SBI_EXT_CAPSTONE_REGION_QUERY:
                     res = query_region(arg0, arg1);
@@ -644,7 +1240,24 @@ unsigned handle_trap_ecall(unsigned arg0, unsigned arg1,
                     res = region_n;
                     break;
                 case SBI_EXT_CAPSTONE_REGION_SHARE_ANNOTATED:
+                    /* I-4 progress ECSA/ECSZ: bracket the handler at the DISPATCH,
+                       so "the ecall arrived" is distinguishable from "the handler
+                       started" (SHA0) even if the handler's own prologue wedges. */
+                    /* Print the FULL register picture, not just arg0. dom_id is
+                       legitimately 0, so arg0 cannot distinguish "arrived" from "lost" --
+                       that ambiguity has already masked three hypotheses. func_code and
+                       ext_code live in a6/a7 and MUST have arrived (we are in this case at
+                       all), so they are the positive control: if they print correctly
+                       while arg1..arg3 print zero, then a0/a6/a7 survive the trap while
+                       a1..a5 do not, which localises the defect to the trap save/restore
+                       of the middle argument registers rather than to any SBI mapping. */
+                    capstone_trace(CAPSTONE_TAG_ECSA, arg0);
+                    capstone_trace(CAPSTONE_TAG_EXTC, ext_code);
+                    capstone_trace(CAPSTONE_TAG_FNCC, func_code);
+                    capstone_trace(CAPSTONE_TAG_ARG1, arg1);
+                    capstone_trace(CAPSTONE_TAG_ARG4, arg4);
                     res = shared_region_annotated(arg0, arg1, arg2, arg3);
+                    capstone_trace(CAPSTONE_TAG_ECSZ, res);
                     break;
                 case SBI_EXT_CAPSTONE_REGION_REVOKE:
                     res = revoke_region(arg0);
@@ -672,6 +1285,11 @@ void handle_interrupt(unsigned int_code) {
             __asm__ volatile ("csrs mip, %0" :: "r"(MIP_STIP));
             break;
         default:
+            /* I-4 site IRQX: an interrupt the monitor does not service. Printing
+               int_code is the whole point -- it says WHICH interrupt. */
+            capstone_report(CAPSTONE_TAG_IRQX, CAPSTONE_ERR_IRQ_UNHANDLED);
+            capstone_report(CAPSTONE_TAG_MCAU, int_code);
+            capstone_uart_flush();
             while(1);
     }
 }
@@ -695,7 +1313,11 @@ static void swap_cpmp(unsigned badaddr) {
         //C_PRINT(region_n);
         print_regions();
         print_cpmps();
-        capstone_error(CAPSTONE_NO_CPMP_REGION);
+        /* I-4 site CPMX. The code stays CAPSTONE_NO_CPMP_REGION so the RTL trace
+           is unchanged; only the UART line is new. badaddr is the faulting
+           address no region covers -- previously only available via C_PRINT. */
+        capstone_report(CAPSTONE_TAG_MTVL, badaddr);
+        capstone_error_tag(CAPSTONE_TAG_CPMX, CAPSTONE_NO_CPMP_REGION);
     }
 
     // check if there is free cpmp entry
@@ -724,6 +1346,7 @@ static void swap_cpmp(unsigned badaddr) {
 unsigned handle_exception(unsigned cause) {
     unsigned badaddr;
     unsigned time_val;
+    unsigned dbg_epc;
     switch(cause) {
         case CAUSE_ILLEGAL_INSTRUCTION:
             // __asm__ ("1: j 1b");
@@ -733,6 +1356,20 @@ unsigned handle_exception(unsigned cause) {
                 break;
             }
             else {
+                /* I-4 site ILLX: an illegal instruction that is not the `time`
+                   CSR read the monitor emulates. This is the site that a board
+                   session already burned days on (an FP store with mstatus.FS=Off,
+                   then a second unservicable userspace instruction) -- with no
+                   output at all, it was indistinguishable from a domain hang.
+                   badaddr is mtval, i.e. the offending instruction word, which
+                   identifies WHICH instruction the monitor cannot service. */
+                capstone_report(CAPSTONE_TAG_ILLX, CAPSTONE_ERR_ILLEGAL_INSN);
+                capstone_report(CAPSTONE_TAG_MTVL, badaddr);
+                C_READ_CSR(mepc, dbg_epc);
+                capstone_report(CAPSTONE_TAG_MEPC, dbg_epc);
+                capstone_uart_flush();
+                /* kept: a debugger halting the wedged core still finds mcause in
+                   a5 and mepc in a6 (the existing gdb workflow). */
                 __asm__ ("csrr a5, mcause");
                 __asm__ ("csrr a6, mepc");
                 while(1);
@@ -747,6 +1384,15 @@ unsigned handle_exception(unsigned cause) {
             time_val = -1;
             break;
         default:
+            /* I-4 site EXCX: a trap cause the monitor does not handle at all. */
+            capstone_report(CAPSTONE_TAG_EXCX, CAPSTONE_ERR_EXC_UNHANDLED);
+            capstone_report(CAPSTONE_TAG_MCAU, cause);
+            C_READ_CSR(mepc, dbg_epc);
+            capstone_report(CAPSTONE_TAG_MEPC, dbg_epc);
+            C_READ_CSR(mtval, badaddr);
+            capstone_report(CAPSTONE_TAG_MTVL, badaddr);
+            capstone_uart_flush();
+            /* kept: mcause in a5, mepc in a6 for a debugger halt. */
             __asm__ ("csrr a5, mcause");
             __asm__ ("csrr a6, mepc");
             __asm__ ("1: j 1b");
@@ -769,6 +1415,19 @@ static void dpi_call(void *arg) {
 }
 
 static void dpi_share_region(void *region) {
+    /* I-4 progress DPIS: a DOMAIN shared a region back into the monitor (the reverse
+       leg of the share path). value = region_n, i.e. the slot it lands in. */
+    capstone_trace(CAPSTONE_TAG_DPIS, region_n);
+    if(region_n >= CAPSTONE_MAX_REGION_N) {
+        /* I-4 site RGNO: the region table is full. This used to write one past the
+           end of regions[] and silently corrupt the globals laid out after it
+           (region_cpmp/cpmp_region/dom_n/region_n) -- a wrong answer with no output
+           rather than a hang, which is worse. A named spin is strictly better. */
+        capstone_report(CAPSTONE_TAG_RGNO, CAPSTONE_ERR_REGION_OVERFLOW);
+        capstone_report(CAPSTONE_TAG_RGNN, region_n);
+        capstone_uart_flush();
+        while(1);
+    }
     regions[region_n] = region;
     region_n += 1;
 }
@@ -779,10 +1438,22 @@ unsigned handle_dpi(unsigned func, void *arg) {
     switch(func) {
         case CAPSTONE_DPI_CALL:
             dpi_call(arg);
+            /* I-4 site DPIC: dpi_call() ends in a jump into S-mode and must not
+               return. */
+            capstone_report(CAPSTONE_TAG_DPIC, CAPSTONE_ERR_DPI_CALL_RET);
+            capstone_uart_flush();
             while(1); /* should not reach here */
         case CAPSTONE_DPI_REGION_SHARE:
             dpi_share_region(arg);
             handled = 1;
+            break;
+        default:
+            /* I-4 site DPIX: a DPI function code the monitor does not implement.
+               Behaviour is unchanged (handled stays 0); it just says so now, because
+               what the caller does with handled == 0 is not visible from here. */
+            capstone_report(CAPSTONE_TAG_DPIX, CAPSTONE_ERR_DPI_UNKNOWN);
+            capstone_report(CAPSTONE_TAG_DPIF, func);
+            capstone_uart_flush();
             break;
     }
 
