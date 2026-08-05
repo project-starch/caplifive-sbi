@@ -112,6 +112,10 @@
 #define CAPSTONE_TAG_SHA4 0x53484134 /* "SHA4" permission annotation applied */
 #define CAPSTONE_TAG_SHA5 0x53484135 /* "SHA5" about to leave M-mode for the domain */
 #define CAPSTONE_TAG_SHA6 0x53484136 /* "SHA6" the domain returned from the share entry */
+#define CAPSTONE_TAG_ENT0 0x454e5430 /* "ENT0" call_domain entered, value = dom_id */
+#define CAPSTONE_TAG_ENT1 0x454e5431 /* "ENT1" about to leave M-mode INTO the domain */
+#define CAPSTONE_TAG_ENT2 0x454e5432 /* "ENT2" the domain returned, value = its result */
+#define CAPSTONE_TAG_ENTB 0x454e5442 /* "ENTB" bad dom_id, returns -1 without entering */
 #define CAPSTONE_TAG_SHAB 0x53484142 /* "SHAB" bad dom_id/region_id (returns -1) */
 #define CAPSTONE_TAG_SHAV 0x53484156 /* "SHAV" unknown annotation_rev (returns -1) */
 #define CAPSTONE_TAG_SHAP 0x53484150 /* "SHAP" unknown annotation_perm (returns -1) */
@@ -836,13 +840,30 @@ static unsigned create_domain(unsigned base_addr, unsigned code_size,
 }
 
 static unsigned call_domain(unsigned dom_id) {
+    /* THE ENTER PATH WAS COMPLETELY UNINSTRUMENTED, and that has been costing verdicts.
+       Every SHA and ECSZ tag belongs to the REGION-SHARE path; nothing here emitted anything. So
+       a domain that produced `SQ: G/enter` and then went silent could have died in this
+       function, in the domain switch, at its first instruction, in the carve loop, or in
+       __capstone_cap_init -- all indistinguishable, because `SQ: G/enter` is printed by the
+       HOST before it even calls in.
+
+       That ambiguity was being read as "entered and wedged -- a REAL result" (the board-run
+       skill's classification rule), which it is not: it is an UNATTRIBUTED result. ENT1/ENT2
+       are the enter-path equivalent of SHA5/SHA6 and make the distinction the rule assumes:
+         ENT0 then silence -> died in this function before the switch
+         ENT1 then silence -> control genuinely left M-mode; the domain owns the wedge
+         ENT2             -> the domain returned; value is its result */
+    capstone_trace(CAPSTONE_TAG_ENT0, dom_id);
     if(dom_id >= dom_n) {
+        capstone_trace(CAPSTONE_TAG_ENTB, dom_id);
         return -1;
     }
 
     unsigned res;
     __dom void *d = domains[dom_id];
+    capstone_trace(CAPSTONE_TAG_ENT1, dom_id);
     d = __domcallsaves(d, CAPSTONE_DPI_CALL, &res);
+    capstone_trace(CAPSTONE_TAG_ENT2, res);
     domains[dom_id] = d;
 
     return res;
