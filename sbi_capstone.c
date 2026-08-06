@@ -56,7 +56,10 @@
 #define CAPSTONE_ERR_ILLEGAL_INSN    0xe003
 #define CAPSTONE_ERR_SPLIT_NO_REGION 0xe005
 #define CAPSTONE_ERR_SPLIT_EXACT     0xe006
-#define CAPSTONE_ERR_SPLIT_EXACT_MID 0xe007 /* exact fit, but NOT the tail slot */
+#define CAPSTONE_ERR_SPLIT_EXACT_MID 0xe010 /* exact fit, but NOT the tail slot.
+     Was 0xe007, which COLLIDES with CAPSTONE_ERR_SHARE_BAD_ID -- distinguishable
+     only by the accompanying tag, which is exactly the kind of ambiguity that
+     costs a session when a log is read quickly. */
 
 /* ENABLED 2026-08-01 after the exact-fit spin was shown to be the BACKGROUND WEDGE.
    Measured: running the trivial control domain repeatedly in one boot wedges at run 6-7 in
@@ -537,9 +540,20 @@ static void *split_out_cap(unsigned base, unsigned len, unsigned linear) {
                with a distinct code so the log tells the two apart. */
 #ifdef CAPSTONE_SPLIT_EXACT_FIT
             if(i + 1 == region_n) {
+                /* Clear the CPMP mapping before dropping the slot. Without this the register
+                   is leaked forever (cpmp_region[c] stays != -1 so the free-slot scan never
+                   reclaims it) and the NEXT region appended at this index inherits a stale
+                   region_cpmp[i], so every access to it reads a register that read_cpmp has
+                   already emptied. Silent, with a delayed symptom. pop_region does it right. */
+                if(region_cpmp[i] != -1) {
+                    cpmp_region[region_cpmp[i]] = -1;
+                    region_cpmp[i] = -1;
+                }
                 region_n -= 1;
             } else {
                 capstone_report(CAPSTONE_TAG_SPLB, CAPSTONE_ERR_SPLIT_EXACT_MID);
+                capstone_report(CAPSTONE_TAG_RGID, i);
+                capstone_report(CAPSTONE_TAG_RGNN, region_n);
                 capstone_report(CAPSTONE_TAG_BASE, base);
                 capstone_report(CAPSTONE_TAG_ALEN, len);
                 capstone_uart_flush();
@@ -549,6 +563,8 @@ static void *split_out_cap(unsigned base, unsigned len, unsigned linear) {
             // matching region. We don't support this for now
             /* I-4 site SPLB */
             capstone_report(CAPSTONE_TAG_SPLB, CAPSTONE_ERR_SPLIT_EXACT);
+            capstone_report(CAPSTONE_TAG_RGID, i);
+            capstone_report(CAPSTONE_TAG_RGNN, region_n);
             capstone_report(CAPSTONE_TAG_BASE, base);
             capstone_report(CAPSTONE_TAG_ALEN, len);
             capstone_uart_flush();
@@ -574,6 +590,18 @@ static void *split_out_cap(unsigned base, unsigned len, unsigned linear) {
             else
                 regions[i] = mem_l;
 
+            if(region_n >= CAPSTONE_MAX_REGION_N) {
+                /* I-4 site RGNO. Was UNGUARDED: three of the four appends had no bounds check,
+                   so the table simply ran past regions[] into region_cpmp[]/cpmp_region[] --
+                   a silent wrong answer instead of a stop. Measured 2026-08-06: region ids
+                   reach 24/25 by the FOURTH SQLite domain against CAPSTONE_MAX_REGION_N = 32,
+                   so this overrun is ~1 domain away on every board session, and it is exactly
+                   what a "fix" to the exact-fit spin would have unmasked. */
+                capstone_report(CAPSTONE_TAG_RGNO, CAPSTONE_ERR_REGION_OVERFLOW);
+                capstone_report(CAPSTONE_TAG_RGNN, region_n);
+                capstone_uart_flush();
+                while(1);
+            }
             regions[region_n] = mem_r;
             region_n += 1;
             /* we load regions into cpmp lazily*/
@@ -591,6 +619,18 @@ static void *split_out_cap(unsigned base, unsigned len, unsigned linear) {
     }
 
     if(!linear) {
+        if(region_n >= CAPSTONE_MAX_REGION_N) {
+            /* I-4 site RGNO. Was UNGUARDED: three of the four appends had no bounds check,
+               so the table simply ran past regions[] into region_cpmp[]/cpmp_region[] --
+               a silent wrong answer instead of a stop. Measured 2026-08-06: region ids
+               reach 24/25 by the FOURTH SQLite domain against CAPSTONE_MAX_REGION_N = 32,
+               so this overrun is ~1 domain away on every board session, and it is exactly
+               what a "fix" to the exact-fit spin would have unmasked. */
+            capstone_report(CAPSTONE_TAG_RGNO, CAPSTONE_ERR_REGION_OVERFLOW);
+            capstone_report(CAPSTONE_TAG_RGNN, region_n);
+            capstone_uart_flush();
+            while(1);
+        }
         regions[region_n] = region;
         region_n += 1;
     }
@@ -891,6 +931,18 @@ static unsigned call_domain_with_cap(unsigned dom_id, unsigned base, unsigned le
 static unsigned create_region(unsigned base, unsigned len) {
     void *region = split_out_cap(base, len, 1);
 
+    if(region_n >= CAPSTONE_MAX_REGION_N) {
+        /* I-4 site RGNO. Was UNGUARDED: three of the four appends had no bounds check,
+           so the table simply ran past regions[] into region_cpmp[]/cpmp_region[] --
+           a silent wrong answer instead of a stop. Measured 2026-08-06: region ids
+           reach 24/25 by the FOURTH SQLite domain against CAPSTONE_MAX_REGION_N = 32,
+           so this overrun is ~1 domain away on every board session, and it is exactly
+           what a "fix" to the exact-fit spin would have unmasked. */
+        capstone_report(CAPSTONE_TAG_RGNO, CAPSTONE_ERR_REGION_OVERFLOW);
+        capstone_report(CAPSTONE_TAG_RGNN, region_n);
+        capstone_uart_flush();
+        while(1);
+    }
     regions[region_n] = region;
     region_n += 1;
 
