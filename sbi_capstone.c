@@ -65,9 +65,16 @@
    spin is what limited every board session to ~5 useful domains and produced a large share of
    this campaign's "random" wedges. See split_out_cap() for what the handling does and why only
    the tail case is handled. */
-/* A/B TEST 2026-08-02: exact-fit fix disabled to test whether it caused
-   the share1/SHA5 wedge. Re-enable by uncommenting. */
-/* #define CAPSTONE_SPLIT_EXACT_FIT 1 */
+/* RE-ENABLED 2026-08-06. The 2026-08-02 A/B disabled this to test whether the fix caused the
+   share1/SHA5 wedge, and it was never turned back on -- so every board session since has been
+   paying the background wedge it was written to fix. Measured again today, twice in
+   consecutive boots: the 5th create_dom of a boot spins at SPLB:0000E006 with no
+   `SQ: A/dom-ok`, i.e. the domain is never created and whatever probe occupied that slot is
+   blamed for a monitor fault. That manufactured a confident, entirely false localization of a
+   SQLite function that never executed.
+   The A/B's own question stays open -- if the share1/SHA5 wedge returns with this on, that is
+   the answer to it and it can be flipped back with one line. */
+#define CAPSTONE_SPLIT_EXACT_FIT 1
 /* ---- I-4, REGION-SHARE path -------------------------------------------------
    SQLite hangs inside its FIRST shared_region_annotated() call with NO monitor
    tag at all -- not ILLX, not SPLA, not SPLB -- so the wedge is at a site that
