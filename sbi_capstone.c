@@ -32,6 +32,9 @@
 #define CPMP_COUNT 16
 #define DOMAIN_DATA_N    96
 #define DOMAIN_DATA_SIZE (16 * DOMAIN_DATA_N)
+// gp-free domain ABI (silicon): fixed image offset where the domain's globals
+// begin (must equal the value in tests/runtime-qemu/gp-free-domain/link-gpfree.ld).
+#define GPFREE_GLOBALS_OFFSET 0x1000
 
 
 // toggle the following for swapping between cpmp swapping and gen_cap (hack)
@@ -288,9 +291,58 @@ static void *split_out_cap(unsigned base, unsigned len, unsigned linear) {
 }
 
 
+/* globals_off: image offset where the domain's globals region starts, i.e. the value
+   the linker script put in __gpfree_globals_base minus the image base. 0 means "not
+   supplied" and falls back to the historical fixed 0x1000, so a caller that does not
+   pass it gets byte-for-byte the old behaviour and every existing rung keeps working
+   against this firmware.
+
+   It has to be a parameter rather than a constant because .text must fit BELOW it:
+   0x1000 is right for a BEEBS kernel and hopeless for SQLite, whose .text is 2.2 MB,
+   and one firmware has to serve both. Keeping it a #define also made DOMAIN_WINDOW=32k
+   silently WRONG whenever the copy path was in use -- the glue computed blob offsets
+   from base+0x8000 while the monitor filled dom_data from base+0x1000. That was masked
+   only because every 32k rung also set LADDER_NO_RO_COPY=1. */
 static unsigned create_domain(unsigned base_addr, unsigned code_size,
-                          unsigned tot_size, unsigned entry_offset)
+                          unsigned tot_size, unsigned entry_offset,
+                          unsigned globals_off)
 {
+    /* entry_offset carries the GLOBALS OFFSET in its high 32 bits (packed by
+       libcapstone; the kernel module forwards the word untouched). 0 in the high half
+       means "not supplied" and falls back to the historical 0x1000, so any domain
+       built before this creates exactly as it used to. */
+    /* TWO 16-BIT SHIFTS, not one 32-bit shift. capstone-c holds the full 64-bit value
+       (the print above shows 0x800000000000 arriving intact) but `>> 32` yields 0 --
+       the shift is evaluated at 32 bits. Measured, not assumed: with `>> 32` the
+       monitor computed gpoff = 0x1000 from an entry_offset of 0x800000000000. */
+    unsigned packed_gpoff = (entry_offset >> 16) >> 16;
+    entry_offset = entry_offset & 0xffffffff;
+    /* Plain if/else, not a nested ternary. With the ternary form capstone-c produced
+       gpoff = 0x1000 even though packed_gpoff printed as 0x8000 immediately above --
+       i.e. the conditional did not select the branch its own condition implied. */
+    /* 0 means THE IMAGE DECLARES NO GLOBALS REGION -- and that must NOT fall back to
+       GPFREE_GLOBALS_OFFSET. The fallback was the bug: it made the gp carve below
+       unconditional, so a domain linked with my_first_domain/link.ld (no globals at
+       0x1000, no gp read from cscratch, ~78 build scripts use it) had its code
+       capability split at base+0x1000 anyway. Two symptoms, one cause, and they look
+       nothing alike:
+         image <  0x1000  -> the SPLIT itself is out of bounds; QEMU asserts in
+                             helper_cssplit and aborts before the domain exists.
+         image >= 0x1000  -> the split succeeds and TRUNCATES the code cap to exactly
+                             4096 bytes; the entry glue's first read past it faults
+                             (measured: coremark, bounds = [base, base+0x1000),
+                              access at base+0x6278).
+       That is the whole red core tier -- smoke, coremark, rv8, beebs, authority and the
+       rest -- from one unconditional split. Only a gp-free/cap-table image has a
+       globals boundary, and those always declare it (.capstone_gp_initdesc, verified
+       present in a built board domain), so keying on it is exact rather than heuristic. */
+    unsigned gpoff = 0;
+    if (globals_off) {
+        gpoff = globals_off;
+    }
+    if (packed_gpoff) {
+        gpoff = packed_gpoff;
+    }
     // alignment requirement
     code_size = (((code_size - 1) >> 4) + 1) << 4;
     __linear void *mem_l, *dom_code, *dom_data, *mem_r;
@@ -301,12 +353,125 @@ static unsigned create_domain(unsigned base_addr, unsigned code_size,
     dom_seal = __split(dom_code, base_addr + code_size);
     dom_data = __split(dom_seal, base_addr + code_size + DOMAIN_DATA_SIZE);
 
+    /* Large-.rodata delivery (issue C-4b). Copy the initialized-globals bytes of the
+       loaded image, [base+GPFREE_GLOBALS_OFFSET, base+code_size), into the FRONT of
+       dom_data, so that dom_data[k] == image[base+GPFREE_GLOBALS_OFFSET + k].
+
+       WHY THIS IS NEEDED. The cap-table glue otherwise materializes an initialized
+       global with an unrolled li/sd immediate sequence. That has a hard ceiling: a
+       single global must be a multiple of 8 bytes and fit a 12-bit store offset
+       (~2 KB), and the code it emits competes for the domain's PCC window. beebs_ns
+       hit it exactly -- "2512 B of *initialized* data overflows the 12-bit store
+       offset and is not copy-eligible" -- and SQLite's static tables are far past it.
+       With the bytes present in dom_data the glue can copy them instead, which scales
+       to any table size.
+
+       WHY THE MONITOR DOES IT. The initializer bytes physically exist in the loaded
+       image, but after the dom_gp split below the image is covered for the domain only
+       by an EXECUTE-authority cap, and the 2026-07-22 root cause established that a
+       code-authority cap cannot load data on captype-fixed CVA6. The monitor runs in
+       M-mode with authority over the image, so it can read it and write into the
+       fresh dom_data region -- the data-authority-over-a-data-region case that already
+       works on the board. The domain therefore never reads data through an execute cap.
+
+       PLACEMENT is load-bearing, in three ways:
+         - BEFORE the dom_gp __split below, while dom_code still spans
+           [base, base+code_size) and so still covers the globals.
+         - BEFORE the C_SET_CURSOR calls that move dom_code's and dom_data's cursors:
+           indexed access here is cursor-relative.
+         - AFTER the dom_data __split, so dom_data is the fresh region and index 0 is
+           its front.
+
+       The word-copy idiom (cap-to-cap, the same shape capstone-c uses for enclave
+       setup) is exact for this payload: .rodata const tables carry no capability tags,
+       so there is nothing for a plain word copy to lose.
+
+       Board owner's stated preference is for the HOST USERSPACE process to do this
+       rather than the monitor ("but for now whatever works is fine"). This is the
+       prototype; keeping it as one self-contained block is what makes moving it out of
+       M-mode later a local change. */
+    /* Bounds guard, deliberately explicit. dom_data spans
+       [base+code_size+DOMAIN_DATA_SIZE, base+tot_size), so it holds
+       tot_size - code_size - DOMAIN_DATA_SIZE bytes, while the blob is
+       code_size - GPFREE_GLOBALS_OFFSET bytes. A domain with a large image and a
+       small data region would otherwise run the copy past dom_data's end, and an
+       out-of-bounds capability store HERE is an M-mode fault -- i.e. it takes the
+       whole machine down, not just the domain. Skipping the copy instead is safe:
+       the glue only reads the blob for globals that took the copy path, and a
+       domain that does not fit simply keeps the old unrolled-immediate behaviour. */
+    /* gpoff != 0 FIRST: with no declared globals region gpoff is 0 and `code_size > 0`
+       is trivially true, which would run the globals blob copy over the whole image for
+       a domain that has no globals at all. */
+    if(gpoff != 0
+       && code_size > gpoff
+       && tot_size > code_size + DOMAIN_DATA_SIZE
+       && (code_size - gpoff) > (tot_size - code_size - DOMAIN_DATA_SIZE)) {
+        /* The blob does not fit in dom_data. This used to SKIP the copy silently,
+           on the reasoning that "the glue only reads the blob for globals that took
+           the copy path" -- which is exactly backwards once a global DOES take it:
+           the domain then runs with uninitialized globals, computes wrong answers and
+           never faults. A domain whose globals were not delivered is not a degraded
+           domain, it is a wrong one, so fail loudly and let the build-time budget
+           check (which is where this belongs) catch it earlier next time. */
+        capstone_error(0xB10B);
+    }
+    if(gpoff != 0
+       && code_size > gpoff
+       && tot_size > code_size + DOMAIN_DATA_SIZE) {
+        /* Index in 16-BYTE units, not 8. These are `__linear void *`, so subscripting
+           steps one CAPABILITY (16 B) and the generated access is a 16-byte ldc/stc --
+           `dom_seal`'s own zeroing loop runs to DOMAIN_DATA_N with
+           DOMAIN_DATA_SIZE = 16 * DOMAIN_DATA_N, which is the same convention.
+           Computing the trip count with `>> 3` (as the earlier draft of this copy did)
+           walks TWICE the intended distance and stores past dom_data's end. That is not
+           a theoretical concern: it faulted on the first run --
+             Cap mem access OOB: cursor = 101562000, size = 16,
+                                 bounds = (101560000, 101561020)
+           i.e. it reached +0x2000 into a 0x1020-byte region.
+           Both endpoints are 16-aligned by construction: code_size is rounded up to a
+           multiple of 16 at the top of this function, and GPFREE_GLOBALS_OFFSET is
+           0x1000, so the byte count is always a whole number of capabilities.
+           Copying through capability-sized accesses is exact for this payload: the
+           image bytes here are const initializer data with no capability tags, so the
+           128 bits round-trip unchanged. */
+        unsigned gpoff_c = gpoff >> 4;                          /* image offset, in caps */
+        unsigned glob_c  = (code_size - gpoff) >> 4;
+        unsigned ci;
+        for(ci = 0; ci < glob_c; ci += 1)
+            dom_data[ci] = dom_code[gpoff_c + ci];
+    }
+
     int i;
     for(i = 0; i < DOMAIN_DATA_N; i += 1) {
         dom_seal[i] = 0;
     }
 
+    // gp-free domain ABI (silicon): derive the domain's `gp` from real authority
+    // by SPLITting the code image at the fixed globals boundary
+    // (GPFREE_GLOBALS_OFFSET, matching link-gpfree.ld) into an execute code cap
+    // (PCC) and an R/W globals cap (gp). SPLIT only partitions existing authority,
+    // so -- unlike the QEMU-only debug op C_GEN_CAP (funct 0x40, absent on the RTL,
+    // which fabricates a cap and hangs the monitor on silicon) -- this works on
+    // real hardware. gp is delivered via the cscratch (dom_data) top-16 slot; the
+    // entry glue does `ldc gp, END-16; delin`.
+    /* Carve gp ONLY for an image that declares a globals boundary, and only when the
+       boundary is genuinely inside the code region. Both conditions are required:
+       gpoff == 0 means no globals region at all, and gpoff >= code_size would be a
+       degenerate or out-of-range split even for an image that does declare one. */
+    __linear void *dom_gp = 0;
+    if (gpoff != 0 && code_size > gpoff) {
+        dom_gp = __split(dom_code, base_addr + gpoff);
+        // dom_code -> [base, base+gpoff) (code); dom_gp -> [.., +code_size) (globals)
+    }
+
     C_SET_CURSOR(dom_code, dom_code, base_addr + entry_offset);
+
+    // store gp (linear; glue delins on first entry) into the cscratch top slot
+    if (dom_gp != 0) {
+        C_SET_CURSOR(dom_data, dom_data, base_addr + tot_size - 16);
+        *(__linear void **)dom_data = dom_gp;
+        C_SET_CURSOR(dom_data, dom_data, base_addr + code_size + DOMAIN_DATA_SIZE);
+    }
 
     // construct the sealed region of the domain
     dom_seal[0] = dom_code;
@@ -753,7 +918,7 @@ unsigned handle_trap_ecall(unsigned arg0, unsigned arg1,
         case SBI_EXT_CAPSTONE:
             switch(func_code) {
                 case SBI_EXT_CAPSTONE_DOM_CREATE:
-                    res = create_domain(arg0, arg1, arg2, arg3);
+                    res = create_domain(arg0, arg1, arg2, arg3, arg4);
                     break;
                 case SBI_EXT_CAPSTONE_DOM_CALL:
                     res = call_domain(arg0);
