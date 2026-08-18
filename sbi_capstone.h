@@ -50,7 +50,32 @@
 
 
 #define CAPSTONE_MAX_DOM_N   32
-#define CAPSTONE_MAX_REGION_N   32
+/* RAISED 32 -> 96 on 2026-08-18. This was the real per-boot run ceiling.
+ *
+ * WHY 96 AND NOT MORE. 256 does not build. capstone-c emits a plain `addi` for the offset
+ * into regions[], and at 256 entries x 16 B the offset is 4096, outside the 12-bit signed
+ * immediate: the monitor fails to assemble with
+ *     sbi_capstone_dom.c.S: Error: illegal operands `addi t1,t1,-4096'
+ * So the practical cap is set by the monitor compiler's addressing, not by memory. 96 keeps
+ * the largest offset at 1536 B, comfortably inside the range, and still lifts the ceiling
+ * from ~5 domains per boot to ~21.
+ *
+ * Each SQLite-class domain consumes ~4 region ids, so region_n reaches 31 by the fifth or
+ * sixth domain and the guarded overflow site in sbi_capstone.c spins in M-mode -- the board
+ * stops with the next domain never entering. That capped every board session at ~5 useful
+ * runs, and it is what the handoff notes recorded as a "~6-run ceiling" with an unknown
+ * exhausted resource. The cost was not just lost runs: it made measuring a RATE expensive,
+ * which is how single-sample wedges kept getting written up as findings.
+ *
+ * SAFE TO RAISE: this bounds the SOFTWARE tables regions[] and region_cpmp[] only. The
+ * hardware resident set is CPMP_COUNT (16, sbi_capstone.c:182) and regions are loaded into
+ * cpmp LAZILY, so a bigger table does not ask for more hardware slots. Cost is ~3 KB of
+ * monitor .bss.
+ *
+ * Why it hid for so long: light ladder rungs consume ~1 region id each and never came near
+ * the old limit -- ten consecutive rungs pass in one boot -- so the ceiling only appears
+ * with region-heavy domains, which made it look like it did not exist at all. */
+#define CAPSTONE_MAX_REGION_N   96
 
 #define CAPSTONE_ERR_STARTER        0xdeadbeef
 #define CAPSTONE_UNKNOWN_EXCP       0x0
