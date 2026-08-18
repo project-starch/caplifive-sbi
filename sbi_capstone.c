@@ -46,8 +46,11 @@
 #define CAPSTONE_TAG_MCAU 0x4d434155 /* "MCAU" mcause */
 #define CAPSTONE_TAG_MEPC 0x4d455043 /* "MEPC" mepc */
 #define CAPSTONE_TAG_MTVL 0x4d54564c /* "MTVL" mtval */
+#define CAPSTONE_TAG_MSTA 0x4d535441 /* "MSTA" mstatus -- MPP in bits [12:11] */
 #define CAPSTONE_TAG_BASE 0x42415345 /* "BASE" requested base address */
 #define CAPSTONE_TAG_ALEN 0x414c454e /* "ALEN" requested length */
+#define CAPSTONE_TAG_DBAS 0x44424153 /* "DBAS" create_domain: the domain's LOAD BASE */
+#define CAPSTONE_TAG_DENT 0x44454e54 /* "DENT" create_domain: entry_offset within that base */
 /* Error codes for sites that previously had none (they spun with no code at all).
    0x1/0x2 (CAPSTONE_NO_REGION / CAPSTONE_NO_CPMP_REGION) keep their existing values so
    the RTL trace does not change. */
@@ -741,6 +744,23 @@ static unsigned create_domain(unsigned base_addr, unsigned code_size,
     __linear void *mem_r;
     __linear void **dom_seal;
 
+    /* DBAS/DENT: the domain's LOAD BASE and entry offset.
+     *
+     * Without these a wedge's latched mepc is UNINTERPRETABLE. On 2026-08-12 the new
+     * debug mux finally produced one -- trap mepc = 0x828897FC -- and it could not be
+     * mapped to an instruction, because nothing in the entire boot transcript reveals
+     * where the domain was loaded. The only addresses printed are the shared regions,
+     * which are nowhere near it. An address without its base names nothing.
+     *
+     * With these two, mepc - base_addr is a file offset into the .dom and the faulting
+     * instruction can be disassembled directly -- which is what discriminates the two
+     * readings of mcause 25 (R-24): UNEXPECTED_OPERAND from the execute path, or
+     * INVALID_CAPABILITY on the PC capability from commit_stage.
+     *
+     * Emitted BEFORE split_out_cap, so they appear even if the carve itself fails. */
+    capstone_trace(CAPSTONE_TAG_DBAS, base_addr);
+    capstone_trace(CAPSTONE_TAG_DENT, entry_offset);
+
     dom_code = split_out_cap(base_addr, tot_size, 1);
 
     dom_seal = __split(dom_code, base_addr + split_size);
@@ -1427,6 +1447,7 @@ unsigned handle_exception(unsigned cause) {
     unsigned badaddr;
     unsigned time_val;
     unsigned dbg_epc;
+    unsigned dbg_mstatus;
     switch(cause) {
         case CAUSE_ILLEGAL_INSTRUCTION:
             // __asm__ ("1: j 1b");
@@ -1471,6 +1492,15 @@ unsigned handle_exception(unsigned cause) {
             capstone_report(CAPSTONE_TAG_MEPC, dbg_epc);
             C_READ_CSR(mtval, badaddr);
             capstone_report(CAPSTONE_TAG_MTVL, badaddr);
+            /* MSTA: mstatus, for MPP -- bits [12:11]. Without it MEPC cannot be interpreted.
+               On 2026-08-15 four boots latched an unhandled trap and MEPC was symbolised against
+               the firmware, twice, before the RTL showed the cause code was only reachable BELOW
+               M-mode (translation is gated on priv_lvl != M), i.e. the address was a virtual one
+               and named nothing in the monitor. MPP is one CSR read and decides that outright:
+                 MPP=3 -> the address IS a firmware address, symbolise it;
+                 MPP<3 -> it is a guest virtual address, do NOT. */
+            C_READ_CSR(mstatus, dbg_mstatus);
+            capstone_report(CAPSTONE_TAG_MSTA, dbg_mstatus);
             capstone_uart_flush();
             /* kept: mcause in a5, mepc in a6 for a debugger halt. */
             __asm__ ("csrr a5, mcause");
