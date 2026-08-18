@@ -82,6 +82,13 @@
 #define CAPSTONE_NO_REGION          0x1
 #define CAPSTONE_NO_CPMP_REGION     0x2
 
+/* Retval delivered to the caller when the monitor terminates a domain that hit
+ * an unrecoverable capability/access fault (e.g. use-after-revoke, out-of-bounds,
+ * or an access to no shared region). Step B of the in-domain fault-delivery work:
+ * the monitor returns cleanly to the caller instead of spinning in
+ * capstone_error(). See design/domain-fault-delivery-proposal.md. */
+#define CAPSTONE_DOMAIN_FAULT_RETVAL 0x0FA017EDu
+
 /* Capstone debugging counters */
 #define DEBUG_COUNTER_SWITCH_U  0
 #define DEBUG_COUNTER_SWITCH_S  1
@@ -107,6 +114,7 @@
 #define SBI_EXT_CAPSTONE_REGION_REVOKE    0xa
 #define SBI_EXT_CAPSTONE_REGION_DE_LINEAR    0xb
 #define SBI_EXT_CAPSTONE_REGION_POP   0xc
+#define SBI_EXT_CAPSTONE_REGION_SHARE_CHILD   0xd
 
 #define CAPSTONE_REGION_FIELD_BASE    0x0
 #define CAPSTONE_REGION_FIELD_END     0x1

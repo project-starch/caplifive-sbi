@@ -165,6 +165,10 @@
 #endif
 #define capstone_error_tag(tag, err_code) do { C_PRINT(CAPSTONE_ERR_STARTER); C_PRINT(err_code); capstone_report((tag), (err_code)); while(1); } while(0)
 #define capstone_error(err_code) capstone_error_tag(CAPSTONE_TAG_CERR, (err_code))
+/* csinit rd, rs1, rs2: UNINIT(cursor==end) -> LIN with cursor = base + rs2.
+ * No __init builtin exists, so emit the instruction directly (funct7 0x9),
+ * same style as C_PRINT/C_GEN_CAP. */
+#define C_INIT(dest, cap, offset) __asm__(".insn r 0x5b, 0x1, 0x9, %0, %1, %2" : "=r"(dest) : "r"(cap), "r"(offset))
 #define cap_base(cap) __capfield((cap), 3)
 #define cap_end(cap) __capfield((cap), 4)
 #define cap_type(cap) __capfield((cap), 1)
@@ -1037,6 +1041,14 @@ static unsigned shared_region_annotated(unsigned dom_id, unsigned region_id, uns
     }
     else if (annotation_rev == CAPSTONE_ANNOTATION_REV_BORROWED) {
         // capability type: linear; post-return revoke: yes
+        /* Re-share after a prior revoke: revoking the linear borrow left the
+         * retained handle UNINIT (with cursor==end, per helper_csrevoke). mrev
+         * requires a LIN input, so re-initialise first: csinit(offset 0) ->
+         * LIN, cursor=base. On the first share r is already LIN, so skip. This
+         * is the explicit owner reclaim step for a linear borrow. */
+        if (cap_type(r) == 3 /* CAP_TYPE_UNINIT */) {
+            C_INIT(r, r, 0);
+        }
         __rev void *rev = __mrev(r);
 
         if (region_cpmp[region_id] != -1) {
@@ -1130,6 +1142,108 @@ static unsigned shared_region_annotated(unsigned dom_id, unsigned region_id, uns
     return 0;
 }
 
+/* Share a child sub-region [offset, offset+len) split-derived from parent_id so a
+ * later revoke_region(parent_id) cascades to it (the paper's H primitive:
+ * sqlite3_close revokes the connection and every statement/value pointer beneath
+ * it). The parent's senior revocation handle is minted with __mrev and retained
+ * under parent_id; the child (and the split-off head/tail fragments) are junior in
+ * the parent's rev lineage, so __revoke(parent_rev) invalidates them. Unlike two
+ * independent create_region()s (independent rev roots -- no cascade), the child
+ * here is __split out of the parent's own cap. */
+static unsigned share_child_region(unsigned dom_id, unsigned parent_id,
+                                   unsigned offset, unsigned len, unsigned perm) {
+    if(dom_id >= dom_n || parent_id >= region_n) {
+        return -1;
+    }
+
+    __dom void *d = domains[dom_id];
+
+    __linear void *r;
+    if (region_cpmp[parent_id] != -1) {
+        r = read_cpmp(region_cpmp[parent_id]);
+    }
+    else {
+        r = regions[parent_id];
+    }
+
+    /* A prior revoke may have left the retained parent handle UNINIT; re-init so
+     * __mrev sees a LIN input (same reclaim step as REV_BORROWED). */
+    if (cap_type(r) == 3 /* CAP_TYPE_UNINIT */) {
+        C_INIT(r, r, 0);
+    }
+
+    unsigned pbase = cap_base(r);
+    unsigned pend = cap_end(r);
+    unsigned cstart = pbase + offset;
+    unsigned cend = cstart + len;
+    if (len == 0 || offset > pend - pbase || cend > pend) {
+        return -1;
+    }
+
+    /* 1. Mint the senior revocation handle and retain it under parent_id, so
+     *    revoke_region(parent_id) -> __revoke(rev) invalidates the junior run. */
+    __rev void *rev = __mrev(r); /* rev: senior (depth d); r: junior (depth d+1) */
+
+    /* 2. Carve the child [cstart, cend) out of the now-junior parent cap. The
+     *    split products stay junior to rev, so a parent revoke cascades to them.
+     *    Retain the head/tail fragments in regions[] the same way split_out_cap
+     *    does (do not drop linear caps); the child is shared last so the
+     *    borrower's REGION_COUNT-1 query resolves to it. */
+    __linear void *head = 0;
+    __linear void *body;
+    if (offset != 0) {
+        body = __split(r, cstart); /* r -> [pbase,cstart); body -> [cstart,pend) */
+        head = r;
+    }
+    else {
+        body = r;
+    }
+
+    __linear void *tail = 0;
+    if (cend != pend) {
+        tail = __split(body, cend); /* body -> [cstart,cend); tail -> [cend,pend) */
+    }
+
+    if (region_cpmp[parent_id] != -1) {
+        write_cpmp(region_cpmp[parent_id], rev);
+    }
+    else {
+        regions[parent_id] = rev;
+    }
+
+    if (head) {
+        regions[region_n] = head;
+        region_n += 1;
+    }
+    if (tail) {
+        regions[region_n] = tail;
+        region_n += 1;
+    }
+
+    /* 3. Tighten permission and share the child (linear borrow). */
+    __linear void *child = body;
+    if (perm == CAPSTONE_ANNOTATION_PERM_IN) {
+        child = __tighten(child, 4);
+    }
+    else if (perm == CAPSTONE_ANNOTATION_PERM_INOUT) {
+        child = __tighten(child, 6);
+    }
+    else if (perm == CAPSTONE_ANNOTATION_PERM_OUT) {
+        child = __tighten(child, 2);
+    }
+    else if (perm == CAPSTONE_ANNOTATION_PERM_FULL) {
+        child = __tighten(child, 7);
+    }
+    else {
+        return -1;
+    }
+
+    d = __domcallsaves(d, CAPSTONE_DPI_REGION_SHARE, child);
+    domains[dom_id] = d;
+
+    return 0;
+}
+
 // This function has been deprecated, use shared_region_annotated instead
 static unsigned share_region(unsigned dom_id, unsigned region_id) {
     if(dom_id >= dom_n || region_id >= region_n) {
@@ -1212,6 +1326,20 @@ static void return_from_domain(unsigned retval) {
 
     *caller_buf = retval;
     __domreturnsaves(caller_dom, DOM_REENTRY_POINT, 0);
+}
+
+/* Step B: terminate the currently-running domain because it hit an
+ * unrecoverable capability/access fault, and return control cleanly to the
+ * caller (the lender/host) with a fault sentinel -- rather than spinning in
+ * capstone_error(). This reuses the exact domain-return path a normal
+ * DOM_RETURN ecall takes (return_from_domain -> __domreturnsaves), which is
+ * already invoked from inside _cap_trap_entry, so it composes with the trap
+ * context. The cause is emitted for the log but the caller only needs to see
+ * that the call faulted (CAPSTONE_DOMAIN_FAULT_RETVAL). Does not return. */
+static void fault_return_from_domain(unsigned cause) {
+    C_PRINT(CAPSTONE_ERR_STARTER);
+    C_PRINT(cause);
+    return_from_domain(CAPSTONE_DOMAIN_FAULT_RETVAL);
 }
 
 static unsigned query_region(unsigned region_id, unsigned field) {
@@ -1368,6 +1496,9 @@ unsigned handle_trap_ecall(unsigned arg0, unsigned arg1,
                 case SBI_EXT_CAPSTONE_REGION_POP:
                     res = pop_region(arg0);
                     break;
+                case SBI_EXT_CAPSTONE_REGION_SHARE_CHILD:
+                    res = share_child_region(arg0, arg1, arg2, arg3, arg4);
+                    break;
                 default:
                     err = 1;
             }
@@ -1409,15 +1540,23 @@ static void swap_cpmp(unsigned badaddr) {
             break;
     }
     if(region_id >= region_n) {
-        //C_PRINT(badaddr);
-        //C_PRINT(region_n);
+        /* MERGE 2026-08-18: both sides kept, because they are orthogonal.
+         *
+         * The UART reporting below is the diagnostic half -- without it a monitor-detected
+         * failure on the FPGA is indistinguishable from a domain hang, which cost several
+         * board sessions. The fault_return_from_domain call is the control-flow half: no
+         * region covers badaddr, so this is an unrecoverable domain fault (a use-after-revoke
+         * store whose region was revoked, or an out-of-bounds access) and the domain is
+         * terminated with the fault returned to the caller rather than spinning in M-mode.
+         *
+         * Reporting FIRST, because fault_return_from_domain does not return. */
         print_regions();
         print_cpmps();
-        /* I-4 site CPMX. The code stays CAPSTONE_NO_CPMP_REGION so the RTL trace
-           is unchanged; only the UART line is new. badaddr is the faulting
-           address no region covers -- previously only available via C_PRINT. */
         capstone_report(CAPSTONE_TAG_MTVL, badaddr);
-        capstone_error_tag(CAPSTONE_TAG_CPMX, CAPSTONE_NO_CPMP_REGION);
+        capstone_report(CAPSTONE_TAG_CPMX, CAPSTONE_NO_CPMP_REGION);
+        capstone_uart_flush();
+        fault_return_from_domain(CAPSTONE_NO_CPMP_REGION);
+        return; /* not reached: fault_return_from_domain switches domains */
     }
 
     // check if there is free cpmp entry
@@ -1502,10 +1641,25 @@ unsigned handle_exception(unsigned cause) {
             C_READ_CSR(mstatus, dbg_mstatus);
             capstone_report(CAPSTONE_TAG_MSTA, dbg_mstatus);
             capstone_uart_flush();
-            /* kept: mcause in a5, mepc in a6 for a debugger halt. */
-            __asm__ ("csrr a5, mcause");
-            __asm__ ("csrr a6, mepc");
-            __asm__ ("1: j 1b");
+            /* MERGE 2026-08-18: report first, then terminate rather than spin.
+             *
+             * The reporting above (EXCX/MCAU/MEPC/MTVL/MSTA) is what makes a latched trap
+             * interpretable at all, and it must run BEFORE the domain is torn down.
+             *
+             * The spin it used to end in -- `csrr a5,mcause; csrr a6,mepc; 1: j 1b` -- is
+             * replaced by fault_return_from_domain, which terminates the faulting domain and
+             * returns the cause to the caller. A non-access-fault synchronous cause from a
+             * domain (RISCV_EXCP_INVALID_CAP from a use-after-revoke, a bounds or tag
+             * violation) is unrecoverable, and returning it beats hanging the board.
+             *
+             * CONSEQUENCE FOR S-07, and it is not small: on the next monitor rebuild an S-07
+             * capability fault stops presenting as "the domain entered and never returned"
+             * and starts presenting as a returned fault code. That is strictly better for
+             * diagnosis, but it changes the observable every S-07 result to date was
+             * classified on, so the wedge-rate baseline must be re-established and
+             * tests/rtl-smoke/s07-rate.py's S07-WEDGE class re-checked against the new shape
+             * before old and new numbers are compared. */
+            fault_return_from_domain(cause);
             time_val = -1;
     }
     return time_val;
