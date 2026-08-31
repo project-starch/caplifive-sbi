@@ -913,40 +913,26 @@ static unsigned create_domain(unsigned base_addr, unsigned code_size,
      * exactly as the real S-12 fault does.
      *
      * `lla` rather than a C declaration: _cap_trap_entry is an assembly label with no prototype,
-     * and this is how sbi_capstone_dom.c:30 already reaches it. The integer assignment matches
-     * the established idiom on the line below for mstatus.
+     * and this is how sbi_capstone_dom.c:30 already reaches it. The temporary is declared at
+     * function scope beside `int i` because capstone-c panics (dag_builder.rs:1258,
+     * `assertion failed: self.decl_type.is_none()`) on a declaration inside a nested block.
      *
-     * EXPECTED TO BE INSUFFICIENT, and it is still worth running, because the two outcomes
-     * discriminate. frontend.sv:425-427 redirects the PC on an exception while :443-444 leaves
-     * npc_metadata_q untouched, capmode_q is sticky (csr_regfile.sv:295), and
-     * commit_stage.sv:222-223 raises cause 28 when the PC leaves the PC-capability's bounds. So
-     * vectoring to _cap_trap_entry (~0x8002xxxx) while still holding the DOMAIN's PC capability
-     * (bounded ~0x828xxxxx) should trade a cause-2 storm for a cause-28 one:
+     * EXPECTED TO BE INSUFFICIENT, and still worth running, because the outcomes discriminate.
+     * frontend.sv:425-427 redirects the PC on an exception while :443-444 leaves npc_metadata_q
+     * untouched, capmode_q is sticky (csr_regfile.sv:295), and commit_stage.sv:222-223 raises
+     * cause 28 when the PC leaves the PC-capability's bounds. So vectoring to _cap_trap_entry
+     * (~0x8002xxxx) while still holding the DOMAIN's PC capability (bounded ~0x828xxxxx) should
+     * trade a cause-2 storm for a cause-28 one:
      *
      *   mcause 28 at the next wedge -> the vector TOOK. The firmware half is right and the
      *                                  missing half is in RTL: slot 1 is meant to hold a trap
      *                                  vector CAPABILITY (cursor->mtvec, metadata->ctvec) and
-     *                                  the core never installs ctvec as the PC capability on a
-     *                                  trap.
-     *   mcause 2 still               -> the vector did NOT take and this diagnosis is wrong.
-     *   EXCX on the UART + a returned CAPSTONE_DOMAIN_FAULT_RETVAL
+     *                                  the core never installs ctvec as the PC capability.
+     *   mcause 2 still               -> the vector did NOT take; this diagnosis is wrong.
+     *   EXCX + a returned CAPSTONE_DOMAIN_FAULT_RETVAL
      *                                -> the prediction was too pessimistic and this alone fixes
-     *                                   it, which would make every capability fault reportable
-     *                                   and recoverable instead of fatal.
-     */
-     * DOES NOT COMPILE YET -- do not enable expecting it to build. capstone-c is a restricted
-     * compiler and rejects this in two separate ways: it panics (dag_builder.rs:1258,
-     * `assertion failed: self.decl_type.is_none()`) on a declaration inside a nested block, so
-     * the temporary is declared at function scope beside `int i`; and it then fails to parse the
-     * assignment below. The surviving suspicion is LINEARITY -- dom_seal is `__linear void **`,
-     * and the neighbouring `dom_seal[3] = (3 << 38) | (2 << 34)` that does work assigns a
-     * constant EXPRESSION, whereas this assigns a variable into a linear slot. Writing the slot
-     * from inline assembly through dom_seal is the untried alternative.
-     *
-     * Kept, guarded and OFF, because the diagnosis it tests is recorded and the exact shape of
-     * the intended write is worth not re-deriving. The default path is proven inert: with the
-     * knob off the regenerated assembly contains exactly one `_cap_trap_entry` reference, the
-     * pre-existing ccsrrw in _cap_env_init, and the firmware builds.
+     *                                   it, making every capability fault reportable instead of
+     *                                   fatal.
      */
     __asm__ ("lla %0, _cap_trap_entry" : "=r"(dom_trap_vec));
     dom_seal[1] = dom_trap_vec;
