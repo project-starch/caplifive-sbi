@@ -207,6 +207,21 @@ static void print_cpmps(void) {
     }
 }
 
+// Q-03: exact-fit tail-slot drop (ported from the board firmware's CAPSTONE_SPLIT_EXACT_FIT).
+// Clears the CPMP mapping first so the register is not leaked and the next region at this
+// index does not inherit a stale region_cpmp[i]; returns the new region_n.
+// Shape matters to Capstone-C: written in-line inside split_out_cap this did not parse under
+// EITHER build pipeline, and as a `static void` helper it parsed under one but not the other.
+// A non-static, value-returning helper whose result is assigned parses under both
+// (bisected 2026-09-05; which of the three differences is load-bearing was not isolated).
+unsigned drop_exact_fit_tail(unsigned i) {
+    if(region_cpmp[i] != -1) {
+        cpmp_region[region_cpmp[i]] = -1;
+        region_cpmp[i] = -1;
+    }
+    return region_n - 1;
+}
+
 static void *split_out_cap(unsigned base, unsigned len, unsigned linear) {
     __linear void *region;
 
@@ -243,9 +258,17 @@ static void *split_out_cap(unsigned base, unsigned len, unsigned linear) {
 
     if (base + len == region_end) {
         if(base == region_base) {
-            // matching region. We don't support this for now
-            C_PRINT(0x1234);
-            while(1);
+            // EXACT FIT: the whole region is consumed, slot i leaves the pool. This used to
+            // C_PRINT(0x1234) and spin -- Q-03, the position-dependent wedge that hit any image.
+            // Tail slot only, as in the firmware; a middle slot reports a DISTINCT code and stops.
+            if(i + 1 == region_n) {
+                region_n = drop_exact_fit_tail(i);
+            } else {
+                C_PRINT(0x1235);
+                C_PRINT(i);
+                C_PRINT(region_n);
+                while(1);
+            }
         } else {
             if(region_cpmp[i] != -1)
                 write_cpmp(region_cpmp[i], mem_l);
