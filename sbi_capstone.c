@@ -47,6 +47,11 @@ __dom void *domains[CAPSTONE_MAX_DOM_N];
 void *regions[CAPSTONE_MAX_REGION_N];
 /* the cpmp entry each region is associated with; -1 if unassociated */
 unsigned region_cpmp[CAPSTONE_MAX_REGION_N];
+/* 1 if the slot holds a live region; 0 for a HOLE (consumed by an exact fit, or transferred
+   away) or a never-used slot. Region ids are guest-visible ARRAY INDICES and the kernel module
+   caches page geometry by them (modcapstone/module/capstone.c:33), so the pool must never
+   renumber a slot or shrink below one the module may hold: a dead slot keeps its index. */
+unsigned region_live[CAPSTONE_MAX_REGION_N];
 /* the region each cpmp entry is associated with; -1 if unassociated */
 unsigned cpmp_region[CPMP_COUNT];
 unsigned dom_n, region_n;
@@ -210,16 +215,22 @@ static void print_cpmps(void) {
 // Q-03: exact-fit tail-slot drop (ported from the board firmware's CAPSTONE_SPLIT_EXACT_FIT).
 // Clears the CPMP mapping first so the register is not leaked and the next region at this
 // index does not inherit a stale region_cpmp[i]; returns the new region_n.
-// Shape matters to Capstone-C: written in-line inside split_out_cap this did not parse under
-// EITHER build pipeline, and as a `static void` helper it parsed under one but not the other.
-// A non-static, value-returning helper whose result is assigned parses under both
-// (bisected 2026-09-05; which of the three differences is load-bearing was not isolated).
-unsigned drop_exact_fit_tail(unsigned i) {
+/* Q-03: a slot whose region has left the pool becomes a HOLE. It keeps its index forever
+   (see region_live above); compaction was refuted on exactly that, and the tail is not special
+   -- the earlier tail-only shrink is gone with this. Every hole prints, so the change cannot
+   pass silently: tag 0x1236 = exact fit (0x1239 is reserved for a REV_TRANSFERRED hole, not
+   enabled -- see Q-05 at the REV_TRANSFERRED site). */
+unsigned make_hole(unsigned i, unsigned tag) {
     if(region_cpmp[i] != -1) {
         cpmp_region[region_cpmp[i]] = -1;
         region_cpmp[i] = -1;
     }
-    return region_n - 1;
+    region_live[i] = 0;
+    regions[i] = 0;
+    C_PRINT(tag);
+    C_PRINT(i);
+    C_PRINT(region_n);
+    return 0;
 }
 
 static void *split_out_cap(unsigned base, unsigned len, unsigned linear) {
@@ -234,6 +245,8 @@ static void *split_out_cap(unsigned base, unsigned len, unsigned linear) {
     unsigned region_base, region_end;
 
     for(i = 0; i < region_n; i += 1) {
+        if(region_live[i] == 0)
+            continue;
         if(region_cpmp[i] != -1)
             mem_l = read_cpmp(region_cpmp[i]);
         else
@@ -258,17 +271,18 @@ static void *split_out_cap(unsigned base, unsigned len, unsigned linear) {
 
     if (base + len == region_end) {
         if(base == region_base) {
-            // EXACT FIT: the whole region is consumed, slot i leaves the pool. This used to
-            // C_PRINT(0x1234) and spin -- Q-03, the position-dependent wedge that hit any image.
-            // Tail slot only, as in the firmware; a middle slot reports a DISTINCT code and stops.
-            if(i + 1 == region_n) {
-                region_n = drop_exact_fit_tail(i);
-            } else {
-                C_PRINT(0x1235);
+            // EXACT FIT: the whole region is consumed and slot i becomes a hole, at ANY
+            // position. This used to C_PRINT(0x1234) and spin (Q-03, the position-dependent
+            // wedge), then handled only the tail (0x1235 spin in the middle).
+            // A non-linear exact fit would fall through to the append below and re-home the
+            // same capability at a new index -- the one index MOVE this file must never do.
+            // Unreachable (linear == 0 only for the boot-time carves); loud if it ever is.
+            if(!linear) {
+                C_PRINT(0x1238);
                 C_PRINT(i);
-                C_PRINT(region_n);
                 while(1);
             }
+            make_hole(i, 0x1236);
         } else {
             if(region_cpmp[i] != -1)
                 write_cpmp(region_cpmp[i], mem_l);
@@ -289,7 +303,13 @@ static void *split_out_cap(unsigned base, unsigned len, unsigned linear) {
             else
                 regions[i] = mem_l;
 
+            if(region_n >= CAPSTONE_MAX_REGION_N) {
+                C_PRINT(0x1237);
+                C_PRINT(region_n);
+                while(1);
+            }
             regions[region_n] = mem_r;
+            region_live[region_n] = 1;
             region_n += 1;
             /* we load regions into cpmp lazily*/
         }
@@ -306,7 +326,13 @@ static void *split_out_cap(unsigned base, unsigned len, unsigned linear) {
     }
 
     if(!linear) {
+        if(region_n >= CAPSTONE_MAX_REGION_N) {
+            C_PRINT(0x1237);
+            C_PRINT(region_n);
+            while(1);
+        }
         regions[region_n] = region;
+        region_live[region_n] = 1;
         region_n += 1;
     }
 
@@ -322,6 +348,11 @@ static unsigned create_domain(unsigned base_addr, unsigned code_size,
     __linear void *mem_l, *dom_code, *dom_data, *mem_r;
     __linear void **dom_seal;
 
+    if(region_n + 1 > CAPSTONE_MAX_REGION_N) {
+        C_PRINT(0x1237);
+        C_PRINT(region_n);
+        return -1;
+    }
     dom_code = split_out_cap(base_addr, tot_size, 1);
 
     dom_seal = __split(dom_code, base_addr + code_size);
@@ -393,9 +424,16 @@ static unsigned call_domain_with_cap(unsigned dom_id, unsigned base, unsigned le
 }
 
 static unsigned create_region(unsigned base, unsigned len) {
+    /* needs up to two slots (a right-hand fragment, then the region): refuse BEFORE carving */
+    if(region_n + 2 > CAPSTONE_MAX_REGION_N) {
+        C_PRINT(0x1237);
+        C_PRINT(region_n);
+        return -1;
+    }
     void *region = split_out_cap(base, len, 1);
 
     regions[region_n] = region;
+    region_live[region_n] = 1;
     region_n += 1;
 
     return region_n - 1;
@@ -403,6 +441,11 @@ static unsigned create_region(unsigned base, unsigned len) {
 
 static unsigned shared_region_annotated(unsigned dom_id, unsigned region_id, unsigned annotation_perm, unsigned annotation_rev) {
     if(dom_id >= dom_n || region_id >= region_n) {
+        return -1;
+    }
+    /* separate statement, NOT a third || operand: Capstone-C evaluates every operand of ||
+       (measured 2026-09-05: an out-of-range id faulted M-mode on region_live[id]) */
+    if(region_live[region_id] == 0) {
         return -1;
     }
 
@@ -463,6 +506,12 @@ static unsigned shared_region_annotated(unsigned dom_id, unsigned region_id, uns
     else if (annotation_rev == CAPSTONE_ANNOTATION_REV_TRANSFERRED) {
         // capability type: linear; post-return revoke: no
         // TODO: regions[region_id] should be added to a free list
+        // NOT made a hole (Q-05): on QEMU the slot keeps a tagged duplicate of the transferred
+        // capability (csldc does not null its source there), and the host's later accesses to the
+        // transferred pages are served through it by swap_cpmp. Making the slot a hole is what
+        // the spec implies and what silicon does, but the intra-domain-mrev-revoke probe's host
+        // observer depends on the duplicate; that is a QEMU-fidelity question filed as Q-05, not
+        // part of the Q-03 exact-fit fix. Behaviour here is unchanged from before Q-03.
         if (cap_type(r) != 0) {
             C_PRINT(0xdeadbeef);
             while(1);
@@ -513,6 +562,17 @@ static unsigned shared_region_annotated(unsigned dom_id, unsigned region_id, uns
 static unsigned share_child_region(unsigned dom_id, unsigned parent_id,
                                    unsigned offset, unsigned len, unsigned perm) {
     if(dom_id >= dom_n || parent_id >= region_n) {
+        return -1;
+    }
+    /* separate statement, NOT a third || operand: Capstone-C evaluates every operand of ||
+       (measured 2026-09-05: an out-of-range id faulted M-mode on region_live[id]) */
+    if(region_live[parent_id] == 0) {
+        return -1;
+    }
+    /* needs up to two slots (head, tail): refuse BEFORE touching the parent */
+    if(region_n + 2 > CAPSTONE_MAX_REGION_N) {
+        C_PRINT(0x1237);
+        C_PRINT(region_n);
         return -1;
     }
 
@@ -573,10 +633,12 @@ static unsigned share_child_region(unsigned dom_id, unsigned parent_id,
 
     if (head) {
         regions[region_n] = head;
+        region_live[region_n] = 1;
         region_n += 1;
     }
     if (tail) {
         regions[region_n] = tail;
+        region_live[region_n] = 1;
         region_n += 1;
     }
 
@@ -609,6 +671,11 @@ static unsigned share_region(unsigned dom_id, unsigned region_id) {
     if(dom_id >= dom_n || region_id >= region_n) {
         return -1;
     }
+    /* separate statement, NOT a third || operand: Capstone-C evaluates every operand of ||
+       (measured 2026-09-05: an out-of-range id faulted M-mode on region_live[id]) */
+    if(region_live[region_id] == 0) {
+        return -1;
+    }
 
     __dom void *d = domains[dom_id];
 
@@ -626,6 +693,11 @@ static unsigned share_region(unsigned dom_id, unsigned region_id) {
 
 static unsigned revoke_region(unsigned region_id) {
     if(region_id >= region_n) {
+        return -1;
+    }
+    /* separate statement, NOT a third || operand: Capstone-C evaluates every operand of ||
+       (measured 2026-09-05: an out-of-range id faulted M-mode on region_live[id]) */
+    if(region_live[region_id] == 0) {
         return -1;
     }
 
@@ -656,6 +728,7 @@ static unsigned pop_region(unsigned pop_num) {
         }
 
         region_cpmp[region_i] = -1;
+        region_live[region_i] = 0;
     }
 
     region_n -= pop_num;
@@ -665,6 +738,11 @@ static unsigned pop_region(unsigned pop_num) {
 
 static unsigned region_de_linear(unsigned region_id) {
     if(region_id >= region_n) {
+        return -1;
+    }
+    /* separate statement, NOT a third || operand: Capstone-C evaluates every operand of ||
+       (measured 2026-09-05: an out-of-range id faulted M-mode on region_live[id]) */
+    if(region_live[region_id] == 0) {
         return -1;
     }
 
@@ -704,6 +782,11 @@ static void fault_return_from_domain(unsigned cause) {
 
 static unsigned query_region(unsigned region_id, unsigned field) {
     if(region_id >= region_n) {
+        return -1;
+    }
+    /* separate statement, NOT a third || operand: Capstone-C evaluates every operand of ||
+       (measured 2026-09-05: an out-of-range id faulted M-mode on region_live[id]) */
+    if(region_live[region_id] == 0) {
         return -1;
     }
 
@@ -861,6 +944,8 @@ static void swap_cpmp(unsigned badaddr) {
     unsigned ejected_region_id;
     __linear void *tmp;
     for(region_id = 0; region_id < region_n; region_id += 1) {
+        if(region_live[region_id] == 0) // a hole holds no capability
+            continue;
         if(region_cpmp[region_id] != -1) // already loaded
             continue;
         start_addr = cap_base(regions[region_id]);
@@ -936,7 +1021,13 @@ static void dpi_call(void *arg) {
 }
 
 static void dpi_share_region(void *region) {
+    if(region_n >= CAPSTONE_MAX_REGION_N) {
+        C_PRINT(0x1237);
+        C_PRINT(region_n);
+        while(1);
+    }
     regions[region_n] = region;
+    region_live[region_n] = 1;
     region_n += 1;
 }
 
