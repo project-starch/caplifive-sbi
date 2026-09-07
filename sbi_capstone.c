@@ -42,6 +42,7 @@
 #define CAPSTONE_TAG_CPMX 0x43504d58 /* "CPMX" swap_cpmp: no region covers the fault addr */
 #define CAPSTONE_TAG_SPLA 0x53504c41 /* "SPLA" split_out_cap: no region covers the request */
 #define CAPSTONE_TAG_SPLB 0x53504c42 /* "SPLB" split_out_cap: exact-fit region unsupported */
+#define CAPSTONE_TAG_HOLE 0x484f4c45 /* "HOLE" split_out_cap: exact-fit slot retired in place (Q-03); value = slot index, RGNN follows */
 /* context lines, printed after a site tag */
 #define CAPSTONE_TAG_MCAU 0x4d434155 /* "MCAU" mcause */
 #define CAPSTONE_TAG_MEPC 0x4d455043 /* "MEPC" mepc */
@@ -58,29 +59,27 @@
 #define CAPSTONE_ERR_EXC_UNHANDLED   0xe002
 #define CAPSTONE_ERR_ILLEGAL_INSN    0xe003
 #define CAPSTONE_ERR_SPLIT_NO_REGION 0xe005
-#define CAPSTONE_ERR_SPLIT_EXACT     0xe006
-#define CAPSTONE_ERR_SPLIT_EXACT_MID 0xe010 /* exact fit, but NOT the tail slot.
-     Was 0xe007, which COLLIDES with CAPSTONE_ERR_SHARE_BAD_ID -- distinguishable
-     only by the accompanying tag, which is exactly the kind of ambiguity that
-     costs a session when a log is read quickly. */
+#define CAPSTONE_ERR_SPLIT_EXACT     0xe006 /* RETIRED 2026-09-07 (Q-03): no emitter. Kept so logs
+     from before the hole fix stay decodable: SPLB:0000E006 = the unimplemented exact-fit spin. */
+#define CAPSTONE_ERR_SPLIT_EXACT_MID 0xe010 /* RETIRED 2026-09-07 (Q-03): no emitter. Was the
+     middle-slot exact-fit spin of the tail-only handling (0xe007 before that, colliding with
+     CAPSTONE_ERR_SHARE_BAD_ID). */
+#define CAPSTONE_ERR_SPLIT_EXACT_NONLIN 0xe011 /* exact fit on a NON-linear carve: would re-home the
+     capability at a new index, the one index move the pool must never do. Unreachable: linear == 0
+     only for the FOUR boot-time carves in cap_env_init, and none of those is an exact fit (the
+     int-handler text is a head carve of genesis region 1, the other three sit inside region 0).
+     Loud if it ever happens. */
 
-/* ENABLED 2026-08-01 after the exact-fit spin was shown to be the BACKGROUND WEDGE.
-   Measured: running the trivial control domain repeatedly in one boot wedges at run 6-7 in
-   4 of 4 boots, and every one of those boots ends with `SPLB:0000E006` at `SQ: B/mkregion1`,
-   i.e. in split_out_cap's unimplemented exact-fit case -- not in the domain under test. That
-   spin is what limited every board session to ~5 useful domains and produced a large share of
-   this campaign's "random" wedges. See split_out_cap() for what the handling does and why only
-   the tail case is handled. */
-/* RE-ENABLED 2026-08-06. The 2026-08-02 A/B disabled this to test whether the fix caused the
-   share1/SHA5 wedge, and it was never turned back on -- so every board session since has been
-   paying the background wedge it was written to fix. Measured again today, twice in
-   consecutive boots: the 5th create_dom of a boot spins at SPLB:0000E006 with no
-   `SQ: A/dom-ok`, i.e. the domain is never created and whatever probe occupied that slot is
-   blamed for a monitor fault. That manufactured a confident, entirely false localization of a
-   SQLite function that never executed.
-   The A/B's own question stays open -- if the share1/SHA5 wedge returns with this on, that is
-   the answer to it and it can be flipped back with one line. */
-#define CAPSTONE_SPLIT_EXACT_FIT 1
+/* Q-03 history. The exact-fit case of split_out_cap() was an unimplemented spin (SPLB:0000E006)
+   and it was the BACKGROUND WEDGE of the 2026-08 board campaigns: the trivial control domain
+   wedged at run 6-7 in 4 of 4 boots (2026-08-01), and the 5th create_dom of a boot spun twice in
+   consecutive boots (2026-08-06) -- each time blaming whatever domain occupied that slot, once
+   producing a confident, entirely false localization of a SQLite function that never executed.
+   The first fix (2026-08-01, re-enabled 2026-08-06 after an A/B left it off) handled only the
+   TAIL slot by shrinking the pool, which renumbers nothing but still spun at any other slot
+   (SPLB:0000E010). Since 2026-09-07 an exact fit at ANY slot leaves a hole (make_hole below):
+   region ids are guest-visible array indices the kernel module caches, so a slot is never
+   renumbered or reused. There is no build knob; the handling is unconditional. */
 /* ---- I-4, REGION-SHARE path -------------------------------------------------
    SQLite hangs inside its FIRST shared_region_annotated() call with NO monitor
    tag at all -- not ILLX, not SPLA, not SPLB -- so the wedge is at a site that
@@ -202,6 +201,11 @@ __dom void *domains[CAPSTONE_MAX_DOM_N];
 void *regions[CAPSTONE_MAX_REGION_N];
 /* the cpmp entry each region is associated with; -1 if unassociated */
 unsigned region_cpmp[CAPSTONE_MAX_REGION_N];
+/* 1 if the slot holds a live region; 0 for a HOLE (consumed by an exact fit) or a never-used
+   slot. Region ids are guest-visible ARRAY INDICES and the kernel module caches page geometry
+   by them (modcapstone/module/capstone.c:33), so the pool must never renumber a slot or
+   shrink below one the module may hold: a consumed slot keeps its index. (Q-03, 2026-09-07) */
+unsigned region_live[CAPSTONE_MAX_REGION_N];
 /* the region each cpmp entry is associated with; -1 if unassociated */
 unsigned cpmp_region[CPMP_COUNT];
 unsigned dom_n, region_n;
@@ -463,6 +467,8 @@ static void print_regions(void) {
     int region_id;
     void *tmp;
     for(region_id = 0; region_id < region_n; region_id += 1) {
+        if(region_live[region_id] == 0)
+            continue;
         if(region_cpmp[region_id] != -1) {
             tmp = read_cpmp(region_cpmp[region_id]);
             write_cpmp(region_cpmp[region_id], tmp);
@@ -484,6 +490,23 @@ static void print_cpmps(void) {
     }
 }
 
+/* Q-03: a slot whose region has been consumed by an exact fit becomes a HOLE. It keeps its
+   index forever (see region_live above); compacting was refuted by audit on exactly that,
+   and the tail is not special -- the tail-only shrink of 2026-08-01 is gone with this. Every
+   hole prints (HOLE i, RGNN region_n) so the change cannot pass silently. Ported from the
+   QEMU stand-in monitor, where the design was audited and validated 2026-09-05. */
+unsigned make_hole(unsigned i) {
+    if(region_cpmp[i] != -1) {
+        cpmp_region[region_cpmp[i]] = -1;
+        region_cpmp[i] = -1;
+    }
+    region_live[i] = 0;
+    regions[i] = 0;
+    capstone_report(CAPSTONE_TAG_HOLE, i);
+    capstone_report(CAPSTONE_TAG_RGNN, region_n);
+    return 0;
+}
+
 static void *split_out_cap(unsigned base, unsigned len, unsigned linear) {
     __linear void *region;
 
@@ -496,6 +519,8 @@ static void *split_out_cap(unsigned base, unsigned len, unsigned linear) {
     unsigned region_base, region_end;
 
     for(i = 0; i < region_n; i += 1) {
+        if(region_live[i] == 0)
+            continue;
         if(region_cpmp[i] != -1)
             mem_l = read_cpmp(region_cpmp[i]);
         else
@@ -528,55 +553,16 @@ static void *split_out_cap(unsigned base, unsigned len, unsigned linear) {
 
     if (base + len == region_end) {
         if(base == region_base) {
-            /* EXACT FIT: the request consumes the WHOLE region, so there is no leftover to
-               store back and slot i simply leaves the pool. This used to be an unimplemented
-               case that spun forever (site SPLB), hanging the board whenever the host
-               allocator happened to hand back an exactly-matching region -- a layout
-               coincidence, not a capability error. That hang was misattributed to silicon
-               during the 2026-08-01 investigation and corrupted a measurement.
-
-               `region` is already `mem_l` (assigned just above), i.e. the whole region, and
-               the search loop broke WITHOUT writing slot i back, so the slot is already
-               logically empty. All that remains is to shrink the pool.
-
-               ONLY THE TAIL CASE IS HANDLED, deliberately. When i is the last slot, dropping
-               it is just `region_n -= 1` and cannot disturb any other slot or any hardware
-               CPMP register. Moving a different slot into i would mean migrating a LINEAR
-               capability between a CPMP register and the array, and those move semantics are
-               not verified here -- so that case still reports and stops rather than guessing,
-               with a distinct code so the log tells the two apart. */
-#ifdef CAPSTONE_SPLIT_EXACT_FIT
-            if(i + 1 == region_n) {
-                /* Clear the CPMP mapping before dropping the slot. Without this the register
-                   is leaked forever (cpmp_region[c] stays != -1 so the free-slot scan never
-                   reclaims it) and the NEXT region appended at this index inherits a stale
-                   region_cpmp[i], so every access to it reads a register that read_cpmp has
-                   already emptied. Silent, with a delayed symptom. pop_region does it right. */
-                if(region_cpmp[i] != -1) {
-                    cpmp_region[region_cpmp[i]] = -1;
-                    region_cpmp[i] = -1;
-                }
-                region_n -= 1;
-            } else {
-                capstone_report(CAPSTONE_TAG_SPLB, CAPSTONE_ERR_SPLIT_EXACT_MID);
+            /* EXACT FIT (Q-03): the whole region is consumed and slot i becomes a hole, at ANY
+               position. The tail-only shrink and the middle-slot spin (SPLB/EXACT_MID) are gone. */
+            if(!linear) {
+                capstone_report(CAPSTONE_TAG_SPLB, CAPSTONE_ERR_SPLIT_EXACT_NONLIN);
                 capstone_report(CAPSTONE_TAG_RGID, i);
                 capstone_report(CAPSTONE_TAG_RGNN, region_n);
-                capstone_report(CAPSTONE_TAG_BASE, base);
-                capstone_report(CAPSTONE_TAG_ALEN, len);
                 capstone_uart_flush();
                 while(1);
             }
-#else
-            // matching region. We don't support this for now
-            /* I-4 site SPLB */
-            capstone_report(CAPSTONE_TAG_SPLB, CAPSTONE_ERR_SPLIT_EXACT);
-            capstone_report(CAPSTONE_TAG_RGID, i);
-            capstone_report(CAPSTONE_TAG_RGNN, region_n);
-            capstone_report(CAPSTONE_TAG_BASE, base);
-            capstone_report(CAPSTONE_TAG_ALEN, len);
-            capstone_uart_flush();
-            while(1);
-#endif
+            make_hole(i);
         } else {
             if(region_cpmp[i] != -1)
                 write_cpmp(region_cpmp[i], mem_l);
@@ -610,6 +596,7 @@ static void *split_out_cap(unsigned base, unsigned len, unsigned linear) {
                 while(1);
             }
             regions[region_n] = mem_r;
+            region_live[region_n] = 1;
             region_n += 1;
             /* we load regions into cpmp lazily*/
         }
@@ -639,6 +626,7 @@ static void *split_out_cap(unsigned base, unsigned len, unsigned linear) {
             while(1);
         }
         regions[region_n] = region;
+        region_live[region_n] = 1;
         region_n += 1;
     }
 
@@ -1009,6 +997,7 @@ static unsigned create_region(unsigned base, unsigned len) {
         while(1);
     }
     regions[region_n] = region;
+    region_live[region_n] = 1;
     region_n += 1;
 
     return region_n - 1;
@@ -1046,6 +1035,11 @@ static unsigned shared_region_annotated(unsigned dom_id, unsigned region_id, uns
         capstone_report(CAPSTONE_TAG_DOMN, dom_n);
         capstone_report(CAPSTONE_TAG_RGNN, region_n);
         capstone_uart_flush();
+        return -1;
+    }
+    /* separate statement, NOT a third || operand: Capstone-C evaluates every operand of ||
+       (an out-of-range id would index region_live[] and fault M-mode) */
+    if(region_live[region_id] == 0) {
         return -1;
     }
     /* I-4 progress SHA1: ids accepted. The value is region_cpmp[region_id], which
@@ -1196,6 +1190,11 @@ static unsigned share_child_region(unsigned dom_id, unsigned parent_id,
     if(dom_id >= dom_n || parent_id >= region_n) {
         return -1;
     }
+    /* separate statement, NOT a third || operand: Capstone-C evaluates every operand of ||
+       (an out-of-range id would index region_live[] and fault M-mode) */
+    if(region_live[parent_id] == 0) {
+        return -1;
+    }
 
     __dom void *d = domains[dom_id];
 
@@ -1254,10 +1253,12 @@ static unsigned share_child_region(unsigned dom_id, unsigned parent_id,
 
     if (head) {
         regions[region_n] = head;
+        region_live[region_n] = 1;
         region_n += 1;
     }
     if (tail) {
         regions[region_n] = tail;
+        region_live[region_n] = 1;
         region_n += 1;
     }
 
@@ -1290,6 +1291,11 @@ static unsigned share_region(unsigned dom_id, unsigned region_id) {
     if(dom_id >= dom_n || region_id >= region_n) {
         return -1;
     }
+    /* separate statement, NOT a third || operand: Capstone-C evaluates every operand of ||
+       (an out-of-range id would index region_live[] and fault M-mode) */
+    if(region_live[region_id] == 0) {
+        return -1;
+    }
 
     __dom void *d = domains[dom_id];
 
@@ -1307,6 +1313,11 @@ static unsigned share_region(unsigned dom_id, unsigned region_id) {
 
 static unsigned revoke_region(unsigned region_id) {
     if(region_id >= region_n) {
+        return -1;
+    }
+    /* separate statement, NOT a third || operand: Capstone-C evaluates every operand of ||
+       (an out-of-range id would index region_live[] and fault M-mode) */
+    if(region_live[region_id] == 0) {
         return -1;
     }
 
@@ -1337,6 +1348,7 @@ static unsigned pop_region(unsigned pop_num) {
         }
 
         region_cpmp[region_i] = -1;
+        region_live[region_i] = 0;
     }
 
     region_n -= pop_num;
@@ -1346,6 +1358,11 @@ static unsigned pop_region(unsigned pop_num) {
 
 static unsigned region_de_linear(unsigned region_id) {
     if(region_id >= region_n) {
+        return -1;
+    }
+    /* separate statement, NOT a third || operand: Capstone-C evaluates every operand of ||
+       (an out-of-range id would index region_live[] and fault M-mode) */
+    if(region_live[region_id] == 0) {
         return -1;
     }
 
@@ -1385,6 +1402,11 @@ static void fault_return_from_domain(unsigned cause) {
 
 static unsigned query_region(unsigned region_id, unsigned field) {
     if(region_id >= region_n) {
+        return -1;
+    }
+    /* separate statement, NOT a third || operand: Capstone-C evaluates every operand of ||
+       (an out-of-range id would index region_live[] and fault M-mode) */
+    if(region_live[region_id] == 0) {
         return -1;
     }
 
@@ -1571,6 +1593,8 @@ static void swap_cpmp(unsigned badaddr) {
     unsigned ejected_region_id;
     __linear void *tmp;
     for(region_id = 0; region_id < region_n; region_id += 1) {
+        if(region_live[region_id] == 0) // a hole holds no capability
+            continue;
         if(region_cpmp[region_id] != -1) // already loaded
             continue;
         tmp = regions[region_id];
@@ -1734,6 +1758,7 @@ static void dpi_share_region(void *region) {
         while(1);
     }
     regions[region_n] = region;
+    region_live[region_n] = 1;
     region_n += 1;
 }
 
