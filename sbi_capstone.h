@@ -1,6 +1,8 @@
 #ifndef _SBI_CAPSTONE_H_
 #define _SBI_CAPSTONE_H_
 
+#include "capstone_target.h"
+
 #define SBI_SPEC_VERSION (1 << 24)
 
 /* Capstone-specific definitions */
@@ -26,7 +28,6 @@
 #define LDC(rd, rs1, imm) .insn i 0x5b, 0x3, rd, imm(rs1)
 #define STC(rs2, rs1, imm) .insn s 0x5b, 0x4, rs2, imm(rs1)
 #define CLEARCMMAP     .insn r 0x5b, 0x1, 0x42, x0, x0, x0
-#define PRINT(rs1)     .insn r 0x7B, 0x0, 0x9, x0, rs1, x0
 #define SEAL(rd, rs1)  .insn r 0x5b, 0x1, 0x7, rd, rs1, x0
 #define CCSRRW(rd, ccsr, rs1) .insn i 0x5b, 0x7, rd, ccsr(rs1)
 #define SCC(rd, rs1, rs2) .insn r 0x5b, 0x1, 0x5, rd, rs1, rs2
@@ -40,14 +41,12 @@
 #define SPLIT(rd, rs1, rs2) .insn r 0x5b, 0x1, 0x6, rd, rs1, rs2
 #define SHRINK(rd, rs1, rs2) .insn r 0x5b, 0x1, 0x1, rd, rs1, rs2
 
-#define CSR_CIS          0x804 //Temp fix because 0x800 is taken
 #define CSR_CID			 0x801
 #define CSR_CIC          0x802
 #define CSR_OFFSETMMU	 0x803 /* TODO: OUTDATED */
 #define CSR_CDCB		 0x803
 
 
-#define CAPSTONE_MAX_DOM_N   32
 /* RAISED 32 -> 96 on 2026-08-18. This was the real per-boot run ceiling.
  *
  * WHY 96 AND NOT MORE. 256 does not build. capstone-c emits a plain `addi` for the offset
@@ -73,7 +72,7 @@
  * Why it hid for so long: light ladder rungs consume ~1 region id each and never came near
  * the old limit -- ten consecutive rungs pass in one boot -- so the ceiling only appears
  * with region-heavy domains, which made it look like it did not exist at all. */
-#define CAPSTONE_MAX_REGION_N   96
+/* CAPSTONE_MAX_REGION_N: see capstone_target.h */
 
 #define CAPSTONE_ERR_STARTER        0xdeadbeef
 #define CAPSTONE_UNKNOWN_EXCP       0x0

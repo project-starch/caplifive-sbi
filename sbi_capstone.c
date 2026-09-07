@@ -178,8 +178,7 @@
 #define debug_counter_tick(counter_no)
 #endif
 
-// #define C_PRINT(v) __asm__ (".insn r 0x0B, 0, 0x7c, x0, %0, x0" : : "r"(v))
-#define C_PRINT(v) __asm__ volatile("csrw 0x800, %0" :: "r"(v))
+/* C_PRINT: per target, capstone_target.h */
 
 #define CPMP_COUNT 16
 #define DOMAIN_DATA_N    96
