@@ -111,42 +111,6 @@ _handle_branch_1:
     fence.i
     j return_to_sumode
 
-# _get_smode_context: //Debugging
-#     CINCOFFSETIMM(sp, sp, 16)
-#     RESTORE_REG(a0, sp)
-#     RESTORE_REG(a1, sp)
-#     RESTORE_REG(ra, sp)
-#     RESTORE_REG(gp, sp)
-#     RESTORE_REG(tp, sp)
-#     RESTORE_REG(t0, sp)
-#     RESTORE_REG(t1, sp)
-#     RESTORE_REG(t2, sp)
-#     RESTORE_REG(s0, sp)
-#     RESTORE_REG(s1, sp)
-#     RESTORE_REG(a2, sp)
-#     RESTORE_REG(a3, sp)
-#     RESTORE_REG(a4, sp)
-#     RESTORE_REG(a5, sp)
-#     RESTORE_REG(a6, sp)
-#     RESTORE_REG(a7, sp)
-#     RESTORE_REG(s2, sp)
-#     RESTORE_REG(s3, sp)
-#     RESTORE_REG(s4, sp)
-#     RESTORE_REG(s5, sp)
-#     RESTORE_REG(s6, sp)
-#     RESTORE_REG(s7, sp)
-#     RESTORE_REG(s8, sp)
-#     RESTORE_REG(s9, sp)
-#     RESTORE_REG(s10, sp)
-#     RESTORE_REG(s11, sp)
-#     RESTORE_REG(t3, sp)
-#     RESTORE_REG(t4, sp)
-#     RESTORE_REG(t5, sp)
-#     RESTORE_REG(t6, sp)
-#     CINCOFFSETIMM(sp, sp, 32 * 8)
-#     CCSRRW(sp, CCSR_CSCRATCH, sp)
-#     j _dom_reentry
-
 _handle_ints:
     # handle interrupts
     slli t0, t0, 1

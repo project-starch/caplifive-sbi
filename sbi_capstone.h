@@ -14,10 +14,8 @@
 #define CCSR_CDC   6
 
 
-/*
-   Note that this definition is for the RTL implementation
-   and different from the specification.
-*/
+/* Capability type field values, as the RTL and QEMU both encode them (a 2025 bring-up commit
+   briefly used 1/2 and was reverted; nothing target-specific remains here). */
 #define CAP_TYPE_LINEAR  0
 #define CAP_TYPE_NONLIN  1
 
