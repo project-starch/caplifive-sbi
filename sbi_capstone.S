@@ -2,14 +2,18 @@
 
 #ifndef DOM_REENTRY_POINT
 _dom_reentry:
+#ifdef CAPSTONE_TARGET_FPGA
     csrr t1, mepc
     csrr t2, mcause
+#endif
     j _dom_reentry
 #define DOM_REENTRY_POINT _dom_reentry
 #endif
 
 _cap_trap_entry:
+#ifdef CAPSTONE_TARGET_FPGA
     fence.i
+#endif
     CCSRRW(sp, CCSR_CSCRATCH, sp)
 
     CINCOFFSETIMM(sp, sp, -32 * 8)
@@ -53,7 +57,9 @@ _cap_trap_entry:
 
     # TODO: however, this would require the bottom of the stack to be reserved
     # for storing S-mode context
+#ifdef CAPSTONE_TARGET_FPGA
     fence.i
+#endif
     call save_smode_context
     CINCOFFSETIMM(sp, sp, 16)
     RESTORE_REG(a0, sp)
@@ -71,10 +77,14 @@ _cap_trap_entry:
     srli t1, t0, 63
     bne t1, x0, _handle_ints
     li t1, CAUSE_SUPERVISOR_ECALL
+#ifdef CAPSTONE_TARGET_FPGA
     fence.i
+#endif
     bne t0, t1, _handle_non_ecall
 
+#ifdef CAPSTONE_TARGET_FPGA
     fence.i
+#endif
     call handle_trap_ecall
     mv a1, a0
     li a0, 0
@@ -82,13 +92,18 @@ _cap_trap_entry:
     CCSRRW(t0, CCSR_CEPC, x0)
     addi t0, t0, 4
     CCSRRW(x0, CCSR_CEPC, t0)
+#ifdef CAPSTONE_TARGET_FPGA
     fence.i
+#endif
     j return_to_sumode
 
 _handle_non_ecall:
     mv a0, t0
+#ifdef CAPSTONE_TARGET_FPGA
     fence.i
+#endif
     call handle_exception
+#ifdef CAPSTONE_TARGET_FPGA
     li t1, -1
     beq a0, t1, _handle_branch_1
 
@@ -104,11 +119,14 @@ _handle_non_ecall:
     addi t2, t2, 4
     csrw mepc, t2
 _handle_branch_1:
+#endif
     CINCOFFSETIMM(sp, sp, 16)
     RESTORE_REG(a0, sp)
     RESTORE_REG(a1, sp)
     CINCOFFSETIMM(sp, sp, -16)
+#ifdef CAPSTONE_TARGET_FPGA
     fence.i
+#endif
     j return_to_sumode
 
 _handle_ints:
@@ -166,7 +184,9 @@ return_to_sumode:
     # right before returning to S mode:
     # cscratch: sp  ->
     #      sp - 8 * 32 - 16  -> gp
+#ifdef CAPSTONE_TARGET_FPGA
     fence.i
+#endif
     mret
 
 call_into_smode:
@@ -177,7 +197,9 @@ call_into_smode:
     STC(gp, sp, -8 * 32 -16)
     CCSRRW(sp, CCSR_CSCRATCH, sp)
     li gp, 0
+#ifdef CAPSTONE_TARGET_FPGA
     fence.i
+#endif
     mret
 
 resume_smode:
