@@ -108,7 +108,9 @@
    widening). capstone_putc polls THRE per character so nothing is dropped by the
    UART, but a console that truncates at 16 characters will now cut the low hex
    digits off every line. */
+#ifdef CAPSTONE_TARGET_FPGA
 #define CAPSTONE_SHARE_TRACE_ENABLE
+#endif
 /* share-path site tags */
 #define CAPSTONE_TAG_EXTC 0x45585443 /* "EXTC" ext_code  (a7) -- positive control */
 #define CAPSTONE_TAG_FNCC 0x464e4343 /* "FNCC" func_code (a6) -- positive control */
@@ -160,6 +162,14 @@
 #define capstone_trace(tag, v) capstone_report((tag), (v))
 #else
 #define capstone_trace(tag, v)
+#endif
+#ifdef CAPSTONE_TARGET_QEMU
+/* QEMU has no UART path in the monitor (the virt board maps its UART with a different register
+ * layout, and the harnesses read the trace instruction instead): a report is a pair of trace
+ * prints, the flush is nothing, and the progress traces stay off. Macros, so the FPGA build is
+ * untouched (see capstone_target.h for why nothing here may be a declaration). */
+#define capstone_report(tag, v) do { C_PRINT(tag); C_PRINT(v); } while (0)
+#define capstone_uart_flush() do { } while (0)
 #endif
 #define capstone_error_tag(tag, err_code) do { C_PRINT(CAPSTONE_ERR_STARTER); C_PRINT(err_code); capstone_report((tag), (err_code)); while(1); } while(0)
 #define capstone_error(err_code) capstone_error_tag(CAPSTONE_TAG_CERR, (err_code))
@@ -217,6 +227,7 @@ unsigned smode_initialised;
 /* saved context of S-mode at the last SBI dom-return call */
 unsigned *smode_saved_context;
 
+#ifdef CAPSTONE_TARGET_FPGA
 /* ---------------------------------------------------------------------------
  * I-4: making monitor errors VISIBLE on the FPGA console.
  *
@@ -336,6 +347,7 @@ static void capstone_report(unsigned tag, unsigned long v) {
     capstone_putc(0x0a);
     capstone_uart_flush();
 }
+#endif /* CAPSTONE_TARGET_FPGA: UART reporting */
 
 static __linear void *read_cpmp(unsigned n) {
     __linear void *res;
