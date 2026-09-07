@@ -218,8 +218,7 @@ static void print_cpmps(void) {
 /* Q-03: a slot whose region has left the pool becomes a HOLE. It keeps its index forever
    (see region_live above); compaction was refuted on exactly that, and the tail is not special
    -- the earlier tail-only shrink is gone with this. Every hole prints, so the change cannot
-   pass silently: tag 0x1236 = exact fit (0x1239 is reserved for a REV_TRANSFERRED hole, not
-   enabled -- see Q-05 at the REV_TRANSFERRED site). */
+   pass silently: tag 0x1236 = exact fit, 0x1239 = REV_TRANSFERRED (Q-05). */
 unsigned make_hole(unsigned i, unsigned tag) {
     if(region_cpmp[i] != -1) {
         cpmp_region[region_cpmp[i]] = -1;
@@ -650,22 +649,17 @@ static unsigned shared_region_annotated(unsigned dom_id, unsigned region_id, uns
     }
     else if (annotation_rev == CAPSTONE_ANNOTATION_REV_TRANSFERRED) {
         // capability type: linear; post-return revoke: no
-        // TODO: regions[region_id] should be added to a free list
-        // NOT made a hole (Q-05): on QEMU the slot keeps a tagged duplicate of the transferred
-        // capability (csldc does not null its source there), and the host's later accesses to the
-        // transferred pages are served through it by swap_cpmp. Making the slot a hole is what
-        // the spec implies and what silicon does, but the intra-domain-mrev-revoke probe's host
-        // observer depends on the duplicate; that is a QEMU-fidelity question filed as Q-05, not
-        // part of the Q-03 exact-fit fix. Behaviour here is unchanged from before Q-03.
+        // The region leaves the pool for good: its slot becomes a hole (Q-05, 2026-09-07). It used
+        // to keep a stale duplicate of the transferred capability on QEMU (csldc does not null its
+        // source there), through which swap_cpmp served the HOST's later accesses to pages it had
+        // given away -- a QEMU-only behaviour the spec forbids. The one test that leaned on it
+        // (intra-domain-mrev-revoke's post-call arena read) now reads back through the domain.
         if (cap_type(r) != 0) {
             C_PRINT(0xdeadbeef);
             while(1);
         }
 
-        if (region_cpmp[region_id] != -1) {
-            cpmp_region[region_cpmp[region_id]] = -1;
-            region_cpmp[region_id] = -1;
-        }
+        make_hole(region_id, 0x1239);
     }
     else {
         return -1;
