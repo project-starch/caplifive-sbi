@@ -715,302 +715,14 @@ static void *split_out_cap(unsigned base, unsigned len, unsigned linear) {
 
     return region;
 }
-#ifdef CAPSTONE_TARGET_FPGA
-static unsigned create_domain(unsigned base_addr, unsigned code_size,
-                          unsigned tot_size, unsigned entry_offset,
-                          unsigned globals_off)
-{
-    /* entry_offset carries the GLOBALS OFFSET in its high 32 bits (packed by
-       libcapstone; the kernel module forwards the word untouched). 0 in the high half
-       means "not supplied" and falls back to the historical 0x1000, so any domain
-       built before this creates exactly as it used to. */
-    /* TWO 16-BIT SHIFTS, not one 32-bit shift. capstone-c holds the full 64-bit value
-       (the print above shows 0x800000000000 arriving intact) but `>> 32` yields 0 --
-       the shift is evaluated at 32 bits. Measured, not assumed: with `>> 32` the
-       monitor computed gpoff = 0x1000 from an entry_offset of 0x800000000000. */
-    unsigned packed_gpoff = (entry_offset >> 16) >> 16;
-    entry_offset = entry_offset & 0xffffffff;
-    /* Plain if/else, not a nested ternary. With the ternary form capstone-c produced
-       gpoff = 0x1000 even though packed_gpoff printed as 0x8000 immediately above --
-       i.e. the conditional did not select the branch its own condition implied. */
-    unsigned gpoff = GPFREE_GLOBALS_OFFSET;
-    if (globals_off) {
-        gpoff = globals_off;
-    }
-    if (packed_gpoff) {
-        gpoff = packed_gpoff;
-    }
-    // alignment requirement
-    code_size = (((code_size - 1) >> 4) + 1) << 4;
-
-    /* CAPABILITY-BOUNDS REPRESENTABILITY (issue C-13, root-caused 2026-07-29).
-       The register file stores capability metadata COMPRESSED. compress_bounds
-       (capstone-ariane core/include/ariane_pkg.sv:749-800) has an exact "cursorless"
-       encoding only while start == cursor; otherwise it truncates the BASE DOWNWARD to
-       a 2^(E+3) granule (:788 `B[13:3] = {bounds.start >> E}[13:3]`, with no round-up,
-       unlike the top at :790).
-
-       dom_data leaves SPLIT cursorless-exact, but the C_SET_CURSOR below (used to park
-       gp at the top of the region) moves the cursor off the start, so the very next
-       writeback re-encodes with the lossy form and PERMANENTLY truncates the base. With
-       code_size rounded only to 16, base+code_size+DOMAIN_DATA_SIZE was 96 bytes past a
-       128-byte granule, so the domain's sp reported a base 96 bytes BELOW where the
-       monitor had copied the blob. The glue then read its own base+8 for `count`, landed
-       in the zeroed seal tail, got 0, skipped the entire table build, never established
-       gp, and the domain faulted on its first `ldc gp[i]`. Verified numerically: a
-       line-for-line model of compress_bounds reproduces the board's measured
-       sp.base (+5632) and size (125440) exactly.
-
-       So round code_size up to the region's REPRESENTABILITY granule, not to 16. The
-       granule depends on the region length, so it must be computed: 128 bytes for a
-       128 KiB domain, 1024 for SQLite's 2 MiB one. Hardcoding 128 would silently fail
-       at SQLite scale, which is the case this whole fix exists to unblock.
-
-       Only the SPLIT geometry moves. The blob extent stays (code_size - gpoff) off the
-       ORIGINAL 16-rounded size, so the copy still reads exactly the image bytes and
-       never past the loaded image. */
-    unsigned repr_len;
-    unsigned repr_tmp;
-    unsigned repr_hb;
-    unsigned repr_e;
-    unsigned repr_gran;
-    unsigned split_size;
-    unsigned data_off;
-    repr_len = tot_size - code_size - DOMAIN_DATA_SIZE;
-    repr_hb = 0;
-    repr_tmp = repr_len;
-    for (repr_tmp = repr_len; repr_tmp > 1; repr_tmp = repr_tmp >> 1) {
-        repr_hb = repr_hb + 1;
-    }
-    repr_e = 0;
-    if (repr_hb > 12) {
-        repr_e = repr_hb - 12;
-    }
-    repr_gran = 1 << (repr_e + 3);
-    split_size = code_size + repr_gran - 1;
-    split_size = split_size - (split_size & (repr_gran - 1));
-
-    /* ALIGN THE SEAL SIZE TOO, not just split_size. dom_data starts at
-       split_size + <seal size>, so BOTH terms must be granule multiples or the sum is
-       not representable and the base slides down exactly as it did before.
-       DOMAIN_DATA_SIZE is 1536: a multiple of 128, so a 128 KiB domain (granule 128) is
-       unaffected and keeps byte-identical geometry -- but NOT a multiple of 1024, so a
-       2 MiB domain (granule 1024) lands 512 bytes past a boundary and dom_data.start
-       truncates DOWN 512 bytes into the seal region. That is the same defect as the
-       96-byte one, one size class up, and it is why every ladder rung passes while
-       SQLite (the only 2 MiB domain) does not.
-       Verified: 128 KiB data_off stays 1536 and dom_data.start stays 5760; 2 MiB goes
-       1536 -> 2048 and dom_data.start 1391104 -> 1391616, which is 1024-aligned. The
-       seal region only grows (2048 B), staying above SEAL's 1024-byte minimum. */
-    data_off = DOMAIN_DATA_SIZE + repr_gran - 1;
-    data_off = data_off - (data_off & (repr_gran - 1));
-    /* ONE DECLARATOR PER DECLARATION -- do not merge these back into one line.
-       capstone-c accumulates the `*` across declarators (dag_builder.rs mutates the
-       shared decl_type in place and never resets it between declarators), so
-       `__linear void *a, *b, *c, *d;` declares a as void*, b as void**, c as void***,
-       and d as void****. Only the FIRST name gets the intended type.
-       That is what made the globals copy below emit ldc/stc: dereferencing dom_code /
-       dom_data yielded a POINTER (16 B) rather than a word (8 B). On real silicon a
-       16-byte capability store puts the high 8 bytes through compress_cap(), a LOSSY
-       encoder, so plain scalar data in the high half of every granule was corrupted --
-       board-confirmed as the root cause of C-13 (see ISSUES R-10). */
-    __linear void *mem_l;
-    __linear void *dom_code;
-    __linear void *dom_data;
-    __linear void *mem_r;
-    __linear void **dom_seal;
-
-    /* DBAS/DENT: the domain's LOAD BASE and entry offset.
-     *
-     * Without these a wedge's latched mepc is UNINTERPRETABLE. On 2026-08-12 the new
-     * debug mux finally produced one -- trap mepc = 0x828897FC -- and it could not be
-     * mapped to an instruction, because nothing in the entire boot transcript reveals
-     * where the domain was loaded. The only addresses printed are the shared regions,
-     * which are nowhere near it. An address without its base names nothing.
-     *
-     * With these two, mepc - base_addr is a file offset into the .dom and the faulting
-     * instruction can be disassembled directly -- which is what discriminates the two
-     * readings of mcause 25 (R-24): UNEXPECTED_OPERAND from the execute path, or
-     * INVALID_CAPABILITY on the PC capability from commit_stage.
-     *
-     * Emitted BEFORE split_out_cap, so they appear even if the carve itself fails. */
-    capstone_trace(CAPSTONE_TAG_DBAS, base_addr);
-    capstone_trace(CAPSTONE_TAG_DENT, entry_offset);
-
-    dom_code = split_out_cap(base_addr, tot_size, 1);
-
-    dom_seal = __split(dom_code, base_addr + split_size);
-    dom_data = __split(dom_seal, base_addr + split_size + data_off);
-
-    /* Large-.rodata delivery (issue C-4b). Copy the initialized-globals bytes of the
-       loaded image, [base+GPFREE_GLOBALS_OFFSET, base+code_size), into the FRONT of
-       dom_data, so that dom_data[k] == image[base+GPFREE_GLOBALS_OFFSET + k].
-
-       WHY THIS IS NEEDED. The cap-table glue otherwise materializes an initialized
-       global with an unrolled li/sd immediate sequence. That has a hard ceiling: a
-       single global must be a multiple of 8 bytes and fit a 12-bit store offset
-       (~2 KB), and the code it emits competes for the domain's PCC window. beebs_ns
-       hit it exactly -- "2512 B of *initialized* data overflows the 12-bit store
-       offset and is not copy-eligible" -- and SQLite's static tables are far past it.
-       With the bytes present in dom_data the glue can copy them instead, which scales
-       to any table size.
-
-       WHY THE MONITOR DOES IT. The initializer bytes physically exist in the loaded
-       image, but after the dom_gp split below the image is covered for the domain only
-       by an EXECUTE-authority cap, and the 2026-07-22 root cause established that a
-       code-authority cap cannot load data on captype-fixed CVA6. The monitor runs in
-       M-mode with authority over the image, so it can read it and write into the
-       fresh dom_data region -- the data-authority-over-a-data-region case that already
-       works on the board. The domain therefore never reads data through an execute cap.
-
-       PLACEMENT is load-bearing, in three ways:
-         - BEFORE the dom_gp __split below, while dom_code still spans
-           [base, base+code_size) and so still covers the globals.
-         - BEFORE the C_SET_CURSOR calls that move dom_code's and dom_data's cursors:
-           indexed access here is cursor-relative.
-         - AFTER the dom_data __split, so dom_data is the fresh region and index 0 is
-           its front.
-
-       The word-copy idiom (cap-to-cap, the same shape capstone-c uses for enclave
-       setup) is exact for this payload: .rodata const tables carry no capability tags,
-       so there is nothing for a plain word copy to lose.
-
-       Board owner's stated preference is for the HOST USERSPACE process to do this
-       rather than the monitor ("but for now whatever works is fine"). This is the
-       prototype; keeping it as one self-contained block is what makes moving it out of
-       M-mode later a local change. */
-    /* Bounds guard, deliberately explicit. dom_data spans
-       [base+code_size+DOMAIN_DATA_SIZE, base+tot_size), so it holds
-       tot_size - code_size - DOMAIN_DATA_SIZE bytes, while the blob is
-       code_size - GPFREE_GLOBALS_OFFSET bytes. A domain with a large image and a
-       small data region would otherwise run the copy past dom_data's end, and an
-       out-of-bounds capability store HERE is an M-mode fault -- i.e. it takes the
-       whole machine down, not just the domain. Skipping the copy instead is safe:
-       the glue only reads the blob for globals that took the copy path, and a
-       domain that does not fit simply keeps the old unrolled-immediate behaviour. */
-    if(code_size > gpoff
-       && tot_size > split_size + data_off
-       && (code_size - gpoff) > (tot_size - split_size - DOMAIN_DATA_SIZE)) {
-        /* The blob does not fit in dom_data. This used to SKIP the copy silently,
-           on the reasoning that "the glue only reads the blob for globals that took
-           the copy path" -- which is exactly backwards once a global DOES take it:
-           the domain then runs with uninitialized globals, computes wrong answers and
-           never faults. A domain whose globals were not delivered is not a degraded
-           domain, it is a wrong one, so fail loudly and let the build-time budget
-           check (which is where this belongs) catch it earlier next time. */
-        capstone_error(0xB10B);
-    }
-    if(code_size > gpoff
-       && tot_size > split_size + data_off) {
-        /* Index in 16-BYTE units, not 8. These are `__linear void *`, so subscripting
-           steps one CAPABILITY (16 B) and the generated access is a 16-byte ldc/stc --
-           `dom_seal`'s own zeroing loop runs to DOMAIN_DATA_N with
-           DOMAIN_DATA_SIZE = 16 * DOMAIN_DATA_N, which is the same convention.
-           Computing the trip count with `>> 3` (as the earlier draft of this copy did)
-           walks TWICE the intended distance and stores past dom_data's end. That is not
-           a theoretical concern: it faulted on the first run --
-             Cap mem access OOB: cursor = 101562000, size = 16,
-                                 bounds = (101560000, 101561020)
-           i.e. it reached +0x2000 into a 0x1020-byte region.
-           Both endpoints are 16-aligned by construction: code_size is rounded up to a
-           multiple of 16 at the top of this function, and GPFREE_GLOBALS_OFFSET is
-           0x1000, so the byte count is always a whole number of capabilities.
-           Copying through capability-sized accesses is exact for this payload: the
-           image bytes here are const initializer data with no capability tags, so the
-           128 bits round-trip unchanged. */
-        /* 8-BYTE UNITS now, not 16. With dom_code/dom_data correctly typed as
-           `__linear void *`, subscripting steps ONE WORD and the loop body emits a
-           scalar ld/sd -- which is the whole point: it never touches compress_cap, so
-           plain data round-trips exactly. Byte extent and start offset are unchanged
-           (gpoff_c*8 == gpoff), and both endpoints stay 8-aligned because code_size is
-           rounded up to 16 and gpoff is 0x1000. */
-        unsigned gpoff_c = gpoff >> 3;                          /* image offset, in words */
-        unsigned glob_c  = (code_size - gpoff) >> 3;
-        unsigned ci;
-        for(ci = 0; ci < glob_c; ci += 1)
-            dom_data[ci] = dom_code[gpoff_c + ci];
-    }
-
-    int i;
-#ifdef CAPSTONE_DOMAIN_TRAP_VECTOR
-    unsigned dom_trap_vec;   /* function scope: capstone-c rejects a nested-block decl; plain
-                              * `unsigned` to match the local idiom (`unsigned mepc_val` etc.) */
-#endif
-    for(i = 0; i < DOMAIN_DATA_N; i += 1) {
-        dom_seal[i] = 0;
-    }
-
-    // gp-free domain ABI (silicon): derive the domain's `gp` from real authority
-    // by SPLITting the code image at the fixed globals boundary
-    // (GPFREE_GLOBALS_OFFSET, matching link-gpfree.ld) into an execute code cap
-    // (PCC) and an R/W globals cap (gp). SPLIT only partitions existing authority,
-    // so -- unlike the QEMU-only debug op C_GEN_CAP (funct 0x40, absent on the RTL,
-    // which fabricates a cap and hangs the monitor on silicon) -- this works on
-    // real hardware. gp is delivered via the cscratch (dom_data) top-16 slot; the
-    // entry glue does `ldc gp, END-16; delin`.
-    __linear void *dom_gp = __split(dom_code, base_addr + gpoff);
-    // dom_code -> [base, base+GPFREE_GLOBALS_OFFSET) (code); dom_gp -> [.., +code_size) (globals)
-
-    C_SET_CURSOR(dom_code, dom_code, base_addr + entry_offset);
-
-    // store gp (linear; glue delins on first entry) into the cscratch top slot
-    C_SET_CURSOR(dom_data, dom_data, base_addr + tot_size - 16);
-    *(__linear void **)dom_data = dom_gp;
-    C_SET_CURSOR(dom_data, dom_data, base_addr + split_size + data_off);
-
-    // construct the sealed region of the domain
-    dom_seal[0] = dom_code;
-#ifdef CAPSTONE_DOMAIN_TRAP_VECTOR
-    /* THE ACCEPTANCE TEST for "a domain enters with NO trap vector".
-     *
-     * Slot 1 is the trap-vector slot -- csr_regfile.sv:407 restores it as
-     * {ctvec_tag_q, ctvec_q, mtvec_q}, and the RTL's own interrupt.S:67 stores ctvec at byte
-     * offset 16 -- and the zeroing loop above leaves it 0 while slots 0, 2 and 3 get written.
-     * The domain switch is an EXCHANGE, so it parks the monitor's live vector in this slot and
-     * loads the zero: the domain runs with mtvec = 0 AND ctvec = 0, and any exception it takes
-     * vectors to address 0. Confirmed on silicon -- mtvec reads 0x0 at every wedge, and a
-     * deliberate benign capability fault (cincoffsetimm on a plain 0xBEEF) kills the board
-     * exactly as the real S-12 fault does.
-     *
-     * `lla` rather than a C declaration: _cap_trap_entry is an assembly label with no prototype,
-     * and this is how sbi_capstone_dom.c:30 already reaches it. The temporary is declared at
-     * function scope beside `int i` because capstone-c panics (dag_builder.rs:1258,
-     * `assertion failed: self.decl_type.is_none()`) on a declaration inside a nested block.
-     *
-     * EXPECTED TO BE INSUFFICIENT, and still worth running, because the outcomes discriminate.
-     * frontend.sv:425-427 redirects the PC on an exception while :443-444 leaves npc_metadata_q
-     * untouched, capmode_q is sticky (csr_regfile.sv:295), and commit_stage.sv:222-223 raises
-     * cause 28 when the PC leaves the PC-capability's bounds. So vectoring to _cap_trap_entry
-     * (~0x8002xxxx) while still holding the DOMAIN's PC capability (bounded ~0x828xxxxx) should
-     * trade a cause-2 storm for a cause-28 one:
-     *
-     *   mcause 28 at the next wedge -> the vector TOOK. The firmware half is right and the
-     *                                  missing half is in RTL: slot 1 is meant to hold a trap
-     *                                  vector CAPABILITY (cursor->mtvec, metadata->ctvec) and
-     *                                  the core never installs ctvec as the PC capability.
-     *   mcause 2 still               -> the vector did NOT take; this diagnosis is wrong.
-     *   EXCX + a returned CAPSTONE_DOMAIN_FAULT_RETVAL
-     *                                -> the prediction was too pessimistic and this alone fixes
-     *                                   it, making every capability fault reportable instead of
-     *                                   fatal.
-     */
-    __asm__ ("lla %0, _cap_trap_entry" : "=r"(dom_trap_vec));
-    dom_seal[1] = dom_trap_vec;
-#endif
-    dom_seal[2] = dom_data;
-    dom_seal[3] = (3 << 38) | (2 << 34);
-
-    __dom void *dom = __seal(dom_seal);
-
-    // PRINT(dom);
-
-    domains[dom_n] = dom;
-
-    dom_n += 1;
-
-    return dom_n - 1;
-}
-#else /* CAPSTONE_TARGET_QEMU */
+/* ONE create_domain for both targets (Phase B item 5, 2026-09-08). Until then the file carried two
+   whole copies under #ifdef CAPSTONE_TARGET_FPGA / #else, which differed at nine sites; the record of
+   each and its gate is in docs/plans/monitor-unification.md. What remains per-target inside this
+   function is only what the macros hide: REPORT_REGION_OVERFLOW (UART tags vs C_PRINT) and
+   capstone_trace (FPGA only; expands to nothing on QEMU). gpoff comes from the packed globals offset
+   the loader supplies (0 = the image declares no globals region: no blob copy, no gp carve, no
+   cscratch slot); every board image links link-gpfree.ld and so packs a nonzero one (0x1000 for the
+   ladder rungs, 0x150000 for SQLite, measured on the staged images 2026-09-08). */
 /* globals_off: image offset where the domain's globals region starts, i.e. the value
    the linker script put in __gpfree_globals_base minus the image base. 0 means "not
    supplied" and falls back to the historical fixed 0x1000, so a caller that does not
@@ -1065,12 +777,32 @@ static unsigned create_domain(unsigned base_addr, unsigned code_size,
     }
     // alignment requirement
     code_size = (((code_size - 1) >> 4) + 1) << 4;
-    /* Phase B item 6 (2026-09-08): the FPGA arm's C-13 representability rounding, applied here
-       too so both targets carve the same geometry. The SPLIT points move to the region's
-       representability granule (2^(E+3), E from the data region's length), while the blob copy
-       below keeps the ORIGINAL 16-rounded code_size, exactly as on the board. QEMU's capability
-       model needs none of this; the point is identical dom_data/sp geometry on both targets.
-       One declarator per line: capstone-c accumulates `*` across declarators. */
+    /* CAPABILITY-BOUNDS REPRESENTABILITY (issue C-13, root-caused 2026-07-29).
+       The register file stores capability metadata COMPRESSED. compress_bounds
+       (capstone-ariane core/include/ariane_pkg.sv:749-800) has an exact "cursorless"
+       encoding only while start == cursor; otherwise it truncates the BASE DOWNWARD to
+       a 2^(E+3) granule (:788 `B[13:3] = {bounds.start >> E}[13:3]`, with no round-up,
+       unlike the top at :790).
+
+       dom_data leaves SPLIT cursorless-exact, but the C_SET_CURSOR below (used to park
+       gp at the top of the region) moves the cursor off the start, so the very next
+       writeback re-encodes with the lossy form and PERMANENTLY truncates the base. With
+       code_size rounded only to 16, base+code_size+DOMAIN_DATA_SIZE was 96 bytes past a
+       128-byte granule, so the domain's sp reported a base 96 bytes BELOW where the
+       monitor had copied the blob. The glue then read its own base+8 for `count`, landed
+       in the zeroed seal tail, got 0, skipped the entire table build, never established
+       gp, and the domain faulted on its first `ldc gp[i]`. Verified numerically: a
+       line-for-line model of compress_bounds reproduces the board's measured
+       sp.base (+5632) and size (125440) exactly.
+
+       So round code_size up to the region's REPRESENTABILITY granule, not to 16. The
+       granule depends on the region length, so it must be computed: 128 bytes for a
+       128 KiB domain, 1024 for SQLite's 2 MiB one. Hardcoding 128 would silently fail
+       at SQLite scale, which is the case this whole fix exists to unblock.
+
+       Only the SPLIT geometry moves. The blob extent stays (code_size - gpoff) off the
+       ORIGINAL 16-rounded size, so the copy still reads exactly the image bytes and
+       never past the loaded image. */
     unsigned repr_len;
     unsigned repr_tmp;
     unsigned repr_hb;
@@ -1103,11 +835,29 @@ static unsigned create_domain(unsigned base_addr, unsigned code_size,
     __linear void *mem_r;
     __linear void **dom_seal;
 
+    /* needs one slot for the domain's own region: refuse BEFORE carving (item 1's check, here since
+       item 5; on the board it precedes what used to be split_out_cap's post-carve RGNO spin) */
     if(region_n + 1 > CAPSTONE_MAX_REGION_N) {
-        C_PRINT(0x1237);
-        C_PRINT(region_n);
+        REPORT_REGION_OVERFLOW();
         return -1;
     }
+    /* DBAS/DENT: the domain's LOAD BASE and entry offset.
+     *
+     * Without these a wedge's latched mepc is UNINTERPRETABLE. On 2026-08-12 the new
+     * debug mux finally produced one -- trap mepc = 0x828897FC -- and it could not be
+     * mapped to an instruction, because nothing in the entire boot transcript reveals
+     * where the domain was loaded. The only addresses printed are the shared regions,
+     * which are nowhere near it. An address without its base names nothing.
+     *
+     * With these two, mepc - base_addr is a file offset into the .dom and the faulting
+     * instruction can be disassembled directly -- which is what discriminates the two
+     * readings of mcause 25 (R-24): UNEXPECTED_OPERAND from the execute path, or
+     * INVALID_CAPABILITY on the PC capability from commit_stage.
+     *
+     * Emitted BEFORE split_out_cap, so they appear even if the carve itself fails. */
+    capstone_trace(CAPSTONE_TAG_DBAS, base_addr);
+    capstone_trace(CAPSTONE_TAG_DENT, entry_offset);
+
     dom_code = split_out_cap(base_addr, tot_size, 1);
 
     dom_seal = __split(dom_code, base_addr + split_size);
@@ -1193,6 +943,10 @@ static unsigned create_domain(unsigned base_addr, unsigned code_size,
     }
 
     int i;
+#ifdef CAPSTONE_DOMAIN_TRAP_VECTOR
+    unsigned dom_trap_vec;   /* function scope: capstone-c rejects a nested-block decl; plain
+                              * `unsigned` to match the local idiom (`unsigned mepc_val` etc.) */
+#endif
     for(i = 0; i < DOMAIN_DATA_N; i += 1) {
         dom_seal[i] = 0;
     }
@@ -1226,6 +980,43 @@ static unsigned create_domain(unsigned base_addr, unsigned code_size,
 
     // construct the sealed region of the domain
     dom_seal[0] = dom_code;
+#ifdef CAPSTONE_DOMAIN_TRAP_VECTOR
+    /* THE ACCEPTANCE TEST for "a domain enters with NO trap vector".
+     *
+     * Slot 1 is the trap-vector slot -- csr_regfile.sv:407 restores it as
+     * {ctvec_tag_q, ctvec_q, mtvec_q}, and the RTL's own interrupt.S:67 stores ctvec at byte
+     * offset 16 -- and the zeroing loop above leaves it 0 while slots 0, 2 and 3 get written.
+     * The domain switch is an EXCHANGE, so it parks the monitor's live vector in this slot and
+     * loads the zero: the domain runs with mtvec = 0 AND ctvec = 0, and any exception it takes
+     * vectors to address 0. Confirmed on silicon -- mtvec reads 0x0 at every wedge, and a
+     * deliberate benign capability fault (cincoffsetimm on a plain 0xBEEF) kills the board
+     * exactly as the real S-12 fault does.
+     *
+     * `lla` rather than a C declaration: _cap_trap_entry is an assembly label with no prototype,
+     * and this is how sbi_capstone_dom.c:30 already reaches it. The temporary is declared at
+     * function scope beside `int i` because capstone-c panics (dag_builder.rs:1258,
+     * `assertion failed: self.decl_type.is_none()`) on a declaration inside a nested block.
+     *
+     * EXPECTED TO BE INSUFFICIENT, and still worth running, because the outcomes discriminate.
+     * frontend.sv:425-427 redirects the PC on an exception while :443-444 leaves npc_metadata_q
+     * untouched, capmode_q is sticky (csr_regfile.sv:295), and commit_stage.sv:222-223 raises
+     * cause 28 when the PC leaves the PC-capability's bounds. So vectoring to _cap_trap_entry
+     * (~0x8002xxxx) while still holding the DOMAIN's PC capability (bounded ~0x828xxxxx) should
+     * trade a cause-2 storm for a cause-28 one:
+     *
+     *   mcause 28 at the next wedge -> the vector TOOK. The firmware half is right and the
+     *                                  missing half is in RTL: slot 1 is meant to hold a trap
+     *                                  vector CAPABILITY (cursor->mtvec, metadata->ctvec) and
+     *                                  the core never installs ctvec as the PC capability.
+     *   mcause 2 still               -> the vector did NOT take; this diagnosis is wrong.
+     *   EXCX + a returned CAPSTONE_DOMAIN_FAULT_RETVAL
+     *                                -> the prediction was too pessimistic and this alone fixes
+     *                                   it, making every capability fault reportable instead of
+     *                                   fatal.
+     */
+    __asm__ ("lla %0, _cap_trap_entry" : "=r"(dom_trap_vec));
+    dom_seal[1] = dom_trap_vec;
+#endif
     dom_seal[2] = dom_data;
     dom_seal[3] = (3 << 38) | (2 << 34);
 
@@ -1239,7 +1030,6 @@ static unsigned create_domain(unsigned base_addr, unsigned code_size,
 
     return dom_n - 1;
 }
-#endif
 
 static unsigned call_domain(unsigned dom_id) {
     /* THE ENTER PATH WAS COMPLETELY UNINSTRUMENTED, and that has been costing verdicts.
