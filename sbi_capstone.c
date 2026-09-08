@@ -1072,6 +1072,34 @@ static unsigned create_domain(unsigned base_addr, unsigned code_size,
     }
     // alignment requirement
     code_size = (((code_size - 1) >> 4) + 1) << 4;
+    /* Phase B item 6 (2026-09-08): the FPGA arm's C-13 representability rounding, applied here
+       too so both targets carve the same geometry. The SPLIT points move to the region's
+       representability granule (2^(E+3), E from the data region's length), while the blob copy
+       below keeps the ORIGINAL 16-rounded code_size, exactly as on the board. QEMU's capability
+       model needs none of this; the point is identical dom_data/sp geometry on both targets.
+       One declarator per line: capstone-c accumulates `*` across declarators. */
+    unsigned repr_len;
+    unsigned repr_tmp;
+    unsigned repr_hb;
+    unsigned repr_e;
+    unsigned repr_gran;
+    unsigned split_size;
+    unsigned data_off;
+    repr_len = tot_size - code_size - DOMAIN_DATA_SIZE;
+    repr_hb = 0;
+    repr_tmp = repr_len;
+    for (repr_tmp = repr_len; repr_tmp > 1; repr_tmp = repr_tmp >> 1) {
+        repr_hb = repr_hb + 1;
+    }
+    repr_e = 0;
+    if (repr_hb > 12) {
+        repr_e = repr_hb - 12;
+    }
+    repr_gran = 1 << (repr_e + 3);
+    split_size = code_size + repr_gran - 1;
+    split_size = split_size - (split_size & (repr_gran - 1));
+    data_off = DOMAIN_DATA_SIZE + repr_gran - 1;
+    data_off = data_off - (data_off & (repr_gran - 1));
     __linear void *mem_l, *dom_code, *dom_data, *mem_r;
     __linear void **dom_seal;
 
@@ -1082,8 +1110,8 @@ static unsigned create_domain(unsigned base_addr, unsigned code_size,
     }
     dom_code = split_out_cap(base_addr, tot_size, 1);
 
-    dom_seal = __split(dom_code, base_addr + code_size);
-    dom_data = __split(dom_seal, base_addr + code_size + DOMAIN_DATA_SIZE);
+    dom_seal = __split(dom_code, base_addr + split_size);
+    dom_data = __split(dom_seal, base_addr + split_size + data_off);
 
     /* Large-.rodata delivery (issue C-4b). Copy the initialized-globals bytes of the
        loaded image, [base+GPFREE_GLOBALS_OFFSET, base+code_size), into the FRONT of
@@ -1136,8 +1164,8 @@ static unsigned create_domain(unsigned base_addr, unsigned code_size,
        a domain that has no globals at all. */
     if(gpoff != 0
        && code_size > gpoff
-       && tot_size > code_size + DOMAIN_DATA_SIZE
-       && (code_size - gpoff) > (tot_size - code_size - DOMAIN_DATA_SIZE)) {
+       && tot_size > split_size + data_off
+       && (code_size - gpoff) > (tot_size - split_size - DOMAIN_DATA_SIZE)) {
         /* The blob does not fit in dom_data. This used to SKIP the copy silently,
            on the reasoning that "the glue only reads the blob for globals that took
            the copy path" -- which is exactly backwards once a global DOES take it:
@@ -1149,7 +1177,7 @@ static unsigned create_domain(unsigned base_addr, unsigned code_size,
     }
     if(gpoff != 0
        && code_size > gpoff
-       && tot_size > code_size + DOMAIN_DATA_SIZE) {
+       && tot_size > split_size + data_off) {
         /* Index in 16-BYTE units, not 8. These are `__linear void *`, so subscripting
            steps one CAPABILITY (16 B) and the generated access is a 16-byte ldc/stc --
            `dom_seal`'s own zeroing loop runs to DOMAIN_DATA_N with
@@ -1202,7 +1230,7 @@ static unsigned create_domain(unsigned base_addr, unsigned code_size,
     if (dom_gp != 0) {
         C_SET_CURSOR(dom_data, dom_data, base_addr + tot_size - 16);
         *(__linear void **)dom_data = dom_gp;
-        C_SET_CURSOR(dom_data, dom_data, base_addr + code_size + DOMAIN_DATA_SIZE);
+        C_SET_CURSOR(dom_data, dom_data, base_addr + split_size + data_off);
     }
 
     // construct the sealed region of the domain
