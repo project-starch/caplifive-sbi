@@ -1209,7 +1209,6 @@ static unsigned shared_region_annotated(unsigned dom_id, unsigned region_id, uns
     else if (annotation_rev == CAPSTONE_ANNOTATION_REV_TRANSFERRED) {
 #ifdef CAPSTONE_TARGET_FPGA
         // capability type: linear; post-return revoke: no
-        // TODO: regions[region_id] should be added to a free list
         if (cap_type(r) != CAP_TYPE_LINEAR) {
             //C_PRINT(0xdeadbeef);
             /* I-4 site SHAX: a TRANSFERRED share needs a linear capability and this
@@ -1223,24 +1222,22 @@ static unsigned shared_region_annotated(unsigned dom_id, unsigned region_id, uns
             while(1);
         }
 
-        if (region_cpmp[region_id] != -1) {
-            cpmp_region[region_cpmp[region_id]] = -1;
-            region_cpmp[region_id] = -1;
-        }
-#else /* CAPSTONE_TARGET_QEMU: the slot becomes a hole (Q-05); Phase B item 2 for the board */
+#else /* CAPSTONE_TARGET_QEMU */
         // capability type: linear; post-return revoke: no
-        // The region leaves the pool for good: its slot becomes a hole (Q-05, 2026-09-07). It used
-        // to keep a stale duplicate of the transferred capability on QEMU (csldc does not null its
-        // source there), through which swap_cpmp served the HOST's later accesses to pages it had
-        // given away -- a QEMU-only behaviour the spec forbids. The one test that leaned on it
-        // (intra-domain-mrev-revoke's post-call arena read) now reads back through the domain.
         if (cap_type(r) != 0) {
             C_PRINT(0xdeadbeef);
             while(1);
         }
-
-        make_hole(region_id, 0x1239);
 #endif
+        /* The region leaves the pool for good: its slot becomes a hole -- on BOTH targets since
+           Phase B item 2B (2026-09-08). QEMU had this since Q-05 (2026-09-07: it used to keep a
+           stale duplicate of the transferred capability through which swap_cpmp served the host's
+           later accesses to pages it had given away). The board used to clear only the CPMP
+           association and leave the nulled slot live, so a later host access to those pages reached
+           cap_base(null) in M-mode -- the silent-wedge shape named in the Q-05 close-out. Now a
+           later access finds no region and takes the ordinary NO_CPMP_REGION path. Board evidence:
+           boots sw36 (transfer probe on the old arm) and sw37 (this form, one HOLE line). */
+        MAKE_HOLE(region_id, 0x1239);
     }
     else {
         /* I-4 site SHAV: annotation_rev is not one of the four defined values. */
