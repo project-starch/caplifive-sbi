@@ -1093,7 +1093,14 @@ static unsigned create_domain(unsigned base_addr, unsigned code_size,
     split_size = split_size - (split_size & (repr_gran - 1));
     data_off = DOMAIN_DATA_SIZE + repr_gran - 1;
     data_off = data_off - (data_off & (repr_gran - 1));
-    __linear void *mem_l, *dom_code, *dom_data, *mem_r;
+    /* ONE DECLARATOR PER DECLARATION (Phase B item 5A, 2026-09-08): capstone-c accumulates the `*`
+       across declarators, so the merged line typed dom_code as void** and dom_data as void*** and the
+       copy below stepped 16 bytes per subscript through ldc/stc. Exact on QEMU, lossy on silicon
+       (R-10/C-13); the FPGA arm has carried this form since 82a241a. Same form on both now. */
+    __linear void *mem_l;
+    __linear void *dom_code;
+    __linear void *dom_data;
+    __linear void *mem_r;
     __linear void **dom_seal;
 
     if(region_n + 1 > CAPSTONE_MAX_REGION_N) {
@@ -1171,24 +1178,15 @@ static unsigned create_domain(unsigned base_addr, unsigned code_size,
     if(gpoff != 0
        && code_size > gpoff
        && tot_size > split_size + data_off) {
-        /* Index in 16-BYTE units, not 8. These are `__linear void *`, so subscripting
-           steps one CAPABILITY (16 B) and the generated access is a 16-byte ldc/stc --
-           `dom_seal`'s own zeroing loop runs to DOMAIN_DATA_N with
-           DOMAIN_DATA_SIZE = 16 * DOMAIN_DATA_N, which is the same convention.
-           Computing the trip count with `>> 3` (as the earlier draft of this copy did)
-           walks TWICE the intended distance and stores past dom_data's end. That is not
-           a theoretical concern: it faulted on the first run --
-             Cap mem access OOB: cursor = 101562000, size = 16,
-                                 bounds = (101560000, 101561020)
-           i.e. it reached +0x2000 into a 0x1020-byte region.
-           Both endpoints are 16-aligned by construction: code_size is rounded up to a
-           multiple of 16 at the top of this function, and GPFREE_GLOBALS_OFFSET is
-           0x1000, so the byte count is always a whole number of capabilities.
-           Copying through capability-sized accesses is exact for this payload: the
-           image bytes here are const initializer data with no capability tags, so the
-           128 bits round-trip unchanged. */
-        unsigned gpoff_c = gpoff >> 4;                          /* image offset, in caps */
-        unsigned glob_c  = (code_size - gpoff) >> 4;
+        /* 8-BYTE UNITS, not 16. With dom_code/dom_data correctly typed as `__linear void *`
+           (one declarator per line above), subscripting steps ONE WORD and the loop body emits a
+           scalar ld/sd -- which is the whole point: it never touches compress_cap, so plain data
+           round-trips exactly (R-10). Byte extent and start offset are unchanged (gpoff_c*8 ==
+           gpoff), and both endpoints stay 8-aligned because code_size is rounded up to 16 and gpoff
+           is a page multiple. The earlier "16-byte units, exact for this payload" comment here was
+           false on silicon (R-10) and is gone. */
+        unsigned gpoff_c = gpoff >> 3;                          /* image offset, in words */
+        unsigned glob_c  = (code_size - gpoff) >> 3;
         unsigned ci;
         for(ci = 0; ci < glob_c; ci += 1)
             dom_data[ci] = dom_code[gpoff_c + ci];
