@@ -11,9 +11,6 @@ _dom_reentry:
 #endif
 
 _cap_trap_entry:
-#ifdef CAPSTONE_TARGET_FPGA
-    fence.i
-#endif
     CCSRRW(sp, CCSR_CSCRATCH, sp)
 
     CINCOFFSETIMM(sp, sp, -32 * 8)
@@ -57,9 +54,6 @@ _cap_trap_entry:
 
     # TODO: however, this would require the bottom of the stack to be reserved
     # for storing S-mode context
-#ifdef CAPSTONE_TARGET_FPGA
-    fence.i
-#endif
     call save_smode_context
     CINCOFFSETIMM(sp, sp, 16)
     RESTORE_REG(a0, sp)
@@ -77,14 +71,8 @@ _cap_trap_entry:
     srli t1, t0, 63
     bne t1, x0, _handle_ints
     li t1, CAUSE_SUPERVISOR_ECALL
-#ifdef CAPSTONE_TARGET_FPGA
-    fence.i
-#endif
     bne t0, t1, _handle_non_ecall
 
-#ifdef CAPSTONE_TARGET_FPGA
-    fence.i
-#endif
     call handle_trap_ecall
     mv a1, a0
     li a0, 0
@@ -93,15 +81,18 @@ _cap_trap_entry:
     addi t0, t0, 4
     CCSRRW(x0, CCSR_CEPC, t0)
 #ifdef CAPSTONE_TARGET_FPGA
+    # KEPT: this fence.i follows a CCSRRW to cepc/cscratch. R-26 (ISSUES.md): the RTL lands
+    # such a write at commit with no pipeline flush, and a younger LDC/STC/CALL/RETURN reads the
+    # register combinationally; fence.i is the flush. The six other fence.i this file carried
+    # (trap entry, ecall dispatch, non-ecall path, register restore, pre-return) were removed
+    # 2026-09-08 after firmware-only board boots without them ran k800 + six BEEBS rungs at
+    # their oracles (Phase B item 8, monitor-unification.md).
     fence.i
 #endif
     j return_to_sumode
 
 _handle_non_ecall:
     mv a0, t0
-#ifdef CAPSTONE_TARGET_FPGA
-    fence.i
-#endif
     call handle_exception
 #ifdef CAPSTONE_TARGET_FPGA
     li t1, -1
@@ -124,9 +115,6 @@ _handle_branch_1:
     RESTORE_REG(a0, sp)
     RESTORE_REG(a1, sp)
     CINCOFFSETIMM(sp, sp, -16)
-#ifdef CAPSTONE_TARGET_FPGA
-    fence.i
-#endif
     j return_to_sumode
 
 _handle_ints:
