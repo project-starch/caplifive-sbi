@@ -30,8 +30,11 @@
 #define C_PRINT(v) __asm__ volatile(".insn r 0x5b, 0x1, 0x43, x0, %0, x0" :: "r"(v))
 #define PRINT(reg)     .insn r 0x5b, 0x1, 0x43, x0, reg, x0
 #define CSR_CIS          0x800
-#define CAPSTONE_MAX_DOM_N   64
-#define CAPSTONE_MAX_REGION_N   64
+/* Phase B item 3 (2026-09-08): the board's geometry on QEMU too -- 32 domain slots (never reused,
+   dom_n only grows, so this is the per-boot domain budget) and 96 region slots. 96 > the kernel
+   module's former 64-entry copy, which is what makes M-2 reproducible off the board. */
+#define CAPSTONE_MAX_DOM_N   32
+#define CAPSTONE_MAX_REGION_N   96
 #endif
 
 #endif
