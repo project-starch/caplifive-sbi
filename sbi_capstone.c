@@ -142,6 +142,7 @@
 #define CAPSTONE_TAG_DRET 0x44524554 /* "DRET" DOM_RETURN: return_from_domain returned: spin */
 /* extra context lines for the share path */
 #define CAPSTONE_TAG_DOMN 0x444f4d4e /* "DOMN" dom_n */
+#define CAPSTONE_TAG_RGNF 0x52474e46 /* "RGNF" region table full: a carve REFUSED before touching the pool (Phase B item 1), not a fault */
 #define CAPSTONE_TAG_RGNN 0x52474e4e /* "RGNN" region_n */
 #define CAPSTONE_TAG_RGID 0x52474944 /* "RGID" region_id */
 #define CAPSTONE_TAG_CPID 0x43504944 /* "CPID" cpmp index */
@@ -175,9 +176,13 @@
  * the FPGA build (capstone-c grows the frame for the unused parameter and shifts every spill
  * offset -- measured). The call sites use this macro; the definitions stay verbatim below. */
 #ifdef CAPSTONE_TARGET_FPGA
+/* plain statements, no do/while: capstone-c turns the wrapper into a bnez-x0 skeleton and
+   re-allocates registers, which cost the QEMU arm its byte-identity for nothing */
+#define REPORT_REGION_OVERFLOW() capstone_report(CAPSTONE_TAG_RGNF, CAPSTONE_ERR_REGION_OVERFLOW); capstone_report(CAPSTONE_TAG_RGNN, region_n); capstone_uart_flush()
 #define MAKE_HOLE(i, tag) make_hole((i))
 #else
 #define MAKE_HOLE(i, tag) make_hole((i), (tag))
+#define REPORT_REGION_OVERFLOW() C_PRINT(0x1237); C_PRINT(region_n)
 #endif
 #define capstone_error_tag(tag, err_code) do { C_PRINT(CAPSTONE_ERR_STARTER); C_PRINT(err_code); capstone_report((tag), (err_code)); while(1); } while(0)
 #define capstone_error(err_code) capstone_error_tag(CAPSTONE_TAG_CERR, (err_code))
@@ -895,18 +900,6 @@ static unsigned create_domain(unsigned base_addr, unsigned code_size,
            check (which is where this belongs) catch it earlier next time. */
         capstone_error(0xB10B);
     }
-    /* DIAGNOSTIC MAGIC (2026-07-29, C-13). Written UNCONDITIONALLY, before the copy
-       guard, into the first word of dom_data -- the exact word the blobpeek probe reads.
-       It discriminates the only two surviving hypotheses, which need opposite fixes:
-         domain reads 0x5A5A5A5A -> the monitor CAN write where the domain reads, so the
-                                    destination is fine and the COPY GUARD or the loop is
-                                    what fails (the guard is silent when false)
-         domain reads 0          -> the monitor's dom_data is NOT the region the domain's
-                                    sp covers: a genuine destination mismatch
-       Board measurement says dom_data.base sits 96 bytes below where this source computes
-       it (sp.base mod 128K = 5632, source implies code_size+DOMAIN_DATA_SIZE = 5728), and
-       96 is exactly the blob size -- unexplained, hence measuring instead of deriving.
-       REMOVE once C-13 is closed. */
     if(code_size > gpoff
        && tot_size > split_size + data_off) {
         /* Index in 16-BYTE units, not 8. These are `__linear void *`, so subscripting
@@ -1293,14 +1286,14 @@ static unsigned call_domain_with_cap(unsigned dom_id, unsigned base, unsigned le
 }
 
 static unsigned create_region(unsigned base, unsigned len) {
-#ifdef CAPSTONE_TARGET_QEMU
-    /* needs up to two slots (a right-hand fragment, then the region): refuse BEFORE carving */
+    /* needs up to two slots (a right-hand fragment, then the region): refuse BEFORE carving.
+       Phase B item 1 (2026-09-08): shared by both targets; the board used to carve first and
+       report RGNO after, leaving a half-completed split behind. The host sees -1 (REGION_CREATE
+       failed) instead of a monitor spin. */
     if(region_n + 2 > CAPSTONE_MAX_REGION_N) {
-        C_PRINT(0x1237);
-        C_PRINT(region_n);
+        REPORT_REGION_OVERFLOW();
         return -1;
     }
-#endif
     void *region = split_out_cap(base, len, 1);
 
     if(region_n >= CAPSTONE_MAX_REGION_N) {
@@ -1529,14 +1522,11 @@ static unsigned share_child_region(unsigned dom_id, unsigned parent_id,
     if(region_live[parent_id] == 0) {
         return -1;
     }
-#ifdef CAPSTONE_TARGET_QEMU
-    /* needs up to two slots (head, tail): refuse BEFORE touching the parent */
+    /* needs up to two slots (head, tail): refuse BEFORE touching the parent (item 1, shared) */
     if(region_n + 2 > CAPSTONE_MAX_REGION_N) {
-        C_PRINT(0x1237);
-        C_PRINT(region_n);
+        REPORT_REGION_OVERFLOW();
         return -1;
     }
-#endif
 
     __dom void *d = domains[dom_id];
 
