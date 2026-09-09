@@ -75,7 +75,15 @@ _cap_trap_entry:
 
     call handle_trap_ecall
     mv a1, a0
-    li a0, 0
+    # M-3 (2026-09-09): error = -1 iff the handler's value is -1, else 0. Every handler signals
+    # failure by returning (unsigned)-1 (refused create/share/call, out-of-range id); it used to
+    # arrive as a VALUE with error hardwired to 0, so the module's failure paths -- the
+    # free_pages on a refused REGION_CREATE among them -- were dead code. A domain's own return
+    # value of -1 (DOM_CALL) now also reads as an error; no shipped domain returns it.
+    # t0 is free here: mcause was consumed above and the CCSRRW below rewrites it.
+    addi t0, a0, 1
+    seqz a0, t0
+    neg a0, a0
 
     CCSRRW(t0, CCSR_CEPC, x0)
     addi t0, t0, 4
