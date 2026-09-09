@@ -1070,6 +1070,11 @@ static unsigned call_domain(unsigned dom_id) {
 
 
 static unsigned call_domain_with_cap(unsigned dom_id, unsigned base, unsigned len, unsigned cursor) {
+    /* M-4 (2026-09-09): the same bound call_domain has. An out-of-range dom_id used to index
+       domains[] past its end (a silent wrong answer, then a carve for nothing); refuse first. */
+    if(dom_id >= dom_n) {
+        return -1;
+    }
     void *region = split_out_cap(base, len, 1);
     __asm__ ("scc(%0, %1, %2)" : "=r"(region) : "r"(region), "r"(cursor));
 
