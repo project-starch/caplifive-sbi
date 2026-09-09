@@ -239,6 +239,11 @@ unsigned* caller_buf;
 unsigned smode_initialised;
 /* saved context of S-mode at the last SBI dom-return call */
 unsigned *smode_saved_context;
+/* Q-06 (2026-09-09): the base of every region that arrived through dpi_share_region, as a SCALAR, so a
+   re-share of the same pages can be matched WITHOUT reading the capability it replaces -- that capability
+   may be revoked (untagged on QEMU) and reading its base is exactly the fault Q-06 reports. 0 = not a
+   shared-in region (bases are never 0). Declared after the last COMMON global (the FPGA-only reporting globals follow under their #ifdef). */
+unsigned region_shared_base[CAPSTONE_MAX_REGION_N];
 
 #ifdef CAPSTONE_TARGET_FPGA
 /* ---------------------------------------------------------------------------
@@ -561,6 +566,7 @@ unsigned make_hole(unsigned i) {
     }
     region_live[i] = 0;
     regions[i] = 0;
+    region_shared_base[i] = 0;
     capstone_report(CAPSTONE_TAG_HOLE, i);
     capstone_report(CAPSTONE_TAG_RGNN, region_n);
     return 0;
@@ -573,6 +579,7 @@ unsigned make_hole(unsigned i, unsigned tag) {
     }
     region_live[i] = 0;
     regions[i] = 0;
+    region_shared_base[i] = 0;
     C_PRINT(tag);
     C_PRINT(i);
     C_PRINT(region_n);
@@ -1893,6 +1900,35 @@ static void dpi_share_region(void *region) {
     /* I-4 progress DPIS: a DOMAIN shared a region back into the monitor (the reverse
        leg of the share path). value = region_n, i.e. the slot it lands in. */
     capstone_trace(CAPSTONE_TAG_DPIS, region_n);
+    /* Q-06 (2026-09-09): the SAME region can arrive again -- a borrow that the owner revoked and then
+       re-shared (the null-blk split module borrows its metadata region before every call). This used to
+       append a NEW id every time and leave the old id live, holding the revoked capability (in its CPMP
+       slot when the domain had touched the pages); the module addresses its regions by fixed id, so its
+       next query of the old id read the revoked slot back untagged and cap_base faulted (cause 24, QEMU).
+       Now a region whose base matches a live shared-in region REPLACES it under the same id -- into the
+       CPMP slot if it has one, else into regions[] -- and the table does not grow. The match is by the
+       scalar shadow, never by reading the capability being replaced. */
+    __linear void *incoming;
+    unsigned shared_base;
+    unsigned k;
+    unsigned found;
+    incoming = region;
+    shared_base = cap_base(incoming);
+    found = -1;
+    for(k = 0; k < region_n; k += 1) {
+        if(region_live[k] == 0)
+            continue;
+        if(region_shared_base[k] == shared_base)
+            found = k;
+    }
+    if(found != -1) {
+        if(region_cpmp[found] != -1)
+            write_cpmp(region_cpmp[found], incoming);
+        else
+            regions[found] = incoming;
+        capstone_trace(CAPSTONE_TAG_DPIS, found);
+        return;
+    }
     if(region_n >= CAPSTONE_MAX_REGION_N) {
         /* I-4 site RGNO: the region table is full. This used to write one past the
            end of regions[] and silently corrupt the globals laid out after it
@@ -1903,8 +1939,9 @@ static void dpi_share_region(void *region) {
         capstone_uart_flush();
         while(1);
     }
-    regions[region_n] = region;
+    regions[region_n] = incoming;
     region_live[region_n] = 1;
+    region_shared_base[region_n] = shared_base;
     region_n += 1;
 }
 
