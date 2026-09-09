@@ -88,15 +88,12 @@ _cap_trap_entry:
     CCSRRW(t0, CCSR_CEPC, x0)
     addi t0, t0, 4
     CCSRRW(x0, CCSR_CEPC, t0)
-#ifdef CAPSTONE_TARGET_FPGA
-    # KEPT: this fence.i follows a CCSRRW to cepc/cscratch. R-26 (ISSUES.md): the RTL lands
-    # such a write at commit with no pipeline flush, and a younger LDC/STC/CALL/RETURN reads the
-    # register combinationally; fence.i is the flush. The six other fence.i this file carried
-    # (trap entry, ecall dispatch, non-ecall path, register restore, pre-return) were removed
-    # 2026-09-08 after firmware-only board boots without them ran k800 + six BEEBS rungs at
-    # their oracles (Phase B item 8, monitor-unification.md).
-    fence.i
-#endif
+    # No fence.i after this CCSRRW any more (2026-09-09). R-26: the RTL used to land a CCSRRW at
+    # commit with no pipeline flush, so a younger LDC/STC/CALL/RETURN could read the old register;
+    # fence.i was the flush. Since 9d8797560 (in the flashed bitstream caplifive_r25r26r27_66c4e7517)
+    # every CCSRRW flushes the pipeline itself. Firmware without the four R-26 fence.i booted clean
+    # on that bitstream (sw46/sw47: k800 + six BEEBS rungs at their oracles, the R-25 probe last).
+    # A firmware for silicon WITHOUT the R-26 flush must put the fence.i back at the four sites.
     j return_to_sumode
 
 _handle_non_ecall:
@@ -180,9 +177,7 @@ return_to_sumode:
     # right before returning to S mode:
     # cscratch: sp  ->
     #      sp - 8 * 32 - 16  -> gp
-#ifdef CAPSTONE_TARGET_FPGA
-    fence.i
-#endif
+    # no fence.i after this CCSRRW since 2026-09-09 (R-26 flush in RTL; see the note above)
     mret
 
 call_into_smode:
@@ -193,9 +188,7 @@ call_into_smode:
     STC(gp, sp, -8 * 32 -16)
     CCSRRW(sp, CCSR_CSCRATCH, sp)
     li gp, 0
-#ifdef CAPSTONE_TARGET_FPGA
-    fence.i
-#endif
+    # no fence.i after this CCSRRW since 2026-09-09 (R-26 flush in RTL; see the note above)
     mret
 
 resume_smode:
