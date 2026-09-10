@@ -640,6 +640,8 @@ static void *split_out_cap(unsigned base, unsigned len, unsigned linear) {
 #else
     __linear void *mem_l;
     __linear void *mem_r;
+    unsigned fill_n;
+    unsigned fill_i;
     unsigned i;
     unsigned region_base, region_end;
 
@@ -652,6 +654,14 @@ static void *split_out_cap(unsigned base, unsigned len, unsigned linear) {
             mem_l = regions[i];
         region_base = cap_base(mem_l);
         region_end = cap_end(mem_l);
+        /* THE SITE WITH NO RE-SHARE. A revoked region stays region_live, so an unrelated later
+         * create_region whose range falls inside it picks this slot and SPLITs the handle -- and
+         * SPLIT demands LINEAR. Nothing in the share path protects this one, because nobody shared
+         * anything: the caller is just allocating. Reclaim it here for the same reason and by the
+         * same rule as the share path. */
+        if (cap_type(mem_l) == 3 /* CAP_TYPE_UNINIT */) {
+            C_RECLAIM_FILL(mem_l, fill_n, fill_i);
+        }
         if(base >= region_base && base + len <= region_end)
             break;
         if(region_cpmp[i] != -1)
@@ -1223,6 +1233,21 @@ static unsigned shared_region_annotated(unsigned dom_id, unsigned region_id, uns
     capstone_trace(CAPSTONE_TAG_BASE, cap_base(r));
     capstone_trace(CAPSTONE_TAG_ALEN, cap_end(r) - cap_base(r));
 
+    /* RECLAIM BEFORE THE BRANCHES, not inside one of them. A prior revoke can leave this handle
+     * UNINIT, and EVERY branch below then consumes it with an operation that demands LINEAR:
+     * REV_DEFAULT does an unguarded __mrev; REV_BORROWED an __mrev; REV_SHARED's type test simply
+     * fails, silently skipping its __delin AND its write-back; and REV_TRANSFERRED's type test is a
+     * hard while(1) on the FPGA target -- a WEDGE, not a trap. Reclaiming once here covers all four
+     * and cannot be forgotten by a fifth branch added later.
+     *
+     * (The first version of this change guarded only REV_BORROWED, which is the site a grep finds.
+     * The RTL lane's auditor named the other three before any of them reached a boot.)
+     *
+     * The trace above deliberately runs FIRST, so it still records the type revoke actually left. */
+    if (cap_type(r) == 3 /* CAP_TYPE_UNINIT */) {
+        C_RECLAIM_FILL(r, fill_n, fill_i);
+    }
+
     if (annotation_rev == CAPSTONE_ANNOTATION_REV_DEFAULT) {
         // capability type: non-linear; post-return revoke: yes
         __rev void *rev = __mrev(r);
@@ -1246,9 +1271,7 @@ static unsigned shared_region_annotated(unsigned dom_id, unsigned region_id, uns
          * them before reuse. Filling also walks the cursor to end, which is what csinit then
          * requires, so the two are one loop. Before R-30/R-31 the cursor arrived at end
          * already and csinit succeeded with no rewrite at all -- the disclosure this closes. */
-        if (cap_type(r) == 3 /* CAP_TYPE_UNINIT */) {
-            C_RECLAIM_FILL(r, fill_n, fill_i);
-        }
+        /* r is LINEAR here: reclaimed above, before the branches. */
         __rev void *rev = __mrev(r);
 
         if (region_cpmp[region_id] != -1) {
@@ -1543,6 +1566,9 @@ static unsigned pop_region(unsigned pop_num) {
 }
 
 static unsigned region_de_linear(unsigned region_id) {
+    __linear void *dr;
+    unsigned fill_n;
+    unsigned fill_i;
     if(region_id >= region_n) {
         return -1;
     }
@@ -1552,14 +1578,22 @@ static unsigned region_de_linear(unsigned region_id) {
         return -1;
     }
 
+    /* DELIN rejects UNINIT, so a region delinearised after a revoke must be reclaimed first --
+     * same reason as the share path. Declarations stay at function scope: capstone-c panics on a
+     * declaration inside a nested block. */
     if (region_cpmp[region_id] != -1) {
-        __linear void *r = read_cpmp(region_cpmp[region_id]);
-        void *r_delin = __delin(r);
-        write_cpmp(region_cpmp[region_id], r_delin);
+        dr = read_cpmp(region_cpmp[region_id]);
+        if (cap_type(dr) == 3 /* CAP_TYPE_UNINIT */) {
+            C_RECLAIM_FILL(dr, fill_n, fill_i);
+        }
+        write_cpmp(region_cpmp[region_id], __delin(dr));
     }
     else {
-        __linear void *r = regions[region_id];
-        regions[region_id] = __delin(r);
+        dr = regions[region_id];
+        if (cap_type(dr) == 3 /* CAP_TYPE_UNINIT */) {
+            C_RECLAIM_FILL(dr, fill_n, fill_i);
+        }
+        regions[region_id] = __delin(dr);
     }
 
     return 0;
