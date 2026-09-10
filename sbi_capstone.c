@@ -149,6 +149,9 @@
 #define CAPSTONE_TAG_AREV 0x41524556 /* "AREV" annotation_rev */
 #define CAPSTONE_TAG_APRM 0x4150524d /* "APRM" annotation_perm */
 #define CAPSTONE_TAG_CTYP 0x43545950 /* "CTYP" capability type (0 = linear) */
+#define CAPSTONE_TAG_RCLM 0x52434c4d /* "RCLM" reclaim: running count, then bytes filled */
+#define CAPSTONE_TAG_RCSH 0x52435348 /* "RCSH" reclaim SHORTFALL: the fill did not reach end */
+#define CAPSTONE_TAG_RCPR 0x52435052 /* "RCPR" reclaim PRECONDITION: cursor was not at base */
 #define CAPSTONE_TAG_DPIF 0x44504946 /* "DPIF" DPI function code */
 #define CAPSTONE_ERR_SHARE_BAD_ID    0xe007
 #define CAPSTONE_ERR_SHARE_BAD_REV   0xe008
@@ -195,6 +198,7 @@
 #define cap_base(cap) __capfield((cap), 3)
 #define cap_end(cap) __capfield((cap), 4)
 #define cap_type(cap) __capfield((cap), 1)
+#define cap_cursor(cap) __capfield((cap), 2)
 /* THE RECLAIM FILL (R-30/R-31 firmware half).
  *
  * After R-31, revoking a linear borrow of a WRITABLE region returns UNINIT positioned at BASE, and
@@ -234,10 +238,46 @@
  * line and does not assemble. Checked by reading the generated output, which is the only place that
  * shows it -- the compiler exits 0 either way. ';' is a statement separator for the assembler and
  * '#' is the comment character, so nothing here is swallowed. */
+/* THE FILL PROVES ITSELF BEFORE IT CALLS INIT. After the loop, read the cursor (LCC field 2) and the
+ * end (field 4) back off the capability and only run csinit if they meet; `scratch` comes out as the
+ * SHORTFALL, zero on success. Without this a wrong loop surfaces as an INIT trap whose cause says
+ * "illegal operand value" and nothing about why, inside a monitor path, on the board -- the least
+ * informative failure available. With it the monitor knows the number of bytes missing, which is also
+ * what decides whether the SHRINK recovery applies: shrinking `end` DOWN to the reached cursor works,
+ * but only if at least one store completed, because SHRINK raises on cursor >= end.
+ * (RTL lane's suggestion, 2026-09-10; the project's own "name the observation that proves the
+ * condition" rule, pointed at firmware.)
+ * On the failure path csinit is NOT executed and `dest` is left as x0, so the caller must test the
+ * shortfall BEFORE using dest. */
 #define C_RECLAIM(dest, scratch, cap, n) __asm__ volatile( \
-    "mv %1, %3; 1: beq %1, x0, 2f; stc(x0, %2, 0); addi %1, %1, -1; j 1b; 2: .insn r 0x5b, 0x1, 0x9, %0, %2, x0" \
+    "mv %1, %3; 1: beq %1, x0, 2f; stc(x0, %2, 0); addi %1, %1, -1; j 1b; " \
+    "2: lcc(%0, %2, 2); lcc(%1, %2, 4); sub %1, %1, %0; mv %0, x0; " \
+    "bne %1, x0, 3f; .insn r 0x5b, 0x1, 0x9, %0, %2, x0; 3:" \
     : "=r"(dest), "=r"(scratch) : "r"(cap), "r"(n))
-#define C_RECLAIM_FILL(cap, n, i) n = (cap_end(cap) - cap_base(cap)) >> 4; C_RECLAIM(cap, i, cap, n)
+/* n comes in as the store count and comes back as the SHORTFALL in bytes (0 = the fill reached end).
+ * i receives the reclaimed LINEAR capability. Caller checks n before using i. */
+#define C_RECLAIM_FILL(cap, n, i) n = (cap_end(cap) - cap_base(cap)) >> 4; C_RECLAIM(i, n, cap, n)
+/* The whole reclaim, including the counter the first post-flash boot needs. Counts RECLAIMS -- the
+ * guard fired and the fill RAN -- not revokes: a counter placed before the type test would report the
+ * allocation-shaped number again and look like a measurement. */
+/* PRECONDITION, the mirror of the postcondition below. The loop's bound is (end - base) / 16, so it
+ * assumes the cursor starts AT BASE. A handle arriving with the cursor at END is caught loudly by the
+ * first store violating STC's bound -- that is the property that makes the gate meaningful. But a
+ * cursor arriving ANYWHERE ELSE in the region overshoots instead: the loop runs a full region's worth
+ * of stores from a partial start and the LAST of them fault out of bounds, having already overwritten
+ * part of the region. That is the same uninformative monitor fault the postcondition exists to
+ * prevent, arrived at from the other end.
+ *
+ * Neither lane can currently show a non-base cursor is reachable -- revoke sets base in both
+ * implementations, and whether any share or return path can deposit a partially filled UNINIT handle
+ * into the region table is untraced. THAT IS THE REASON TO CHECK RATHER THAN NOT TO: the check makes
+ * the unanswered question stop mattering, for one comparison. (RTL lane, 2026-09-10.) */
+#define C_DO_RECLAIM(cap, n, i) \
+    if (cap_cursor(cap) != cap_base(cap)) { capstone_report(CAPSTONE_TAG_RCPR, cap_cursor(cap) - cap_base(cap)); capstone_report(CAPSTONE_TAG_BASE, cap_base(cap)); capstone_uart_flush(); while(1); } \
+    C_RECLAIM_FILL(cap, n, i); \
+    if (n != 0) { capstone_report(CAPSTONE_TAG_RCSH, n); capstone_report(CAPSTONE_TAG_BASE, cap_base(cap)); capstone_uart_flush(); while(1); } \
+    cap = i; \
+    reclaim_count += 1
 #ifdef CAPSTONE_DEBUG_ENABLE
 #define debug_counter_inc(counter_no, delta) __asm__ volatile(".insn r 0x5b, 0x1, 0x45, x0, %0, %1" :: "r"(counter_no), "r"(delta))
 #define debug_counter_tick(counter_no) debug_counter_inc((counter_no), 1)
@@ -265,6 +305,10 @@ unsigned *mtime;
 unsigned *mtimecmp;
 __dom void *domains[CAPSTONE_MAX_DOM_N];
 void *regions[CAPSTONE_MAX_REGION_N];
+/* how many times the reclaim fill actually RAN. The cost of the fill is bytes-per-reclaim times
+   reclaims-per-boot, and only the first factor is known; this measures the second at zero marginal
+   cost on a boot that is happening anyway. */
+unsigned reclaim_count;
 /* the cpmp entry each region is associated with; -1 if unassociated */
 unsigned region_cpmp[CAPSTONE_MAX_REGION_N];
 /* 1 if the slot holds a live region; 0 for a HOLE (consumed by an exact fit) or a never-used
@@ -641,7 +685,7 @@ static void *split_out_cap(unsigned base, unsigned len, unsigned linear) {
     __linear void *mem_l;
     __linear void *mem_r;
     unsigned fill_n;
-    unsigned fill_i;
+    __linear void *fill_i;
     unsigned i;
     unsigned region_base, region_end;
 
@@ -660,7 +704,7 @@ static void *split_out_cap(unsigned base, unsigned len, unsigned linear) {
          * anything: the caller is just allocating. Reclaim it here for the same reason and by the
          * same rule as the share path. */
         if (cap_type(mem_l) == 3 /* CAP_TYPE_UNINIT */) {
-            C_RECLAIM_FILL(mem_l, fill_n, fill_i);
+            C_DO_RECLAIM(mem_l, fill_n, fill_i);
         }
         if(base >= region_base && base + len <= region_end)
             break;
@@ -1188,7 +1232,7 @@ static unsigned shared_region_annotated(unsigned dom_id, unsigned region_id, uns
     /* reclaim-fill counters -- function scope, because capstone-c panics on a declaration
        inside a nested block (dag_builder.rs:1258) */
     unsigned fill_n;
-    unsigned fill_i;
+    __linear void *fill_i;
     t_dom = dom_id;
     t_rgn = region_id;
     t_prm = annotation_perm;
@@ -1233,6 +1277,23 @@ static unsigned shared_region_annotated(unsigned dom_id, unsigned region_id, uns
     capstone_trace(CAPSTONE_TAG_BASE, cap_base(r));
     capstone_trace(CAPSTONE_TAG_ALEN, cap_end(r) - cap_base(r));
 
+    /* RECLAIM COUNT, reported UNCONDITIONALLY on every share rather than inside the guard, and
+     * flushed. The count is what answers "how often does a reclaim actually happen", which is the
+     * factor the fill's cost turns on and the only one nobody has measured.
+     *
+     * WHY IT IS HERE AND NOT AT THE INCREMENT. Reported only when a reclaim fires, the tag is ABSENT
+     * on the current bitstream -- where revoke returns LINEAR and the guard never fires -- so there
+     * is no way to test that the number can be READ until the one boot where it matters. Emitted on
+     * every share, a pre-flash boot shows `RCLM:00000000`: zero reclaims, and the reporting path
+     * proven. Post-flash the same line climbs. The positive control costs nothing and happens first.
+     *
+     * The flush is not decoration. A count is most useful at teardown, which is exactly where output
+     * gets truncated -- REPORT_REGION_OVERFLOW flushes for that reason -- and a number cut off
+     * mid-line is worse than no number. (RTL lane, 2026-09-10: a counter that cannot be read produces
+     * a number rather than silence, so show it producing one you have already seen.) */
+    capstone_report(CAPSTONE_TAG_RCLM, reclaim_count);
+    capstone_uart_flush();
+
     /* RECLAIM BEFORE THE BRANCHES, not inside one of them. A prior revoke can leave this handle
      * UNINIT, and EVERY branch below then consumes it with an operation that demands LINEAR:
      * REV_DEFAULT does an unguarded __mrev; REV_BORROWED an __mrev; REV_SHARED's type test simply
@@ -1245,7 +1306,7 @@ static unsigned shared_region_annotated(unsigned dom_id, unsigned region_id, uns
      *
      * The trace above deliberately runs FIRST, so it still records the type revoke actually left. */
     if (cap_type(r) == 3 /* CAP_TYPE_UNINIT */) {
-        C_RECLAIM_FILL(r, fill_n, fill_i);
+        C_DO_RECLAIM(r, fill_n, fill_i);
     }
 
     if (annotation_rev == CAPSTONE_ANNOTATION_REV_DEFAULT) {
@@ -1389,7 +1450,7 @@ static unsigned share_child_region(unsigned dom_id, unsigned parent_id,
                                    unsigned offset, unsigned len, unsigned perm) {
     /* reclaim-fill counters -- function scope, see the note at the other call site */
     unsigned fill_n;
-    unsigned fill_i;
+    __linear void *fill_i;
     if(dom_id >= dom_n || parent_id >= region_n) {
         return -1;
     }
@@ -1418,7 +1479,7 @@ static unsigned share_child_region(unsigned dom_id, unsigned parent_id,
      * sees a LIN input -- same step as REV_BORROWED above, and the fill is the security half
      * for the same reason: the parent still holds the borrower's bytes. */
     if (cap_type(r) == 3 /* CAP_TYPE_UNINIT */) {
-        C_RECLAIM_FILL(r, fill_n, fill_i);
+        C_DO_RECLAIM(r, fill_n, fill_i);
     }
 
     unsigned pbase = cap_base(r);
@@ -1568,7 +1629,7 @@ static unsigned pop_region(unsigned pop_num) {
 static unsigned region_de_linear(unsigned region_id) {
     __linear void *dr;
     unsigned fill_n;
-    unsigned fill_i;
+    __linear void *fill_i;
     if(region_id >= region_n) {
         return -1;
     }
@@ -1584,14 +1645,14 @@ static unsigned region_de_linear(unsigned region_id) {
     if (region_cpmp[region_id] != -1) {
         dr = read_cpmp(region_cpmp[region_id]);
         if (cap_type(dr) == 3 /* CAP_TYPE_UNINIT */) {
-            C_RECLAIM_FILL(dr, fill_n, fill_i);
+            C_DO_RECLAIM(dr, fill_n, fill_i);
         }
         write_cpmp(region_cpmp[region_id], __delin(dr));
     }
     else {
         dr = regions[region_id];
         if (cap_type(dr) == 3 /* CAP_TYPE_UNINIT */) {
-            C_RECLAIM_FILL(dr, fill_n, fill_i);
+            C_DO_RECLAIM(dr, fill_n, fill_i);
         }
         regions[region_id] = __delin(dr);
     }
