@@ -186,13 +186,58 @@
 #endif
 #define capstone_error_tag(tag, err_code) do { C_PRINT(CAPSTONE_ERR_STARTER); C_PRINT(err_code); capstone_report((tag), (err_code)); while(1); } while(0)
 #define capstone_error(err_code) capstone_error_tag(CAPSTONE_TAG_CERR, (err_code))
-/* csinit rd, rs1, rs2: UNINIT(cursor==end) -> LIN with cursor = base + rs2.
+/* csinit rd, rs1, rs2: UNINIT -> LIN with cursor = base + rs2.
  * No __init builtin exists, so emit the instruction directly (funct7 0x9),
- * same style as C_PRINT/C_GEN_CAP. */
+ * same style as C_PRINT/C_GEN_CAP.
+ * PRECONDITION CHANGED with R-30: csinit used to require cursor == end and now requires the cursor
+ * to have REACHED end. Nothing here changes; what changes is that the caller must FILL first. */
 #define C_INIT(dest, cap, offset) __asm__(".insn r 0x5b, 0x1, 0x9, %0, %1, %2" : "=r"(dest) : "r"(cap), "r"(offset))
 #define cap_base(cap) __capfield((cap), 3)
 #define cap_end(cap) __capfield((cap), 4)
 #define cap_type(cap) __capfield((cap), 1)
+/* THE RECLAIM FILL (R-30/R-31 firmware half).
+ *
+ * After R-31, revoking a linear borrow of a WRITABLE region returns UNINIT positioned at BASE, and
+ * after R-30 csinit refuses a cursor that has not reached END. So the owner must overwrite the
+ * borrower's data before reuse -- which is the security property the UNINIT type exists to force,
+ * and which the old cursor-at-end behaviour silently skipped.
+ *
+ * stc with imm 0 through an UNINIT capability stores 16 bytes AND advances the cursor, so ONE loop
+ * both zeroes the region and walks the cursor to end. There is no cheaper route: stc is the only
+ * instruction that advances an UNINIT cursor (a scalar store traps UNEXPECTED_CAP_TYPE), and
+ * cincoffset/scc reject UNINIT outright, so the cursor cannot be repositioned by hand.
+ *
+ * `stc` resolves against the __CAPSTONE_C_BUILTIN__ preamble capstone-c writes into the generated
+ * .c.S (stc(rs1, rs2, offset)), exactly as C_SET_CURSOR relies on `scc`. x0 reads as the null
+ * capability, so this stores 16 zero bytes with the tag clear.
+ *
+ * WHY THE LOOP AND THE csinit ARE ONE ASM BLOCK, and not a C loop over a store macro. The cursor
+ * advance happens IN THE REGISTER, so expressing it as a C value needs a read-write asm operand --
+ * and capstone-c supports exactly two output constraints, Overwrite ("=r") and ReadWrite, the
+ * second of which PANICS the compiler: `ReadWrite asm output unsupported`, src/codegen.rs:1500.
+ * Tried, and that is the error it gives. With only "=r" and "r" available, a C-level loop would
+ * have to move the advanced capability out each iteration, which needs movc on an UNINIT operand --
+ * an extra unknown on the linear-family rules. Keeping fill and csinit in one block sidesteps all
+ * of it: the capability is advanced inside the block and only the RESULT crosses back into C.
+ *
+ * %1 is advanced in place and the compiler is not told, which is safe ONLY because nothing reads
+ * `cap` afterwards -- both call sites overwrite it with the result. %0 and %3 are real outputs, so
+ * the scratch counter gets a register the allocator owns rather than a hard-coded t0 (this is a
+ * merged register file: tN IS the capability register, and scratching one by hand has cost readings
+ * before). Local numeric labels are reusable, so the macro can appear more than once per function.
+ *
+ * The counters are passed in because capstone-c panics on a declaration inside a nested block
+ * (dag_builder.rs:1258), so they must be function-scope at the call site.
+ *
+ * SEPARATED BY ';' AND NOT '\n': capstone-c does NOT interpret escapes in an asm template, it copies
+ * the template through verbatim, so "\n" reaches the .c.S as the two characters backslash-n on one
+ * line and does not assemble. Checked by reading the generated output, which is the only place that
+ * shows it -- the compiler exits 0 either way. ';' is a statement separator for the assembler and
+ * '#' is the comment character, so nothing here is swallowed. */
+#define C_RECLAIM(dest, scratch, cap, n) __asm__ volatile( \
+    "mv %1, %3; 1: beq %1, x0, 2f; stc(x0, %2, 0); addi %1, %1, -1; j 1b; 2: .insn r 0x5b, 0x1, 0x9, %0, %2, x0" \
+    : "=r"(dest), "=r"(scratch) : "r"(cap), "r"(n))
+#define C_RECLAIM_FILL(cap, n, i) n = (cap_end(cap) - cap_base(cap)) >> 4; C_RECLAIM(cap, i, cap, n)
 #ifdef CAPSTONE_DEBUG_ENABLE
 #define debug_counter_inc(counter_no, delta) __asm__ volatile(".insn r 0x5b, 0x1, 0x45, x0, %0, %1" :: "r"(counter_no), "r"(delta))
 #define debug_counter_tick(counter_no) debug_counter_inc((counter_no), 1)
@@ -1130,6 +1175,10 @@ static unsigned shared_region_annotated(unsigned dom_id, unsigned region_id, uns
     unsigned t_rgn;
     unsigned t_prm;
     unsigned t_rev;
+    /* reclaim-fill counters -- function scope, because capstone-c panics on a declaration
+       inside a nested block (dag_builder.rs:1258) */
+    unsigned fill_n;
+    unsigned fill_i;
     t_dom = dom_id;
     t_rgn = region_id;
     t_prm = annotation_perm;
@@ -1188,13 +1237,17 @@ static unsigned shared_region_annotated(unsigned dom_id, unsigned region_id, uns
     }
     else if (annotation_rev == CAPSTONE_ANNOTATION_REV_BORROWED) {
         // capability type: linear; post-return revoke: yes
-        /* Re-share after a prior revoke: revoking the linear borrow left the
-         * retained handle UNINIT (with cursor==end, per helper_csrevoke). mrev
-         * requires a LIN input, so re-initialise first: csinit(offset 0) ->
-         * LIN, cursor=base. On the first share r is already LIN, so skip. This
-         * is the explicit owner reclaim step for a linear borrow. */
+        /* Re-share after a prior revoke: revoking the linear borrow left the retained handle
+         * UNINIT. mrev requires a LIN input, so reclaim first. On the first share r is
+         * already LIN, so this is skipped.
+         *
+         * THE FILL IS THE SECURITY STEP, not a workaround for csinit's precondition. Revoke
+         * hands back a region still holding the BORROWER's bytes; the owner must overwrite
+         * them before reuse. Filling also walks the cursor to end, which is what csinit then
+         * requires, so the two are one loop. Before R-30/R-31 the cursor arrived at end
+         * already and csinit succeeded with no rewrite at all -- the disclosure this closes. */
         if (cap_type(r) == 3 /* CAP_TYPE_UNINIT */) {
-            C_INIT(r, r, 0);
+            C_RECLAIM_FILL(r, fill_n, fill_i);
         }
         __rev void *rev = __mrev(r);
 
@@ -1311,6 +1364,9 @@ static unsigned shared_region_annotated(unsigned dom_id, unsigned region_id, uns
  * here is __split out of the parent's own cap. */
 static unsigned share_child_region(unsigned dom_id, unsigned parent_id,
                                    unsigned offset, unsigned len, unsigned perm) {
+    /* reclaim-fill counters -- function scope, see the note at the other call site */
+    unsigned fill_n;
+    unsigned fill_i;
     if(dom_id >= dom_n || parent_id >= region_n) {
         return -1;
     }
@@ -1335,10 +1391,11 @@ static unsigned share_child_region(unsigned dom_id, unsigned parent_id,
         r = regions[parent_id];
     }
 
-    /* A prior revoke may have left the retained parent handle UNINIT; re-init so
-     * __mrev sees a LIN input (same reclaim step as REV_BORROWED). */
+    /* A prior revoke may have left the retained parent handle UNINIT; reclaim it so __mrev
+     * sees a LIN input -- same step as REV_BORROWED above, and the fill is the security half
+     * for the same reason: the parent still holds the borrower's bytes. */
     if (cap_type(r) == 3 /* CAP_TYPE_UNINIT */) {
-        C_INIT(r, r, 0);
+        C_RECLAIM_FILL(r, fill_n, fill_i);
     }
 
     unsigned pbase = cap_base(r);
