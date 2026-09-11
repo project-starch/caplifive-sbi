@@ -20,6 +20,12 @@
    briefly used 1/2 and was reverted; nothing target-specific remains here). */
 #define CAP_TYPE_LINEAR  0
 #define CAP_TYPE_NONLIN  1
+/* REV is 2 on the READ side, which is the only side this file sees. cap_type() below is
+   __capfield(cap, 1) -> LCC selector 1, and the RTL's selector-1 case returns cap_type - 1,
+   so software gets LINEAR 0 / NONLIN 1 / REV 2 / UNINIT 3 on both targets. The raw enum in
+   asm_insn.h (REV 3, UNINIT 4) is the WRITE side, what CAPTYPE takes. Taking a constant from
+   the wrong side of that line has already cost a board boot. */
+#define CAP_TYPE_REV     2
 
 #define CAPENTER(rs1, rs2) .insn r 0x5b, 0x1, 0xd, x0, rs1, rs2
 #define SETCAPMEM(reg) .insn r 0x5b, 0x1, 0x41, x0, reg, x0

@@ -1581,7 +1581,31 @@ static unsigned share_region(unsigned dom_id, unsigned region_id) {
     return 0;
 }
 
+/* M-6. Returns 0 revoked, 2 nothing to revoke, -1 refused.
+ *
+ * The handle here is a REV only after a RETAINING share: REV_DEFAULT (:1320) and REV_BORROWED
+ * (:1342) store one, and share_child_region (:1521) does. Nothing else does. create_region stores
+ * what split_out_cap returned, which is LINEAR by construction -- split_out_cap ends in a check
+ * that spins forever if it is not -- and REV_SHARED stores a delinearised NONLIN. Passing either
+ * to csrevoke aborts QEMU on its `type == CAP_TYPE_REV` assertion and raises UNEXPECTED_CAP_TYPE
+ * on silicon, INSIDE M-mode, into a trap entry with no mstatus.MPP check and no domain to return
+ * to. Reachable from an unprivileged ioctl: /dev/capstone is mode 0666.
+ *
+ * The test is on BOTH arms deliberately. Which one runs depends on region_cpmp[], preset to 0/1/2
+ * for the first three ids by cap_env_init and assigned by swap_cpmp on any access fault into a
+ * region, so a guard on one arm fixes nothing.
+ *
+ * "Nothing to revoke" is 2 rather than 0 so that neither caller is lied to: the kernel module's
+ * release path treats it as permission to pop, because for a never-shared region the monitor holds
+ * the only capability and there is genuinely nothing outstanding to invalidate -- which is what a
+ * release of a SHARED region already does after its revoke. A direct REGION_REVOKE ecall gets the 2
+ * and can tell the difference between "revoked" and "there was nothing there".
+ *
+ * Declarations stay at function scope: capstone-c panics on a declaration inside a nested block. */
 static unsigned revoke_region(unsigned region_id) {
+    __rev void *rev;
+    void *r;
+
     if(region_id >= region_n) {
         return -1;
     }
@@ -1592,13 +1616,19 @@ static unsigned revoke_region(unsigned region_id) {
     }
 
     if (region_cpmp[region_id] != -1) {
-        __rev void *rev = read_cpmp(region_cpmp[region_id]);
-        void *r = __revoke(rev);
+        rev = read_cpmp(region_cpmp[region_id]);
+        if (cap_type(rev) != CAP_TYPE_REV) {
+            return 2;
+        }
+        r = __revoke(rev);
         write_cpmp(region_cpmp[region_id], r);
     }
     else {
-        __rev void *rev = regions[region_id];
-        void *r = __revoke(rev);
+        rev = regions[region_id];
+        if (cap_type(rev) != CAP_TYPE_REV) {
+            return 2;
+        }
+        r = __revoke(rev);
         regions[region_id] = r;
     }
 
