@@ -152,6 +152,11 @@
 #define CAPSTONE_TAG_RCLM 0x52434c4d /* "RCLM" reclaim: running count, then bytes filled */
 #define CAPSTONE_TAG_RCSH 0x52435348 /* "RCSH" reclaim SHORTFALL: the fill did not reach end */
 #define CAPSTONE_TAG_RCPR 0x52435052 /* "RCPR" reclaim PRECONDITION: cursor was not at base */
+/* The two the sw60 shortfall could not be read without. Both are OFFSETS FROM BASE, not addresses:
+ * they stay small, they need no 64-bit report, and RCEN - RCCU must equal RCSH -- an instrument that
+ * checks itself, so a wrong reading shows up as an inconsistency rather than as a plausible number. */
+#define CAPSTONE_TAG_RCEN 0x5243454e /* "RCEN" end - base: the capability's TRUE size */
+#define CAPSTONE_TAG_RCCU 0x52434355 /* "RCCU" cursor - base: how far the fill actually got */
 #define CAPSTONE_TAG_DPIF 0x44504946 /* "DPIF" DPI function code */
 #define CAPSTONE_ERR_SHARE_BAD_ID    0xe007
 #define CAPSTONE_ERR_SHARE_BAD_REV   0xe008
@@ -275,7 +280,9 @@
 #define C_DO_RECLAIM(cap, n, i) \
     if (cap_cursor(cap) != cap_base(cap)) { capstone_report(CAPSTONE_TAG_RCPR, cap_cursor(cap) - cap_base(cap)); capstone_report(CAPSTONE_TAG_BASE, cap_base(cap)); capstone_uart_flush(); while(1); } \
     C_RECLAIM_FILL(cap, n, i); \
-    if (n != 0) { capstone_report(CAPSTONE_TAG_RCSH, n); capstone_report(CAPSTONE_TAG_BASE, cap_base(cap)); capstone_uart_flush(); while(1); } \
+    if (n != 0) { capstone_report(CAPSTONE_TAG_RCSH, n); capstone_report(CAPSTONE_TAG_BASE, cap_base(cap)); \
+                  capstone_report(CAPSTONE_TAG_RCEN, cap_end(cap) - cap_base(cap)); capstone_report(CAPSTONE_TAG_RCCU, cap_cursor(cap) - cap_base(cap)); \
+                  capstone_uart_flush(); while(1); } \
     cap = i; \
     reclaim_count += 1
 #ifdef CAPSTONE_DEBUG_ENABLE
