@@ -258,7 +258,24 @@
     "mv %1, %3; 1: beq %1, x0, 2f; stc(x0, %2, 0); addi %1, %1, -1; j 1b; " \
     "2: lcc(%0, %2, 2); lcc(%1, %2, 4); sub %1, %1, %0; mv %0, x0; " \
     "bne %1, x0, 3f; .insn r 0x5b, 0x1, 0x9, %0, %2, x0; 3:" \
-    : "=r"(dest), "=r"(scratch) : "r"(cap), "r"(n))
+    : "=&r"(dest), "=&r"(scratch) : "r"(cap), "r"(n))
+/* BOTH OUTPUTS ARE EARLY-CLOBBER, and the '&' is load-bearing rather than decorative. Without it the
+ * compiler may allocate an output over %2 (the capability), which is live to the very end of the
+ * template: %1 is written by the FIRST instruction (`mv %1, %3`) while %2 has not been read yet, and
+ * %0 is written by `lcc(%0, %2, 2)` one instruction before `lcc(%1, %2, 4)` still needs %2. An
+ * overlap destroys the capability mid-template and the `end` read returns garbage.
+ * It had not bitten: all five shipped sites allocate dest/scratch/cap to t0/a1/a2, disjoint, checked
+ * by decoding the linked firmware rather than by trusting the constraint. That is luck, and luck that
+ * two added reports in the halting branch could have changed. (Hazard named by the RTL lane
+ * 2026-09-12; verified and fixed here rather than left resting on allocation.)
+ *
+ * The INPUT-only "r"(cap) is deliberate and is NOT a second instance of the same bug, but it is only
+ * safe for a reason worth writing down: the hardware advances the cursor in the register, so the
+ * compiler's view of `cap` after the template is by-the-constraints stale. capstone-c's linear
+ * discipline saves it anyway -- a capability is written back to its home slot after every use -- and
+ * all five sites were verified to store the post-fill capability home and reload it from that exact
+ * slot before RCEN/RCCU read it. If that discipline ever changes, RCCU silently reads 0 and RCEN
+ * reads the pre-fill end; the self-check (RCEN - RCCU == RCSH) is what would catch it. */
 /* n comes in as the store count and comes back as the SHORTFALL in bytes (0 = the fill reached end).
  * i receives the reclaimed LINEAR capability. Caller checks n before using i. */
 #define C_RECLAIM_FILL(cap, n, i) n = (cap_end(cap) - cap_base(cap)) >> 4; C_RECLAIM(i, n, cap, n)
