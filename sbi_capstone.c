@@ -157,6 +157,11 @@
  * checks itself, so a wrong reading shows up as an inconsistency rather than as a plausible number. */
 #define CAPSTONE_TAG_RCEN 0x5243454e /* "RCEN" end - base: the capability's TRUE size */
 #define CAPSTONE_TAG_RCCU 0x52434355 /* "RCCU" cursor - base: how far the fill actually got */
+/* "RCRE" the fill COMPLETED but the re-encoded `end` now sits above the cursor, so INIT would refuse
+ * (it raises on cursor < end). Reports end - cursor, i.e. the widening. Without this tag, dropping
+ * the end read from the fill check simply lets csinit trap ILLEGAL_OPERAND_VALUE inside the monitor
+ * -- the uninformative fault the postcondition exists to prevent, reached from the other side. */
+#define CAPSTONE_TAG_RCRE 0x52435245
 #define CAPSTONE_TAG_DPIF 0x44504946 /* "DPIF" DPI function code */
 #define CAPSTONE_ERR_SHARE_BAD_ID    0xe007
 #define CAPSTONE_ERR_SHARE_BAD_REV   0xe008
@@ -254,11 +259,29 @@
  * condition" rule, pointed at firmware.)
  * On the failure path csinit is NOT executed and `dest` is left as x0, so the caller must test the
  * shortfall BEFORE using dest. */
-#define C_RECLAIM(dest, scratch, cap, n) __asm__ volatile( \
-    "mv %1, %3; 1: beq %1, x0, 2f; stc(x0, %2, 0); addi %1, %1, -1; j 1b; " \
-    "2: lcc(%0, %2, 2); lcc(%1, %2, 4); sub %1, %1, %0; mv %0, x0; " \
-    "bne %1, x0, 3f; .insn r 0x5b, 0x1, 0x9, %0, %2, x0; 3:" \
-    : "=&r"(dest), "=&r"(scratch) : "r"(cap), "r"(n))
+/* R-33 (2026-09-12): THE FILL CHECK NO LONGER READS `end`, AND THAT IS THE WHOLE POINT.
+ * A capability's bounds RE-ENCODE when its cursor leaves base, and the decoded `end` then reads up
+ * to one granule HIGH (ariane_pkg.sv:787 picks an exact form only while cursor == the low bound;
+ * :827-828 otherwise rounds the top up to 2^(E+3)). The old template read `end` back AFTER the fill
+ * and reported `end - cursor`, so a perfectly complete fill of a non-representable region reported a
+ * shortfall -- which is exactly what boot sw60's RCSH:000006C0 was, and it cost a day reading it as
+ * 108 failed stores. The check could not tell a re-encoded bound from a fill that genuinely stopped
+ * short, and those are different defects.
+ * The cursor is NOT affected: fat_cap_t carries it full-width and cap_metadata_t has no cursor field
+ * at all, so only the bounds are lossy. Comparing the cursor against base + 16n therefore uses two
+ * quantities neither of which is a re-encoded bound, and asks only the question this check exists to
+ * ask: did every store advance?
+ * `scratch` comes back as the FILL shortfall in bytes, zero when the fill completed. */
+#define C_RECLAIM(scratch, tmp, cap, n) __asm__ volatile( \
+    "lcc(%0, %2, 2); slli %1, %3, 4; add %0, %0, %1; mv %1, %3; " \
+    "1: beq %1, x0, 2f; stc(x0, %2, 0); addi %1, %1, -1; j 1b; " \
+    "2: lcc(%1, %2, 2); sub %0, %0, %1" \
+    : "=&r"(scratch), "=&r"(tmp) : "r"(cap), "r"(n))
+/* csinit, split out of the template above so the two preconditions can be tested separately in C.
+ * Splitting costs nothing: the bounds are re-encoded on every register writeback regardless, so
+ * keeping the capability in one register across fill-and-init never protected it. */
+#define C_RECLAIM_INIT(dest, cap) __asm__ volatile( \
+    ".insn r 0x5b, 0x1, 0x9, %0, %1, x0" : "=r"(dest) : "r"(cap))
 /* BOTH OUTPUTS ARE EARLY-CLOBBER, and the '&' is load-bearing rather than decorative. Without it the
  * compiler may allocate an output over %2 (the capability), which is live to the very end of the
  * template: %1 is written by the FIRST instruction (`mv %1, %3`) while %2 has not been read yet, and
@@ -278,7 +301,7 @@
  * reads the pre-fill end; the self-check (RCEN - RCCU == RCSH) is what would catch it. */
 /* n comes in as the store count and comes back as the SHORTFALL in bytes (0 = the fill reached end).
  * i receives the reclaimed LINEAR capability. Caller checks n before using i. */
-#define C_RECLAIM_FILL(cap, n, i) n = (cap_end(cap) - cap_base(cap)) >> 4; C_RECLAIM(i, n, cap, n)
+#define C_RECLAIM_FILL(cap, n, i) n = (cap_end(cap) - cap_base(cap)) >> 4; C_RECLAIM(n, i, cap, n)
 /* The whole reclaim, including the counter the first post-flash boot needs. Counts RECLAIMS -- the
  * guard fired and the fill RAN -- not revokes: a counter placed before the type test would report the
  * allocation-shaped number again and look like a measurement. */
@@ -300,6 +323,10 @@
     if (n != 0) { capstone_report(CAPSTONE_TAG_RCSH, n); capstone_report(CAPSTONE_TAG_BASE, cap_base(cap)); \
                   capstone_report(CAPSTONE_TAG_RCEN, cap_end(cap) - cap_base(cap)); capstone_report(CAPSTONE_TAG_RCCU, cap_cursor(cap) - cap_base(cap)); \
                   capstone_uart_flush(); while(1); } \
+    if (cap_cursor(cap) < cap_end(cap)) { capstone_report(CAPSTONE_TAG_RCRE, cap_end(cap) - cap_cursor(cap)); capstone_report(CAPSTONE_TAG_BASE, cap_base(cap)); \
+                  capstone_report(CAPSTONE_TAG_RCEN, cap_end(cap) - cap_base(cap)); capstone_report(CAPSTONE_TAG_RCCU, cap_cursor(cap) - cap_base(cap)); \
+                  capstone_uart_flush(); while(1); } \
+    C_RECLAIM_INIT(i, cap); \
     cap = i; \
     reclaim_count += 1
 #ifdef CAPSTONE_DEBUG_ENABLE
