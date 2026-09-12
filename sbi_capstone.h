@@ -26,6 +26,13 @@
    asm_insn.h (REV 3, UNINIT 4) is the WRITE side, what CAPTYPE takes. Taking a constant from
    the wrong side of that line has already cost a board boot. */
 #define CAP_TYPE_REV     2
+/* READ side, like the three above: cap_type() is __capfield(cap, 1) and selector 1 returns
+   cap_type - 1. The RAW enum in asm_insn.h has UNINIT at 4, which is the WRITE side (what CAPTYPE
+   takes). Defined 2026-09-12 because five reclaim guards in sbi_capstone.c carried a bare `3` with
+   a comment, and the header above warns in as many words that taking a constant from the wrong side
+   of this line has already cost a board boot -- a bare 3 next to an asm_insn.h that says 4 is an
+   invitation to "fix" it in the direction that breaks it. No behaviour change: 3 is what they had. */
+#define CAP_TYPE_UNINIT  3
 
 #define CAPENTER(rs1, rs2) .insn r 0x5b, 0x1, 0xd, x0, rs1, rs2
 #define SETCAPMEM(reg) .insn r 0x5b, 0x1, 0x41, x0, reg, x0

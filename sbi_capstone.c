@@ -703,7 +703,7 @@ static void *split_out_cap(unsigned base, unsigned len, unsigned linear) {
          * SPLIT demands LINEAR. Nothing in the share path protects this one, because nobody shared
          * anything: the caller is just allocating. Reclaim it here for the same reason and by the
          * same rule as the share path. */
-        if (cap_type(mem_l) == 3 /* CAP_TYPE_UNINIT */) {
+        if (cap_type(mem_l) == CAP_TYPE_UNINIT) {
             C_DO_RECLAIM(mem_l, fill_n, fill_i);
         }
         if(base >= region_base && base + len <= region_end)
@@ -1305,7 +1305,7 @@ static unsigned shared_region_annotated(unsigned dom_id, unsigned region_id, uns
      * The RTL lane's auditor named the other three before any of them reached a boot.)
      *
      * The trace above deliberately runs FIRST, so it still records the type revoke actually left. */
-    if (cap_type(r) == 3 /* CAP_TYPE_UNINIT */) {
+    if (cap_type(r) == CAP_TYPE_UNINIT) {
         C_DO_RECLAIM(r, fill_n, fill_i);
     }
 
@@ -1478,7 +1478,7 @@ static unsigned share_child_region(unsigned dom_id, unsigned parent_id,
     /* A prior revoke may have left the retained parent handle UNINIT; reclaim it so __mrev
      * sees a LIN input -- same step as REV_BORROWED above, and the fill is the security half
      * for the same reason: the parent still holds the borrower's bytes. */
-    if (cap_type(r) == 3 /* CAP_TYPE_UNINIT */) {
+    if (cap_type(r) == CAP_TYPE_UNINIT) {
         C_DO_RECLAIM(r, fill_n, fill_i);
     }
 
@@ -1674,14 +1674,14 @@ static unsigned region_de_linear(unsigned region_id) {
      * declaration inside a nested block. */
     if (region_cpmp[region_id] != -1) {
         dr = read_cpmp(region_cpmp[region_id]);
-        if (cap_type(dr) == 3 /* CAP_TYPE_UNINIT */) {
+        if (cap_type(dr) == CAP_TYPE_UNINIT) {
             C_DO_RECLAIM(dr, fill_n, fill_i);
         }
         write_cpmp(region_cpmp[region_id], __delin(dr));
     }
     else {
         dr = regions[region_id];
-        if (cap_type(dr) == 3 /* CAP_TYPE_UNINIT */) {
+        if (cap_type(dr) == CAP_TYPE_UNINIT) {
             C_DO_RECLAIM(dr, fill_n, fill_i);
         }
         regions[region_id] = __delin(dr);
