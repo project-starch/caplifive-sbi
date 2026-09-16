@@ -110,8 +110,19 @@ _handle_non_ecall:
     andi t4, t4, 0x1F
 
     slli t5, t4, 3
-    add  t5, sp, t5
-    sd a0, 16(t5)
+    # Move the STACK CAPABILITY's cursor instead of computing an integer address from it. The old
+    # form was `add t5, sp, t5` followed by a store through t5: an integer add on a capability
+    # register produces a NOT_CAP result, and in M-mode with capmode set the LSU refuses the plain
+    # store through it with mcause 24. That refusal is invisible on the deployed bitstream, where
+    # the exception is raised and dropped (R-34), and becomes a fault in the monitor's own trap
+    # handler the moment delivery is fixed. rd and rs1 are both sp so the capability is modified in
+    # place and no source-consumption question arises. Validated in RTL simulation on the
+    # R-34/R-24 delivery-fix branch, where this form retires and stores while the old one traps 24:
+    # verif/tests/custom/capstone/d3-monitor-writeback.S in capstone-ariane.
+    CINCOFFSET(sp, sp, t5)
+    sd a0, 16(sp)
+    sub t5, x0, t5
+    CINCOFFSET(sp, sp, t5)
     addi t2, t2, 4
     csrw mepc, t2
 _handle_branch_1:
