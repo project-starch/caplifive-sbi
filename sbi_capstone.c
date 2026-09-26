@@ -1,3 +1,4 @@
+#include "process-abi.h"
 /**
  * NOTE: This file is to be compiled with Capstone-CC to generate sbi_capstone.S.
 */
@@ -676,6 +677,103 @@ unsigned make_hole(unsigned i, unsigned tag) {
 }
 #endif
 
+#ifdef CAPSTONE_SUPERVISED_CALL
+/* Retained destruction authority belongs to the monitor, including when a
+ * child receives TRANSFERRED authority. Cached extents retain Linux authority;
+ * neither slot retirement nor returning pages without authority is permitted. */
+__rev void *managed_domain_root[CAPSTONE_MAX_DOM_N];
+unsigned managed_domain_base[CAPSTONE_MAX_DOM_N];
+unsigned managed_domain_size[CAPSTONE_MAX_DOM_N];
+unsigned managed_domain_region[CAPSTONE_MAX_DOM_N];
+unsigned managed_domain_live[CAPSTONE_MAX_DOM_N];
+__rev void *managed_region_root[CAPSTONE_MAX_REGION_N];
+unsigned managed_region_owned[CAPSTONE_MAX_REGION_N];
+
+static void managed_unmap(unsigned id) {
+    void *discard;
+    if (region_cpmp[id] != -1) {
+        discard = read_cpmp(region_cpmp[id]);
+        cpmp_region[region_cpmp[id]] = -1;
+        region_cpmp[id] = -1;
+    }
+    region_live[id] = 0;
+    regions[id] = 0;
+    region_shared_base[id] = 0;
+}
+
+static __linear void *managed_reclaim(__rev void *root) {
+    __linear void *memory;
+    unsigned cursor;
+    unsigned end;
+    memory = __revoke(root);
+    if (cap_type(memory) == 3) {
+        cursor = __capfield(memory, 2);
+        end = cap_end(memory);
+        while (cursor < end) {
+            /* STC initializes exactly one granule and advances UNINIT.cursor. */
+            __asm__ volatile ("stc(x0, %0, 0)" :: "r"(memory));
+            cursor += 16;
+        }
+        C_INIT(memory, memory, 0);
+    }
+    return memory;
+}
+#endif
+
+/* The VM platform implements protected, preemptible CALL. The explicit build
+ * feature keeps the existing hardware instruction set unchanged. */
+#ifdef CAPSTONE_SUPERVISED_CALL
+unsigned supervised_events[4];
+unsigned supervised_results[CAPSTONE_MAX_DOM_N];
+unsigned supervised_kind[CAPSTONE_MAX_DOM_N];
+unsigned supervised_cause[CAPSTONE_MAX_DOM_N];
+unsigned supervised_pc[CAPSTONE_MAX_DOM_N];
+unsigned supervised_address[CAPSTONE_MAX_DOM_N];
+
+/* Leave the VM's emergency reserve available for destruction of all 32 owners.
+ * Application MREV/SPLIT also stop at this reserve. Creation fails before any
+ * authority is carved, so the Linux allocator can roll back a fresh block. */
+static unsigned managed_can_allocate(void) {
+    unsigned available, selector;
+    selector = 7;
+    __asm__ volatile (".insn r 0x5b, 0x1, 0x23, %0, %1, x0"
+        : "=r"(available) : "r"(selector));
+    return available >= 288;
+}
+
+static unsigned supervised_invoke(unsigned id, unsigned request, void *argument) {
+    unsigned status;
+    __dom void *d;
+    if (id >= dom_n) {
+        return -1;
+    }
+    d = domains[id];
+    __asm__ volatile (".insn r 0x5b, 0x1, 0x22, %0, %1, %2"
+        : "=r"(status) : "r"(d), "r"(supervised_events));
+    if (status != 0) {
+        domains[id] = d;
+        return -1;
+    }
+    d = __domcallsaves(d, request, argument);
+    domains[id] = d;
+    supervised_kind[id] = supervised_events[0];
+    supervised_cause[id] = supervised_events[1];
+    supervised_pc[id] = supervised_events[2];
+    supervised_address[id] = supervised_events[3];
+    return supervised_events[0];
+}
+
+static unsigned supervised_call(unsigned id) {
+    unsigned *result;
+    if (id >= dom_n) { return -1; }
+    result = &supervised_results[id];
+    __asm__ volatile (".insn i 0x5b, 0, %0, %1, 8"
+        : "=r"(result) : "r"(result));
+    result = __tighten(result, 2);
+    return supervised_invoke(id, CAPSTONE_DPI_CALL, result);
+}
+#endif
+
 static void *split_out_cap(unsigned base, unsigned len, unsigned linear) {
     __linear void *region;
 
@@ -843,7 +941,7 @@ static void *split_out_cap(unsigned base, unsigned len, unsigned linear) {
    only because every 32k rung also set LADDER_NO_RO_COPY=1. */
 static unsigned create_domain(unsigned base_addr, unsigned code_size,
                           unsigned tot_size, unsigned entry_offset,
-                          unsigned globals_off)
+                          unsigned globals_off, unsigned managed)
 {
     /* entry_offset carries the GLOBALS OFFSET in its high 32 bits (packed by
        libcapstone; the kernel module forwards the word untouched). 0 in the high half
@@ -881,6 +979,29 @@ static unsigned create_domain(unsigned base_addr, unsigned code_size,
     if (packed_gpoff) {
         gpoff = packed_gpoff;
     }
+    unsigned domain_slot = dom_n;
+#ifdef CAPSTONE_SUPERVISED_CALL
+    unsigned cached = 0;
+    unsigned cache_region = 0;
+    unsigned search;
+    if (managed) {
+        if (managed_can_allocate() == 0) { return -1; }
+        for (search = 0; search < dom_n; search += 1) {
+            if (managed_domain_base[search] == base_addr) {
+                if (managed_domain_live[search] != 0) { return -1; }
+                if (managed_domain_size[search] != tot_size) { return -1; }
+                domain_slot = search;
+                cached = 1;
+                cache_region = managed_domain_region[search];
+                break;
+            }
+        }
+    }
+    if (cached == 0) {
+        if (region_n + 3 > CAPSTONE_MAX_REGION_N) { return -1; }
+    }
+#endif
+    if (domain_slot >= CAPSTONE_MAX_DOM_N) { return -1; }
     // alignment requirement
     code_size = (((code_size - 1) >> 4) + 1) << 4;
     /* CAPABILITY-BOUNDS REPRESENTABILITY (issue C-13, root-caused 2026-07-29).
@@ -964,7 +1085,28 @@ static unsigned create_domain(unsigned base_addr, unsigned code_size,
     capstone_trace(CAPSTONE_TAG_DBAS, base_addr);
     capstone_trace(CAPSTONE_TAG_DENT, entry_offset);
 
+#ifdef CAPSTONE_SUPERVISED_CALL
+    if (cached) {
+        managed_unmap(cache_region);
+        dom_code = managed_reclaim(managed_domain_root[domain_slot]);
+    } else {
+        dom_code = split_out_cap(base_addr, tot_size, 1);
+    }
+    if (managed) {
+        if (cached == 0) {
+            cache_region = region_n;
+            region_n += 1;
+            managed_unmap(cache_region);
+        }
+        managed_domain_root[domain_slot] = __mrev(dom_code);
+        managed_domain_base[domain_slot] = base_addr;
+        managed_domain_size[domain_slot] = tot_size;
+        managed_domain_region[domain_slot] = cache_region;
+        managed_domain_live[domain_slot] = 1;
+    }
+#else
     dom_code = split_out_cap(base_addr, tot_size, 1);
+#endif
 
     dom_seal = __split(dom_code, base_addr + split_size);
     dom_data = __split(dom_seal, base_addr + split_size + data_off);
@@ -1130,11 +1272,9 @@ static unsigned create_domain(unsigned base_addr, unsigned code_size,
 
     // PRINT(dom);
 
-    domains[dom_n] = dom;
-
-    dom_n += 1;
-
-    return dom_n - 1;
+    domains[domain_slot] = dom;
+    if (domain_slot == dom_n) { dom_n += 1; }
+    return domain_slot;
 }
 
 static unsigned call_domain(unsigned dom_id) {
@@ -1386,6 +1526,9 @@ static unsigned shared_region_annotated(unsigned dom_id, unsigned region_id, uns
            cap_base(null) in M-mode -- the silent-wedge shape named in the Q-05 close-out. Now a
            later access finds no region and takes the ordinary NO_CPMP_REGION path. Board evidence:
            boots sw36 (transfer probe on the old arm) and sw37 (this form, one HOLE line). */
+#ifdef CAPSTONE_SUPERVISED_CALL
+        if (managed_region_owned[region_id]) { managed_unmap(region_id); }
+#endif
         MAKE_HOLE(region_id, 0x1239);
     }
     else {
@@ -1430,6 +1573,12 @@ static unsigned shared_region_annotated(unsigned dom_id, unsigned region_id, uns
        never came back and the monitor is exonerated; no SHA5 means the wedge is in
        one of the monitor steps above. */
     capstone_trace(CAPSTONE_TAG_SHA5, dom_id);
+#ifdef CAPSTONE_SUPERVISED_CALL
+    if (managed_domain_live[dom_id]) {
+        domains[dom_id] = d;
+        return supervised_invoke(dom_id, CAPSTONE_DPI_REGION_SHARE, r);
+    }
+#endif
     d = __domcallsaves(d, CAPSTONE_DPI_REGION_SHARE, r);
     /* I-4 progress SHA6: the domain returned from the share entry. */
     capstone_trace(CAPSTONE_TAG_SHA6, dom_id);
@@ -1763,6 +1912,84 @@ static unsigned schedule_domain(unsigned dom_id) {
     return 0;
 }
 
+#ifdef CAPSTONE_SUPERVISED_CALL
+static unsigned supervised_query(unsigned id, unsigned field) {
+    unsigned value, selector;
+    if (id >= dom_n) { return -1; }
+    if (field >= 8) { return -1; }
+    selector = field & 3;
+    value = 0;
+    if (selector == 0) { value = supervised_results[id]; }
+    if (selector == 1) { value = supervised_cause[id]; }
+    if (selector == 2) { value = supervised_pc[id]; }
+    if (selector == 3) { value = supervised_address[id]; }
+    if (field >= 4) { return value >> 32; }
+    return value & 0xffffffff;
+}
+
+static unsigned supervised_forget(unsigned id) {
+    unsigned status;
+    __dom void *d;
+    if (id >= dom_n) {
+        return -1;
+    }
+    d = domains[id];
+    __asm__ volatile (".insn r 0x5b, 0x1, 0x22, %0, %1, x0"
+        : "=r"(status) : "r"(d));
+    domains[id] = d;
+    return status;
+}
+static unsigned managed_destroy_domain(unsigned id) {
+    __linear void *memory;
+    unsigned r;
+    if (id >= dom_n) { return -1; }
+    if (managed_domain_base[id] == 0) { return -1; }
+    if (managed_domain_live[id] == 0) { return 0; }
+    supervised_forget(id);
+    domains[id] = 0;
+    memory = managed_reclaim(managed_domain_root[id]);
+    managed_domain_root[id] = __mrev(memory);
+    r = managed_domain_region[id];
+    regions[r] = __delin(memory);
+    region_live[r] = 1;
+    managed_domain_live[id] = 0;
+    return 0;
+}
+
+static unsigned managed_create_region(unsigned base, unsigned len) {
+    unsigned id;
+    __linear void *memory;
+    if (managed_can_allocate() == 0) { return -1; }
+    id = create_region(base, len);
+    if (id == -1) { return -1; }
+    memory = regions[id];
+    managed_region_root[id] = __mrev(memory);
+    regions[id] = memory;
+    managed_region_owned[id] = 1;
+    return id;
+}
+
+static unsigned managed_reset_region(unsigned id, unsigned prepare) {
+    __linear void *memory;
+    if (id >= region_n) { return -1; }
+    if (managed_region_owned[id] == 0) { return -1; }
+    if (prepare) {
+        if (managed_can_allocate() == 0) { return -1; }
+    }
+    managed_unmap(id);
+    memory = managed_reclaim(managed_region_root[id]);
+    managed_region_root[id] = __mrev(memory);
+    if (prepare) {
+        regions[id] = memory;
+    } else {
+        regions[id] = __delin(memory);
+    }
+    region_live[id] = 1;
+    return 0;
+}
+
+#endif
+
 // SBI implementation
 unsigned handle_trap_ecall(unsigned arg0, unsigned arg1,
                            unsigned arg2, unsigned arg3,
@@ -1809,8 +2036,48 @@ unsigned handle_trap_ecall(unsigned arg0, unsigned arg1,
             break;
         case SBI_EXT_CAPSTONE:
             switch(func_code) {
+                case SBI_CAPSTONE_PROCESS_CAPABILITIES: /* process platform ABI and feature bits */
+#ifdef CAPSTONE_SUPERVISED_CALL
+                    res = CAPSTONE_PROCESS_FEATURES_V1;
+#else
+                    res = 0;
+#endif
+                    break;
+#ifdef CAPSTONE_SUPERVISED_CALL
+                case SBI_CAPSTONE_PROCESS_STEP:
+                    res = supervised_call(arg0);
+                    break;
+                case SBI_CAPSTONE_PROCESS_QUERY:
+                    res = supervised_query(arg0, arg1);
+                    break;
+                case SBI_CAPSTONE_PROCESS_FORGET:
+                    res = supervised_forget(arg0);
+                    break;
+                case SBI_CAPSTONE_PROCESS_DESTROY:
+                    res = managed_destroy_domain(arg0);
+                    break;
+                case SBI_CAPSTONE_PROCESS_REGION_CREATE:
+                    res = managed_create_region(arg0, arg1);
+                    break;
+                case SBI_CAPSTONE_PROCESS_REGION_RESET:
+                    res = managed_reset_region(arg0, 0);
+                    break;
+                case SBI_CAPSTONE_PROCESS_REGION_PREPARE:
+                    res = managed_reset_region(arg0, 1);
+                    break;
+                case SBI_CAPSTONE_PROCESS_COLLECT:
+                    __asm__ volatile (".insn r 0x5b, 0x1, 0x23, %0, x0, x0" : "=r"(res));
+                    break;
+                case SBI_CAPSTONE_PROCESS_RESUME_SHARE:
+                    res = supervised_invoke(arg0, 0, 0);
+                    break;
+                case SBI_CAPSTONE_PROCESS_STATS:
+                    __asm__ volatile (".insn r 0x5b, 0x1, 0x23, %0, %1, x0"
+                        : "=r"(res) : "r"(arg0));
+                    break;
+#endif
                 case SBI_EXT_CAPSTONE_DOM_CREATE:
-                    res = create_domain(arg0, arg1, arg2, arg3, arg4);
+                    res = create_domain(arg0, arg1, arg2, arg3, arg4, arg5);
                     break;
                 case SBI_EXT_CAPSTONE_DOM_CALL:
                     res = call_domain(arg0);
