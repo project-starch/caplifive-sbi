@@ -931,6 +931,33 @@ static unsigned context_free_slot(void) {
     return found;
 }
 
+/* Revocation nodes. Every call's loan takes one (loan_begin's __mrev), and a
+   revoked node becomes free again only once the supervisor's collector has
+   swept its stale copies. The supervisor runs the collector by itself when
+   SUPERVISED code runs short of nodes, which an application that never
+   allocates one never does; the monitor has no reserve (capstone-qemu
+   capstone_require_node), so a long run of calls used to exhaust every node
+   and halt the monitor at the next loan (cause 30). Before a loan the monitor
+   therefore collects whenever fewer than CONTEXT_NODES_LOW are free, as the
+   driver's COLLECT does at a process's end, and refuses the step if even the
+   collector frees none. */
+#define CONTEXT_NODES_LOW 1024
+static unsigned nodes_free(void) {
+    unsigned n;
+    unsigned q;
+    q = 7;
+    __asm__ volatile (".insn r 0x5b, 0x1, 0x23, %0, %1, x0" : "=r"(n) : "r"(q));
+    return n;
+}
+
+static unsigned nodes_reserve(void) {
+    unsigned r;
+    if (nodes_free() < CONTEXT_NODES_LOW) {
+        __asm__ volatile (".insn r 0x5b, 0x1, 0x23, %0, x0, x0" : "=r"(r));
+    }
+    return nodes_free();
+}
+
 /* Lend slot k's descriptor for one logical call. The context receives a
    write-only alias; the monitor keeps a full alias to read it back. */
 static void *loan_begin(unsigned k) {
@@ -1017,6 +1044,7 @@ static unsigned context_step(unsigned k, unsigned g) {
     if (slot_kind[k] == CONTEXT_SLOT_UNMANAGED) { return CAPSTONE_PROCESS_STEP_STALE; }
     if (slot_gen[k] != g) { return CAPSTONE_PROCESS_STEP_STALE; }
     if (desc_loan[k] == 0) {
+        if (nodes_reserve() == 0) { return -1; }
         lent = loan_begin(k);
     } else {
         /* A resume: the supervisor restores the callee's own registers, and the
