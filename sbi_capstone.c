@@ -750,7 +750,13 @@ static unsigned supervised_invoke(unsigned id, unsigned request, void *argument)
         domains[id] = d;
         return -1;
     }
-    d = __domcallsaves(d, request, argument);
+    /* __domcall, not __domcallsaves: the supervisor snapshots the caller's
+     * whole state at CALL and restores it on every return (capstone_supervisor.c
+     * save_state/restore_state: cpmp, satp, stvec, sepc, ...), and a supervised
+     * domain cannot touch a CPMP CCSR at all. The S-mode save the compiler
+     * wraps around __domcallsaves (16 CPMP swaps out and back, each a TLB
+     * flush in QEMU, plus 9 S/M CSR swaps) would only repeat that. */
+    d = __domcall(d, request, argument);
     domains[id] = d;
     return supervised_events[0];
 }
