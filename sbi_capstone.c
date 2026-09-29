@@ -768,6 +768,10 @@ __linear void *desc_pool_hi[CONTEXT_DESC_HALF_N];
 __rev void *desc_rev[CAPSTONE_MAX_DOM_N];
 unsigned *desc_view[CAPSTONE_MAX_DOM_N];
 unsigned desc_loan[CAPSTONE_MAX_DOM_N];
+/* Slot k's context can never run again although its seal stays valid: a STEP
+   ended in a fault (the supervisor keeps the continuation as terminal and
+   never arms it again) or was refused (the seal's privilege is not C-mode). */
+unsigned slot_ended[CAPSTONE_MAX_DOM_N];
 __dom void *offer[CAPSTONE_MAX_DOM_N];
 unsigned offer_ticket[CAPSTONE_MAX_DOM_N];
 unsigned offer_live[CAPSTONE_MAX_DOM_N];
@@ -851,6 +855,7 @@ static unsigned context_assign(unsigned slot, unsigned kind, unsigned local) {
     slot_kind[slot] = kind;
     slot_desc[slot] = local;
     desc_loan[slot] = 0;
+    slot_ended[slot] = 0;
     offer_live[slot] = 0;
     gen = slot_gen[slot] + 1;
     slot_gen[slot] = gen;
@@ -977,6 +982,8 @@ static unsigned context_step(unsigned k, unsigned g) {
         lent = __tighten(desc_view[k], 2);
     }
     kind = supervised_invoke(k, CAPSTONE_DPI_CALL, lent);
+    if (kind == 2) { slot_ended[k] = 1; }
+    if (kind == CAPSTONE_PROCESS_STEP_REFUSED) { slot_ended[k] = 1; }
     result = 0;
     if (kind != 1) {
         result = loan_end(k);
@@ -1028,10 +1035,13 @@ static void context_retire(unsigned k) {
     slot_kind[k] = CONTEXT_SLOT_FREE;
 }
 
-/* Registrations whose seal is dead: a revoked seal reloads untagged (ISSUES
-   Q-11), so its type reads 7 instead of 4. They are retired when an adoption
-   finds no descriptor (application `app`) or no slot (any application), so
-   dead registrations never exhaust either when nobody forgets them. */
+/* Dead registrations: the seal is revoked (it reloads untagged, ISSUES Q-11,
+   so its type reads 7 instead of 4) or the context has ended (slot_ended).
+   They are retired when an adoption finds no descriptor (application `app`)
+   or no slot (any application), so they never exhaust either when nobody
+   forgets them. A slot with an outstanding offer is kept until the offer is
+   adopted: retiring it would discard the offered seal, the offering slot of
+   the adoption in progress included. */
 static unsigned context_seal_live(unsigned k) {
     __dom void *d;
     unsigned ty;
@@ -1048,8 +1058,10 @@ static void context_retire_dead(unsigned app, unsigned any) {
         if (slot_kind[k] == CONTEXT_SLOT_MINTED) {
             owner = slot_app[k];
             if ((any | (owner == app)) != 0) {
-                if (context_seal_live(k) == 0) {
-                    context_retire(k);
+                if (offer_live[k] == 0) {
+                    if ((slot_ended[k] | (context_seal_live(k) == 0)) != 0) {
+                        context_retire(k);
+                    }
                 }
             }
         }
