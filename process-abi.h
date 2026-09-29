@@ -24,6 +24,10 @@
  * the two as separate arguments. A generation is never reissued. */
 #define CAPSTONE_PROCESS_SLOT_MASK 0xffffffffUL
 
+/* The monitor's slot table: every application's first context and every
+ * adopted context holds one slot. */
+#define CAPSTONE_PROCESS_SLOTS 32
+
 /* STEP kinds after the supervisor's returned (0), preempted (1), fault (2). */
 #define CAPSTONE_PROCESS_STEP_DEAD 3   /* the slot's seal was revoked */
 #define CAPSTONE_PROCESS_STEP_STALE 4  /* (slot, generation) names no current context */

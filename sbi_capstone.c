@@ -5,6 +5,10 @@
 
 #include "sbi_capstone.h"
 
+#if CAPSTONE_MAX_DOM_N != CAPSTONE_PROCESS_SLOTS
+#error "the driver sizes its context records by CAPSTONE_PROCESS_SLOTS"
+#endif
+
 /* Capstone-C defs */
 #define __linear __attribute__((linear))
 #define __dom __attribute__((dom))
@@ -744,6 +748,8 @@ unsigned supervised_events[4];
 #define CONTEXT_SLOT_FREE 0
 #define CONTEXT_SLOT_APP 1
 #define CONTEXT_SLOT_MINTED 2
+/* A domain of the unmanaged path: never stepped, adopted or reused. */
+#define CONTEXT_SLOT_UNMANAGED 3
 #define CONTEXT_DESC_PER_APP 8
 #define CONTEXT_DESC_AREA CAPSTONE_PROCESS_DESC_AREA
 #define CONTEXT_GEN_LAST 0xffffffff
@@ -961,6 +967,7 @@ static unsigned context_step(unsigned k, unsigned g) {
     void *lent;
     if (k >= dom_n) { return -1; }
     if (slot_kind[k] == CONTEXT_SLOT_FREE) { return CAPSTONE_PROCESS_STEP_STALE; }
+    if (slot_kind[k] == CONTEXT_SLOT_UNMANAGED) { return CAPSTONE_PROCESS_STEP_STALE; }
     if (slot_gen[k] != g) { return CAPSTONE_PROCESS_STEP_STALE; }
     if (desc_loan[k] == 0) {
         lent = loan_begin(k);
@@ -985,6 +992,68 @@ static unsigned context_step(unsigned k, unsigned g) {
         smode_saved_context[SBI_TRAP_REGS_a5] = 0;
     }
     return kind;
+}
+
+static unsigned supervised_forget(unsigned id) {
+    unsigned status;
+    __dom void *d;
+    if (id >= dom_n) {
+        return -1;
+    }
+    d = domains[id];
+    __asm__ volatile (".insn r 0x5b, 0x1, 0x22, %0, %1, x0"
+        : "=r"(status) : "r"(d));
+    domains[id] = d;
+    return status;
+}
+/* Remove slot k's registration: its continuation, an outstanding loan and an
+   unadopted offer. Whether the context completed is none of this function's
+   business, and its memory stays with its application. */
+static void context_remove(unsigned k) {
+    supervised_forget(k);
+    if (desc_loan[k] != 0) {
+        loan_end(k);
+    }
+    offer_live[k] = 0;
+    offer[k] = 0;
+    domains[k] = 0;
+}
+
+/* Retire minted slot k: its registration, loan and offer, and its descriptor. */
+static void context_retire(unsigned k) {
+    unsigned app;
+    context_remove(k);
+    app = slot_app[k];
+    app_desc_mark(app, slot_desc[k], 0);
+    slot_kind[k] = CONTEXT_SLOT_FREE;
+}
+
+/* Registrations whose seal is dead: a revoked seal reloads untagged (ISSUES
+   Q-11), so its type reads 7 instead of 4. They are retired when an adoption
+   finds no descriptor (application `app`) or no slot (any application), so
+   dead registrations never exhaust either when nobody forgets them. */
+static unsigned context_seal_live(unsigned k) {
+    __dom void *d;
+    unsigned ty;
+    d = domains[k];
+    ty = cap_type(d);
+    domains[k] = d;
+    return ty == 4;
+}
+
+static void context_retire_dead(unsigned app, unsigned any) {
+    unsigned k;
+    unsigned owner;
+    for (k = 0; k < dom_n; k += 1) {
+        if (slot_kind[k] == CONTEXT_SLOT_MINTED) {
+            owner = slot_app[k];
+            if ((any | (owner == app)) != 0) {
+                if (context_seal_live(k) == 0) {
+                    context_retire(k);
+                }
+            }
+        }
+    }
 }
 #endif
 
@@ -1212,6 +1281,16 @@ static unsigned create_domain(unsigned base_addr, unsigned code_size,
                 cached = 1;
                 cache_region = managed_domain_region[search];
                 break;
+            }
+        }
+        /* A new block takes a free slot, not the next index: minted contexts
+           may have raised dom_n to the table's end and left free slots below
+           it. Dead registrations are retired when none is free. */
+        if (cached == 0) {
+            domain_slot = context_free_slot();
+            if (domain_slot == CAPSTONE_MAX_DOM_N) {
+                context_retire_dead(0, 1);
+                domain_slot = context_free_slot();
             }
         }
     }
@@ -1512,13 +1591,14 @@ static unsigned create_domain(unsigned base_addr, unsigned code_size,
     // PRINT(dom);
 
     domains[domain_slot] = dom;
-    if (domain_slot == dom_n) { dom_n += 1; }
+    if (domain_slot >= dom_n) { dom_n = domain_slot + 1; }
 #ifdef CAPSTONE_SUPERVISED_CALL
     if (managed) {
         app_desc_used[domain_slot] = 1;
         slot_app[domain_slot] = domain_slot;
         return context_assign(domain_slot, CONTEXT_SLOT_APP, 0);
     }
+    slot_kind[domain_slot] = CONTEXT_SLOT_UNMANAGED;
 #endif
     return domain_slot;
 }
@@ -2159,41 +2239,12 @@ static unsigned schedule_domain(unsigned dom_id) {
 }
 
 #ifdef CAPSTONE_SUPERVISED_CALL
-static unsigned supervised_forget(unsigned id) {
-    unsigned status;
-    __dom void *d;
-    if (id >= dom_n) {
-        return -1;
-    }
-    d = domains[id];
-    __asm__ volatile (".insn r 0x5b, 0x1, 0x22, %0, %1, x0"
-        : "=r"(status) : "r"(d));
-    domains[id] = d;
-    return status;
-}
-/* Remove slot k's registration: its continuation, an outstanding loan and an
-   unadopted offer. Whether the context completed is none of this function's
-   business, and its memory stays with its application. */
-static void context_remove(unsigned k) {
-    supervised_forget(k);
-    if (desc_loan[k] != 0) {
-        loan_end(k);
-    }
-    offer_live[k] = 0;
-    offer[k] = 0;
-    domains[k] = 0;
-}
-
 /* FORGET a minted context. An old generation cannot reach a replacement. */
 static unsigned context_forget(unsigned k, unsigned g) {
-    unsigned app;
     if (k >= dom_n) { return CAPSTONE_PROCESS_STALE; }
     if (slot_gen[k] != g) { return CAPSTONE_PROCESS_STALE; }
     if (slot_kind[k] != CONTEXT_SLOT_MINTED) { return CAPSTONE_PROCESS_STALE; }
-    context_remove(k);
-    app = slot_app[k];
-    app_desc_mark(app, slot_desc[k], 0);
-    slot_kind[k] = CONTEXT_SLOT_FREE;
+    context_retire(k);
     return 0;
 }
 
@@ -2207,13 +2258,22 @@ static unsigned context_adopt(unsigned k, unsigned g, unsigned ticket) {
     unsigned slot;
     if (k >= dom_n) { return CAPSTONE_PROCESS_STALE; }
     if (slot_kind[k] == CONTEXT_SLOT_FREE) { return CAPSTONE_PROCESS_STALE; }
+    if (slot_kind[k] == CONTEXT_SLOT_UNMANAGED) { return CAPSTONE_PROCESS_STALE; }
     if (slot_gen[k] != g) { return CAPSTONE_PROCESS_STALE; }
     if (offer_live[k] == 0) { return CAPSTONE_PROCESS_EMPTY; }
     if (offer_ticket[k] != ticket) { return CAPSTONE_PROCESS_STALE; }
     app = slot_app[k];
     local = app_desc_free(app);
+    if (local == CONTEXT_DESC_PER_APP) {
+        context_retire_dead(app, 0);
+        local = app_desc_free(app);
+    }
     if (local == CONTEXT_DESC_PER_APP) { return CAPSTONE_PROCESS_FULL; }
     slot = context_free_slot();
+    if (slot == CAPSTONE_MAX_DOM_N) {
+        context_retire_dead(0, 1);
+        slot = context_free_slot();
+    }
     if (slot == CAPSTONE_MAX_DOM_N) { return CAPSTONE_PROCESS_FULL; }
     domains[slot] = offer[k];
     offer[k] = 0;
