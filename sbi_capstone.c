@@ -928,7 +928,11 @@ static unsigned loan_end(unsigned k) {
     view = desc_view[k];
     result = view[0];
     ticket = view[2];
+    /* ldc copies; it does not clear the source. Clear it here, or the block
+       keeps a second copy of the sealed context and offers it again on the
+       next call (seen 2026-09-29: a consumed offer came back with ticket 0). */
     __asm__ volatile ("ldc(%0, %1, 32)" : "=r"(seal) : "r"(view));
+    __asm__ volatile ("stc(x0, %0, 32)" :: "r"(view));
     if (cap_type(seal) == 4) {
         offer[k] = seal;
         offer_ticket[k] = ticket;
