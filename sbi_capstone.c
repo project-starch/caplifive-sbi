@@ -954,6 +954,20 @@ static void *loan_begin(unsigned k) {
 
 /* End slot k's loan: read the result, take an offered seal out, then revoke
    every derivation of the block and return it, reinitialised, to the pool. */
+/* Whether slot k's outstanding offer still names a live seal. A revoked seal
+   reloads untagged (ISSUES Q-11), so its type is no longer 4. cap_type moves a
+   linear operand, so restore the slot after reading it (as context_seal_live
+   does for domains[]). */
+static unsigned offer_valid(unsigned k) {
+    __dom void *o;
+    unsigned ty;
+    if (offer_live[k] == 0) { return 0; }
+    o = offer[k];
+    ty = cap_type(o);
+    offer[k] = o;
+    return ty == 4;
+}
+
 static unsigned loan_end(unsigned k) {
     unsigned idx;
     unsigned *view;
@@ -970,10 +984,17 @@ static unsigned loan_end(unsigned k) {
        next call (seen 2026-09-29: a consumed offer came back with ticket 0). */
     __asm__ volatile ("ldc(%0, %1, 32)" : "=r"(seal) : "r"(view));
     __asm__ volatile ("stc(x0, %0, 32)" :: "r"(view));
+    /* A new seal is offered only when no still-valid offer is outstanding: a
+       first, live offer stays until it is adopted (its FULL is repeatable), and
+       a second offer's ticket is STALE. Once the first offer is revoked
+       (offer_valid is false) the new one replaces it. The consumed source slot
+       was already cleared above. */
     if (cap_type(seal) == 4) {
-        offer[k] = seal;
-        offer_ticket[k] = ticket;
-        offer_live[k] = 1;
+        if (offer_valid(k) == 0) {
+            offer[k] = seal;
+            offer_ticket[k] = ticket;
+            offer_live[k] = 1;
+        }
     }
     block = managed_reclaim(desc_rev[k]);
     desc_put(idx, block);
