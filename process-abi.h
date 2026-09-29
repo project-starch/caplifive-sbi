@@ -21,7 +21,9 @@
 /* Context slots (docs/plans/delegation-threads.md in llvm-capstone). A
  * context is named by its slot and the slot's generation; create and ADOPT
  * return (generation << 32) | slot, and STEP, FORGET, DESTROY and ADOPT take
- * the two as separate arguments. A generation is never reissued. */
+ * the two as separate arguments. A generation is never reissued and never
+ * exceeds 0x7fffffff, so every id is positive as a long; a slot that has had
+ * that generation is not used again. */
 #define CAPSTONE_PROCESS_SLOT_MASK 0xffffffffUL
 
 /* The monitor's slot table: every application's first context and every

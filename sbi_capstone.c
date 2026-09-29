@@ -752,7 +752,11 @@ unsigned supervised_events[4];
 #define CONTEXT_SLOT_UNMANAGED 3
 #define CONTEXT_DESC_PER_APP 8
 #define CONTEXT_DESC_AREA CAPSTONE_PROCESS_DESC_AREA
-#define CONTEXT_GEN_LAST 0xffffffff
+/* The last generation a slot is assigned; after it the slot is never used
+   again. 31 bits, so that every id (gen << 32) | slot is a positive long: the
+   driver takes a negative SBI value for an error, and the launcher hands ids
+   to the domain as long with -errno below zero. */
+#define CONTEXT_GEN_LAST 0x7fffffff
 /* TWO HALVES, not one 256-entry pool: capstone-c gives every global its own
    exactly-sized capability at start-up and computes each size as an addi
    immediate, so a global larger than 2048 bytes does not assemble ("illegal
@@ -842,6 +846,20 @@ static void desc_put(unsigned idx, __linear void *block) {
     }
 }
 
+#ifdef CAPSTONE_TEST_GEN_PRESET
+/* Test firmware only (Probe A, A9): every slot starts at this generation, so
+   that a boot reaches CONTEXT_GEN_LAST within a few assignments. Applied at
+   the first assignment, before any generation has named an id. */
+unsigned test_gen_preset_done;
+static void test_gen_preset(void) {
+    unsigned k;
+    for (k = 0; k < CAPSTONE_MAX_DOM_N; k += 1) {
+        slot_gen[k] = CAPSTONE_TEST_GEN_PRESET;
+    }
+    test_gen_preset_done = 1;
+}
+#endif
+
 /* Slot bookkeeping in small functions of their own. capstone-c mis-allocates
    registers when a long function stores into many arrays in a row: it spilled
    an index, loaded an array capability into the same register and used that
@@ -852,6 +870,9 @@ static void desc_put(unsigned idx, __linear void *block) {
    arguments of one call crashes capstone-c (codegen.rs:635, unwrap on None). */
 static unsigned context_assign(unsigned slot, unsigned kind, unsigned local) {
     unsigned gen;
+#ifdef CAPSTONE_TEST_GEN_PRESET
+    if (test_gen_preset_done == 0) { test_gen_preset(); }
+#endif
     slot_kind[slot] = kind;
     slot_desc[slot] = local;
     desc_loan[slot] = 0;
@@ -1067,6 +1088,27 @@ static void context_retire_dead(unsigned app, unsigned any) {
         }
     }
 }
+
+/* A free slot for an application block, retiring dead registrations of any
+   application when none is free; CAPSTONE_MAX_DOM_N when there is none. */
+static unsigned block_free_slot(void) {
+    unsigned slot;
+    slot = context_free_slot();
+    if (slot == CAPSTONE_MAX_DOM_N) {
+        context_retire_dead(0, 1);
+        slot = context_free_slot();
+    }
+    return slot;
+}
+
+/* A cached block moved off its exhausted slot `from`: that slot keeps no
+   record, and it is never assigned again (its generation is the last). */
+static void block_leave_slot(unsigned from) {
+    managed_domain_root[from] = 0;
+    managed_domain_base[from] = 0;
+    managed_domain_size[from] = 0;
+    managed_domain_live[from] = 0;
+}
 #endif
 
 static void *split_out_cap(unsigned base, unsigned len, unsigned linear) {
@@ -1278,6 +1320,7 @@ static unsigned create_domain(unsigned base_addr, unsigned code_size,
 #ifdef CAPSTONE_SUPERVISED_CALL
     unsigned cached = 0;
     unsigned cache_region = 0;
+    unsigned cache_slot = 0;
     unsigned search;
     if (managed) {
         if (managed_can_allocate() == 0) { return -1; }
@@ -1290,6 +1333,7 @@ static unsigned create_domain(unsigned base_addr, unsigned code_size,
                 if (managed_domain_live[search] != 0) { return -1; }
                 if (managed_domain_size[search] != tot_size) { return -1; }
                 domain_slot = search;
+                cache_slot = search;
                 cached = 1;
                 cache_region = managed_domain_region[search];
                 break;
@@ -1297,12 +1341,14 @@ static unsigned create_domain(unsigned base_addr, unsigned code_size,
         }
         /* A new block takes a free slot, not the next index: minted contexts
            may have raised dom_n to the table's end and left free slots below
-           it. Dead registrations are retired when none is free. */
+           it. A cached block whose slot has had its last generation moves to a
+           free one, so no id is ever reissued. */
         if (cached == 0) {
-            domain_slot = context_free_slot();
-            if (domain_slot == CAPSTONE_MAX_DOM_N) {
-                context_retire_dead(0, 1);
-                domain_slot = context_free_slot();
+            domain_slot = block_free_slot();
+        }
+        if (cached != 0) {
+            if (slot_gen[cache_slot] == CONTEXT_GEN_LAST) {
+                domain_slot = block_free_slot();
             }
         }
     }
@@ -1402,7 +1448,10 @@ static unsigned create_domain(unsigned base_addr, unsigned code_size,
 #ifdef CAPSTONE_SUPERVISED_CALL
     if (cached) {
         managed_unmap(cache_region);
-        dom_code = managed_reclaim(managed_domain_root[domain_slot]);
+        dom_code = managed_reclaim(managed_domain_root[cache_slot]);
+        if (cache_slot != domain_slot) {
+            block_leave_slot(cache_slot);
+        }
     } else {
         dom_code = split_out_cap(base_addr, tot_size, 1);
     }
