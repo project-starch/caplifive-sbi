@@ -792,6 +792,11 @@ static unsigned supervised_invoke(unsigned id, unsigned request, void *argument)
         domains[id] = d;
         return CAPSTONE_PROCESS_STEP_DEAD;
     }
+    /* 2: the seal's saved privilege is not C-mode; it is not entered. */
+    if (status == 2) {
+        domains[id] = d;
+        return CAPSTONE_PROCESS_STEP_REFUSED;
+    }
     if (status != 0) {
         domains[id] = d;
         return -1;
@@ -974,7 +979,7 @@ static unsigned context_step(unsigned k, unsigned g) {
     smode_saved_context[SBI_TRAP_REGS_a3] = supervised_events[1];
     smode_saved_context[SBI_TRAP_REGS_a4] = supervised_events[2];
     smode_saved_context[SBI_TRAP_REGS_a5] = supervised_events[3];
-    if (kind == CAPSTONE_PROCESS_STEP_DEAD) {
+    if (kind >= CAPSTONE_PROCESS_STEP_DEAD) {
         smode_saved_context[SBI_TRAP_REGS_a3] = 0;
         smode_saved_context[SBI_TRAP_REGS_a4] = 0;
         smode_saved_context[SBI_TRAP_REGS_a5] = 0;

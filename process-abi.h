@@ -27,6 +27,7 @@
 /* STEP kinds after the supervisor's returned (0), preempted (1), fault (2). */
 #define CAPSTONE_PROCESS_STEP_DEAD 3   /* the slot's seal was revoked */
 #define CAPSTONE_PROCESS_STEP_STALE 4  /* (slot, generation) names no current context */
+#define CAPSTONE_PROCESS_STEP_REFUSED 5 /* the seal would not run in C-mode; not entered */
 
 /* Results of FORGET and ADOPT besides 0 and a context id. */
 #define CAPSTONE_PROCESS_STALE -2      /* old generation or ticket */
