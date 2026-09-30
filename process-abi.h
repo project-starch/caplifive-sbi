@@ -46,8 +46,9 @@
 #define CAPSTONE_PROCESS_DESC_TICKET 16
 #define CAPSTONE_PROCESS_DESC_OFFER 32
 #define CAPSTONE_PROCESS_DESC_BYTES 64
-/* Per application, carved off the top of its data region: 8 descriptors, so
- * at most 8 of its contexts registered at once. The driver adds this to the
- * block it allocates, so the declared data is not reduced. */
-#define CAPSTONE_PROCESS_DESC_AREA 512
+/* Per application, carved off the top of its data region: 16 descriptors, so
+ * at most 16 of its contexts registered at once (the first and 15 threads).
+ * The driver adds this to the block it allocates, so the declared data is not
+ * reduced. The slots stay the board's 32 for all applications together. */
+#define CAPSTONE_PROCESS_DESC_AREA 1024
 #endif

@@ -750,25 +750,31 @@ unsigned supervised_events[4];
 #define CONTEXT_SLOT_MINTED 2
 /* A domain of the unmanaged path: never stepped, adopted or reused. */
 #define CONTEXT_SLOT_UNMANAGED 3
-#define CONTEXT_DESC_PER_APP 8
+#define CONTEXT_DESC_PER_APP 16
 #define CONTEXT_DESC_AREA CAPSTONE_PROCESS_DESC_AREA
 /* The last generation a slot is assigned; after it the slot is never used
    again. 31 bits, so that every id (gen << 32) | slot is a positive long: the
    driver takes a negative SBI value for an error, and the launcher hands ids
    to the domain as long with -errno below zero. */
 #define CONTEXT_GEN_LAST 0x7fffffff
-/* TWO HALVES, not one 256-entry pool: capstone-c gives every global its own
-   exactly-sized capability at start-up and computes each size as an addi
-   immediate, so a global larger than 2048 bytes does not assemble ("illegal
-   operands `addi t1,t1,-8192'"). 128 capabilities are exactly 2048 bytes. */
-#define CONTEXT_DESC_HALF_N 128
+/* FOUR QUARTERS, not one 512-entry pool (32 applications, 16 descriptors
+   each): capstone-c gives every global its own exactly-sized capability at
+   start-up and computes each size as an addi immediate, so a global larger
+   than 2048 bytes does not assemble ("illegal operands `addi t1,t1,-8192'").
+   128 capabilities are exactly 2048 bytes. */
+#define CONTEXT_DESC_PART_N 128
+#if CONTEXT_DESC_PART_N != 128 || CAPSTONE_MAX_DOM_N * CONTEXT_DESC_PER_APP > 4 * CONTEXT_DESC_PART_N
+#error "the descriptor pool's four parts do not hold every application's descriptors"
+#endif
 unsigned slot_gen[CAPSTONE_MAX_DOM_N];
 unsigned slot_kind[CAPSTONE_MAX_DOM_N];
 unsigned slot_app[CAPSTONE_MAX_DOM_N];
 unsigned slot_desc[CAPSTONE_MAX_DOM_N];
 unsigned app_desc_used[CAPSTONE_MAX_DOM_N];
-__linear void *desc_pool_lo[CONTEXT_DESC_HALF_N];
-__linear void *desc_pool_hi[CONTEXT_DESC_HALF_N];
+__linear void *desc_pool_0[CONTEXT_DESC_PART_N];
+__linear void *desc_pool_1[CONTEXT_DESC_PART_N];
+__linear void *desc_pool_2[CONTEXT_DESC_PART_N];
+__linear void *desc_pool_3[CONTEXT_DESC_PART_N];
 __rev void *desc_rev[CAPSTONE_MAX_DOM_N];
 unsigned *desc_view[CAPSTONE_MAX_DOM_N];
 unsigned desc_loan[CAPSTONE_MAX_DOM_N];
@@ -828,21 +834,39 @@ static unsigned supervised_invoke(unsigned id, unsigned request, void *argument)
 
 static __linear void *desc_take(unsigned idx) {
     __linear void *block;
-    if (idx < CONTEXT_DESC_HALF_N) {
-        block = desc_pool_lo[idx];
-        desc_pool_lo[idx] = 0;
+    unsigned part;
+    unsigned at;
+    part = idx >> 7;   /* CONTEXT_DESC_PART_N is 128 */
+    at = idx & 127;
+    if (part == 0) {
+        block = desc_pool_0[at];
+        desc_pool_0[at] = 0;
+    } else if (part == 1) {
+        block = desc_pool_1[at];
+        desc_pool_1[at] = 0;
+    } else if (part == 2) {
+        block = desc_pool_2[at];
+        desc_pool_2[at] = 0;
     } else {
-        block = desc_pool_hi[idx - CONTEXT_DESC_HALF_N];
-        desc_pool_hi[idx - CONTEXT_DESC_HALF_N] = 0;
+        block = desc_pool_3[at];
+        desc_pool_3[at] = 0;
     }
     return block;
 }
 
 static void desc_put(unsigned idx, __linear void *block) {
-    if (idx < CONTEXT_DESC_HALF_N) {
-        desc_pool_lo[idx] = block;
+    unsigned part;
+    unsigned at;
+    part = idx >> 7;   /* CONTEXT_DESC_PART_N is 128 */
+    at = idx & 127;
+    if (part == 0) {
+        desc_pool_0[at] = block;
+    } else if (part == 1) {
+        desc_pool_1[at] = block;
+    } else if (part == 2) {
+        desc_pool_2[at] = block;
     } else {
-        desc_pool_hi[idx - CONTEXT_DESC_HALF_N] = block;
+        desc_pool_3[at] = block;
     }
 }
 
