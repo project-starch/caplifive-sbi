@@ -1,14 +1,13 @@
-/* Process platform ABI v1. Keep this wire definition identical in the driver
+/* Process platform ABI. Keep this wire definition identical in the driver
  * and monitor repositories. RV64 only; unavailable on the current FPGA target.
- * QUERY uses selectors 0..3 for low u32 and 4..7 for high u32 of
- * result/cause/pc/address, avoiding the legacy SBI -1 error sentinel.
+ * STEP returns the whole event in one ecall: the kind as the SBI value (a1),
+ * then result, cause, pc and address in a2..a5. The driver issues STEP with
+ * its own ecall that declares a2..a5 clobbered; every other function keeps the
+ * SBI convention. No feature probe: driver and monitor are pinned together.
  */
 #ifndef CAPSTONE_PROCESS_ABI_H
 #define CAPSTONE_PROCESS_ABI_H
-#define CAPSTONE_PROCESS_FEATURES_V1 0x10001
-#define SBI_CAPSTONE_PROCESS_CAPABILITIES 0x20
 #define SBI_CAPSTONE_PROCESS_STEP 0x21
-#define SBI_CAPSTONE_PROCESS_QUERY 0x22
 #define SBI_CAPSTONE_PROCESS_FORGET 0x23
 #define SBI_CAPSTONE_PROCESS_DESTROY 0x24
 #define SBI_CAPSTONE_PROCESS_REGION_CREATE 0x25

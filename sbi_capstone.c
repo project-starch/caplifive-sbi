@@ -776,10 +776,6 @@ static __linear void *managed_reclaim(__rev void *root) {
 #ifdef CAPSTONE_SUPERVISED_CALL
 unsigned supervised_events[4];
 unsigned supervised_results[CAPSTONE_MAX_DOM_N];
-unsigned supervised_kind[CAPSTONE_MAX_DOM_N];
-unsigned supervised_cause[CAPSTONE_MAX_DOM_N];
-unsigned supervised_pc[CAPSTONE_MAX_DOM_N];
-unsigned supervised_address[CAPSTONE_MAX_DOM_N];
 
 /* Leave the VM's emergency reserve available for destruction of all 32 owners.
  * Application MREV/SPLIT also stop at this reserve. Creation fails before any
@@ -805,23 +801,35 @@ static unsigned supervised_invoke(unsigned id, unsigned request, void *argument)
         domains[id] = d;
         return -1;
     }
-    d = __domcallsaves(d, request, argument);
+    /* __domcall, not __domcallsaves: the supervisor snapshots the caller's
+     * whole state at CALL and restores it on every return (capstone_supervisor.c
+     * save_state/restore_state: cpmp, satp, stvec, sepc, ...), and a supervised
+     * domain cannot touch a CPMP CCSR at all. The S-mode save the compiler
+     * wraps around __domcallsaves (16 CPMP swaps out and back, each a TLB
+     * flush in QEMU, plus 9 S/M CSR swaps) would only repeat that. */
+    d = __domcall(d, request, argument);
     domains[id] = d;
-    supervised_kind[id] = supervised_events[0];
-    supervised_cause[id] = supervised_events[1];
-    supervised_pc[id] = supervised_events[2];
-    supervised_address[id] = supervised_events[3];
     return supervised_events[0];
 }
 
 static unsigned supervised_call(unsigned id) {
-    unsigned *result;
+    unsigned *result, kind;
     if (id >= dom_n) { return -1; }
     result = &supervised_results[id];
     __asm__ volatile (".insn i 0x5b, 0, %0, %1, 8"
         : "=r"(result) : "r"(result));
     result = __tighten(result, 2);
-    return supervised_invoke(id, CAPSTONE_DPI_CALL, result);
+    kind = supervised_invoke(id, CAPSTONE_DPI_CALL, result);
+    if (kind == (unsigned)-1) { return -1; }
+    /* The whole event goes back in this one ecall. The kind is the SBI value
+     * (a1); result, cause, pc and address travel in a2..a5, written into the
+     * S-mode trap frame that return_to_sumode restores. STEP is the only
+     * function that clobbers a2..a5, and the driver's ecall declares it. */
+    smode_saved_context[SBI_TRAP_REGS_a2] = supervised_results[id];
+    smode_saved_context[SBI_TRAP_REGS_a3] = supervised_events[1];
+    smode_saved_context[SBI_TRAP_REGS_a4] = supervised_events[2];
+    smode_saved_context[SBI_TRAP_REGS_a5] = supervised_events[3];
+    return kind;
 }
 #endif
 
@@ -1964,20 +1972,6 @@ static unsigned schedule_domain(unsigned dom_id) {
 }
 
 #ifdef CAPSTONE_SUPERVISED_CALL
-static unsigned supervised_query(unsigned id, unsigned field) {
-    unsigned value, selector;
-    if (id >= dom_n) { return -1; }
-    if (field >= 8) { return -1; }
-    selector = field & 3;
-    value = 0;
-    if (selector == 0) { value = supervised_results[id]; }
-    if (selector == 1) { value = supervised_cause[id]; }
-    if (selector == 2) { value = supervised_pc[id]; }
-    if (selector == 3) { value = supervised_address[id]; }
-    if (field >= 4) { return value >> 32; }
-    return value & 0xffffffff;
-}
-
 static unsigned supervised_forget(unsigned id) {
     unsigned status;
     __dom void *d;
@@ -2087,19 +2081,9 @@ unsigned handle_trap_ecall(unsigned arg0, unsigned arg1,
             break;
         case SBI_EXT_CAPSTONE:
             switch(func_code) {
-                case SBI_CAPSTONE_PROCESS_CAPABILITIES: /* process platform ABI and feature bits */
-#ifdef CAPSTONE_SUPERVISED_CALL
-                    res = CAPSTONE_PROCESS_FEATURES_V1;
-#else
-                    res = 0;
-#endif
-                    break;
 #ifdef CAPSTONE_SUPERVISED_CALL
                 case SBI_CAPSTONE_PROCESS_STEP:
                     res = supervised_call(arg0);
-                    break;
-                case SBI_CAPSTONE_PROCESS_QUERY:
-                    res = supervised_query(arg0, arg1);
                     break;
                 case SBI_CAPSTONE_PROCESS_FORGET:
                     res = supervised_forget(arg0);
