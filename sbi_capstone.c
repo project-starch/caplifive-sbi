@@ -59,6 +59,7 @@
 #define CAPSTONE_TAG_SUPA 0x53555041 /* "SUPA" supervised_invoke: cssupervise status (0 armed) */
 #define CAPSTONE_TAG_SUPK 0x5355504b /* "SUPK" supervised_invoke: event kind (0 ret, 1 preempt, 2 fault) */
 #define CAPSTONE_TAG_SUPN 0x5355504e /* "SUPN" classic test hook: preemptions in one call */
+#define CAPSTONE_TAG_SUPM 0x5355504d /* "SUPM" classic test hook: this call supervised (1) or plain (0) */
 /* Error codes for sites that previously had none (they spun with no code at all).
    0x1/0x2 (CAPSTONE_NO_REGION / CAPSTONE_NO_CPMP_REGION) keep their existing values so
    the RTL trace does not change. */
@@ -808,6 +809,14 @@ unsigned supervised_events[4];
 __linear void *sup_save_area;
 /* Slot k's last event was a preemption: its next CALL is a RESUME (csupctl = 1). */
 unsigned slot_paused[CAPSTONE_MAX_DOM_N];
+#ifdef CAPSTONE_SUPERVISE_CLASSIC_TEST
+/* Bit n of the mask: the n-th call_domain of the boot (from 0) runs supervised; calls from the 32nd on always do.
+   Lets one boot pair the SAME image plain and supervised. Default: every call. */
+#ifndef CAPSTONE_SUPERVISE_CLASSIC_MASK
+#define CAPSTONE_SUPERVISE_CLASSIC_MASK 0xffffffff
+#endif
+unsigned sup_classic_calls;
+#endif
 #define SUP_CSR_READ(csr, v) __asm__ volatile ("csrr %0, " #csr : "=r"(v))
 #define SUP_CSR_WRITE(csr, v) __asm__ volatile ("csrw " #csr ", %0" :: "r"(v))
 #endif
@@ -911,7 +920,15 @@ static unsigned supervised_invoke(unsigned id, unsigned request, void *argument)
     __asm__ volatile (".insn r 0x5b, 0x1, 0x22, %0, %1, %2"
         : "=&r"(status) : "r"(d), "r"(save));
     sup_save_area = save;
+#ifdef CAPSTONE_SUPERVISE_QUIET
+    /* QUIET (board test builds): no per-invoke lines. Each costs ~5 ms of UART inside the resume loop, i.e.
+       inside the domain's own cycle bracket; a refused arm is still reported. */
+    if (status != 0) {
+        capstone_report(CAPSTONE_TAG_SUPA, status);
+    }
+#else
     capstone_trace(CAPSTONE_TAG_SUPA, status);
+#endif
     if (status == 1) {
         domains[id] = d;
         return CAPSTONE_PROCESS_STEP_DEAD;
@@ -944,7 +961,9 @@ static unsigned supervised_invoke(unsigned id, unsigned request, void *argument)
     SUP_CSR_READ(0xfc3, ev);
     supervised_events[3] = ev;
     slot_paused[id] = (kind == 1);
+#ifndef CAPSTONE_SUPERVISE_QUIET
     capstone_trace(CAPSTONE_TAG_SUPK, kind);
+#endif
     return kind;
 }
 #else
@@ -1933,6 +1952,22 @@ static unsigned call_domain(unsigned dom_id) {
        console. Not for production: an unbounded resume loop holds the hart for the whole call. */
     unsigned kind;
     unsigned preemptions;
+    unsigned sel;
+    __dom void *d;
+    sel = 1;
+    if (sup_classic_calls < 32) {
+        sel = (CAPSTONE_SUPERVISE_CLASSIC_MASK >> sup_classic_calls) & 1;
+    }
+    sup_classic_calls = sup_classic_calls + 1;
+    capstone_report(CAPSTONE_TAG_SUPM, sel);
+    if (sel == 0) {
+        d = domains[dom_id];
+        capstone_trace(CAPSTONE_TAG_ENT1, dom_id);
+        d = __domcallsaves(d, CAPSTONE_DPI_CALL, &res);
+        capstone_trace(CAPSTONE_TAG_ENT2, res);
+        domains[dom_id] = d;
+        return res;
+    }
     res = 0;
     preemptions = 0;
     slot_paused[dom_id] = 0;
