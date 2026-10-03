@@ -1974,7 +1974,23 @@ static unsigned call_domain(unsigned dom_id) {
     capstone_trace(CAPSTONE_TAG_ENT1, dom_id);
     kind = supervised_invoke(dom_id, CAPSTONE_DPI_CALL, &res);
     while (kind == 1) {
+#ifdef CAPSTONE_SUPERVISE_TRACE_EVENTS
+        /* Board diagnostic: the cause and pc of the first few preemptions. */
+        if (preemptions < 4) {
+            capstone_report(CAPSTONE_TAG_MCAU, supervised_events[1]);
+            capstone_report(CAPSTONE_TAG_MEPC, supervised_events[2]);
+        }
+#endif
         preemptions = preemptions + 1;
+#ifdef CAPSTONE_SUPERVISE_MAX_RESUMES
+        /* Board diagnostic: stop resuming after N preemptions and RETURN, so that a livelock in the resume loop
+           comes back as a result instead of a silent hart. The domain is left paused; SUPK 0x1b marks it. */
+        if (preemptions >= CAPSTONE_SUPERVISE_MAX_RESUMES) {
+            capstone_report(CAPSTONE_TAG_SUPN, preemptions);
+            capstone_report(CAPSTONE_TAG_SUPK, 0x1b);
+            return -1;
+        }
+#endif
         kind = supervised_invoke(dom_id, CAPSTONE_DPI_CALL, &res);
     }
     capstone_report(CAPSTONE_TAG_SUPN, preemptions);
