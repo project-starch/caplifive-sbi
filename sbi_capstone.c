@@ -56,6 +56,9 @@
 #define CAPSTONE_TAG_ALEN 0x414c454e /* "ALEN" requested length */
 #define CAPSTONE_TAG_DBAS 0x44424153 /* "DBAS" create_domain: the domain's LOAD BASE */
 #define CAPSTONE_TAG_DENT 0x44454e54 /* "DENT" create_domain: entry_offset within that base */
+#define CAPSTONE_TAG_SUPA 0x53555041 /* "SUPA" supervised_invoke: cssupervise status (0 armed) */
+#define CAPSTONE_TAG_SUPK 0x5355504b /* "SUPK" supervised_invoke: event kind (0 ret, 1 preempt, 2 fault) */
+#define CAPSTONE_TAG_SUPN 0x5355504e /* "SUPN" classic test hook: preemptions in one call */
 /* Error codes for sites that previously had none (they spun with no code at all).
    0x1/0x2 (CAPSTONE_NO_REGION / CAPSTONE_NO_CPMP_REGION) keep their existing values so
    the RTL trace does not change. */
@@ -779,6 +782,35 @@ static __linear void *managed_reclaim(__rev void *root) {
  * feature keeps the existing hardware instruction set unchanged. */
 #ifdef CAPSTONE_SUPERVISED_CALL
 unsigned supervised_events[4];
+#ifdef CAPSTONE_SUPERVISOR_CSR_EVENTS
+/* SILICON SUPERVISED CALL (capstone-ariane 36a641e0b; llvm-capstone docs/plans/supervised-call-silicon.md,
+ * "Monitor contract implied"). It differs from the VM's supervisor in every place the monitor touches:
+ *   - arm: `cssupervise rd, seal, save` -- rs2 is the monitor's PRIVATE save area (a LINEAR RW capability,
+ *     >= 1 KiB, 16-byte aligned), not an event buffer. rd must differ from rs1 and rs2 (early-clobber).
+ *     Status: 0 armed, 1 dead node, 2 malformed operands (no privilege term on silicon), 3 an event is unread.
+ *   - events: read-to-clear CSRs, csupstatus 0xFC0 = {kind[1:0], valid}, csupcause 0xFC1, csupepc 0xFC2,
+ *     csuptval 0xFC3. Kind 0 returned, 1 preempted, 2 fault -- the same numbers the STEP ABI uses.
+ *   - quantum: csupquantum 0x7C3, cycles, loaded at each armed CALL. Resume: csupctl 0x7C4 bit 0 = 1, then a
+ *     fresh arm and the same CALL; 0 before a first entry.
+ *   - forget: rs1 = x0 (`cssupervise rd, x0, x0`). The VM's `rd, d, x0` is a status-2 refusal here and leaves
+ *     the arm standing.
+ *   - census: csnodefree 0xFC4. There is no collector instruction: the VM's 0x23 opcode is NOT decoded on
+ *     silicon and would trap into the ILLX spin, i.e. wedge the board. Nothing below emits it.
+ * Measured on silicon (bare, 2026-10-02/03): quantum preemption with exactly-once resume, fault events with
+ * the trap stripped, the CLINT timer escape, S-11's seal refusal. */
+#ifndef CAPSTONE_SUPERVISOR_QUANTUM
+/* 2,000,000 cycles = 80 ms at the board's 25 MHz. It must exceed the longest uninterruptible stall: a REVOKE
+   over 16,384 nodes measured 461,252 cycles on silicon (R1 cold series, 2026-10-03). Tighten only with data. */
+#define CAPSTONE_SUPERVISOR_QUANTUM 2000000
+#endif
+/* The private save area, carved once in cap_env_init (wrapper) from sup_save_region. Moved out of this global
+   for the arm and put straight back: the hardware keeps only its base for the SAVE/RESTORE walks. */
+__linear void *sup_save_area;
+/* Slot k's last event was a preemption: its next CALL is a RESUME (csupctl = 1). */
+unsigned slot_paused[CAPSTONE_MAX_DOM_N];
+#define SUP_CSR_READ(csr, v) __asm__ volatile ("csrr %0, " #csr : "=r"(v))
+#define SUP_CSR_WRITE(csr, v) __asm__ volatile ("csrw " #csr ", %0" :: "r"(v))
+#endif
 
 /* CONTEXT SLOTS (docs/plans/delegation-threads.md in llvm-capstone).
  *
@@ -841,13 +873,81 @@ unsigned offer_live[CAPSTONE_MAX_DOM_N];
  * Application MREV/SPLIT also stop at this reserve. Creation fails before any
  * authority is carved, so the Linux allocator can roll back a fresh block. */
 static unsigned managed_can_allocate(void) {
-    unsigned available, selector;
+    unsigned available;
+#ifdef CAPSTONE_SUPERVISOR_CSR_EVENTS
+    SUP_CSR_READ(0xfc4, available);
+#else
+    unsigned selector;
     selector = 7;
     __asm__ volatile (".insn r 0x5b, 0x1, 0x23, %0, %1, x0"
         : "=r"(available) : "r"(selector));
+#endif
     return available >= 288;
 }
 
+#ifdef CAPSTONE_SUPERVISOR_CSR_EVENTS
+static unsigned supervised_invoke(unsigned id, unsigned request, void *argument) {
+    unsigned status;
+    unsigned ev;
+    unsigned kind;
+    unsigned quantum;
+    unsigned resume;
+    __dom void *d;
+    __linear void *save;
+    if (id >= dom_n) {
+        return -1;
+    }
+    d = domains[id];
+    /* A stale unread event makes the arm return 3 and drop: clear it first (csupstatus is read-to-clear). */
+    SUP_CSR_READ(0xfc0, ev);
+    quantum = CAPSTONE_SUPERVISOR_QUANTUM;
+    SUP_CSR_WRITE(0x7c3, quantum);
+    resume = slot_paused[id];
+    SUP_CSR_WRITE(0x7c4, resume);
+    save = sup_save_area;
+    sup_save_area = 0;
+    /* rd early-clobber: rd must not be rs1 or rs2. The ecall path runs with MIE = 0, so nothing can take an
+       interrupt between the arm and the CALL. Exactly one CALL follows (scripts check the generated asm). */
+    __asm__ volatile (".insn r 0x5b, 0x1, 0x22, %0, %1, %2"
+        : "=&r"(status) : "r"(d), "r"(save));
+    sup_save_area = save;
+    capstone_trace(CAPSTONE_TAG_SUPA, status);
+    if (status == 1) {
+        domains[id] = d;
+        return CAPSTONE_PROCESS_STEP_DEAD;
+    }
+    if (status != 0) {
+        /* 2 malformed operands, 3 an unread event (cleared above, so not expected): no arm stands either way. */
+        domains[id] = d;
+        return -1;
+    }
+    /* __domcallsaves, not the VM's __domcall: silicon's first entry is the ordinary 8-register exchange, so the
+       domain would otherwise run with the monitor's CPMP0..15 live. The swap keeps Linux-region capabilities
+       out of the domain; the escape's SAVE/RESTORE then carries the swapped-out (empty) CPMPs, and the
+       compiler's swap-in after CALL + 4 restores the real ones. */
+    d = __domcallsaves(d, request, argument);
+    domains[id] = d;
+    SUP_CSR_READ(0xfc0, ev);
+    if ((ev & 1) == 0) {
+        /* No event although the armed CALL completed: never seen in the bare runs; refuse to guess. */
+        capstone_trace(CAPSTONE_TAG_SUPK, 0xff);
+        slot_paused[id] = 0;
+        return -1;
+    }
+    kind = (ev >> 1) & 3;
+    supervised_events[0] = kind;
+    /* Into locals first: capstone-c does not take an asm output straight into an array element. */
+    SUP_CSR_READ(0xfc1, ev);
+    supervised_events[1] = ev;
+    SUP_CSR_READ(0xfc2, ev);
+    supervised_events[2] = ev;
+    SUP_CSR_READ(0xfc3, ev);
+    supervised_events[3] = ev;
+    slot_paused[id] = (kind == 1);
+    capstone_trace(CAPSTONE_TAG_SUPK, kind);
+    return kind;
+}
+#else
 static unsigned supervised_invoke(unsigned id, unsigned request, void *argument) {
     unsigned status;
     __dom void *d;
@@ -882,6 +982,7 @@ static unsigned supervised_invoke(unsigned id, unsigned request, void *argument)
     domains[id] = d;
     return supervised_events[0];
 }
+#endif
 
 static __linear void *desc_take(unsigned idx) {
     __linear void *block;
@@ -1019,17 +1120,24 @@ static unsigned context_free_slot(void) {
 #define CONTEXT_NODES_LOW 1024
 static unsigned nodes_free(void) {
     unsigned n;
+#ifdef CAPSTONE_SUPERVISOR_CSR_EVENTS
+    SUP_CSR_READ(0xfc4, n);
+#else
     unsigned q;
     q = 7;
     __asm__ volatile (".insn r 0x5b, 0x1, 0x23, %0, %1, x0" : "=r"(n) : "r"(q));
+#endif
     return n;
 }
 
 static unsigned nodes_reserve(void) {
+#ifndef CAPSTONE_SUPERVISOR_CSR_EVENTS
+    /* Silicon has no collector instruction; its pool reclaims on REVOKE (the reclaimer's free list). */
     unsigned r;
     if (nodes_free() < CONTEXT_NODES_LOW) {
         __asm__ volatile (".insn r 0x5b, 0x1, 0x23, %0, x0, x0" : "=r"(r));
     }
+#endif
     return nodes_free();
 }
 
@@ -1118,6 +1226,9 @@ static unsigned context_step(unsigned k, unsigned g) {
     if (slot_kind[k] == CONTEXT_SLOT_FREE) { return CAPSTONE_PROCESS_STEP_STALE; }
     if (slot_kind[k] == CONTEXT_SLOT_UNMANAGED) { return CAPSTONE_PROCESS_STEP_STALE; }
     if (slot_gen[k] != g) { return CAPSTONE_PROCESS_STEP_STALE; }
+#ifdef CAPSTONE_SUPERVISOR_CSR_EVENTS
+    if (slot_ended[k]) { return -1; }
+#endif
     if (desc_loan[k] == 0) {
         if (nodes_reserve() == 0) { return -1; }
         lent = loan_begin(k);
@@ -1153,8 +1264,14 @@ static unsigned supervised_forget(unsigned id) {
         return -1;
     }
     d = domains[id];
+#ifdef CAPSTONE_SUPERVISOR_CSR_EVENTS
+    /* The silicon forget form is rs1 = x0; the VM's rs2 = x0 form is a status-2 refusal here. */
+    __asm__ volatile (".insn r 0x5b, 0x1, 0x22, %0, x0, x0" : "=r"(status));
+    slot_paused[id] = 0;
+#else
     __asm__ volatile (".insn r 0x5b, 0x1, 0x22, %0, %1, x0"
         : "=r"(status) : "r"(d));
+#endif
     domains[id] = d;
     return status;
 }
@@ -1809,6 +1926,33 @@ static unsigned call_domain(unsigned dom_id) {
     }
 
     unsigned res;
+#ifdef CAPSTONE_SUPERVISE_CLASSIC_TEST
+    /* TEST BUILD ONLY (board checkpoint C5): run a CLASSIC domain's ordinary call under supervision and resume
+       every preemption here, in the monitor, so the unmodified host and module see one plain call. Reports
+       the preemption count and the final event, so a real workload's preempt/resume cycle is visible on the
+       console. Not for production: an unbounded resume loop holds the hart for the whole call. */
+    unsigned kind;
+    unsigned preemptions;
+    res = 0;
+    preemptions = 0;
+    slot_paused[dom_id] = 0;
+    capstone_trace(CAPSTONE_TAG_ENT1, dom_id);
+    kind = supervised_invoke(dom_id, CAPSTONE_DPI_CALL, &res);
+    while (kind == 1) {
+        preemptions = preemptions + 1;
+        kind = supervised_invoke(dom_id, CAPSTONE_DPI_CALL, &res);
+    }
+    capstone_report(CAPSTONE_TAG_SUPN, preemptions);
+    capstone_report(CAPSTONE_TAG_SUPK, kind);
+    if (kind != 0) {
+        capstone_report(CAPSTONE_TAG_MCAU, supervised_events[1]);
+        capstone_report(CAPSTONE_TAG_MEPC, supervised_events[2]);
+        capstone_report(CAPSTONE_TAG_MTVL, supervised_events[3]);
+        return -1;
+    }
+    capstone_trace(CAPSTONE_TAG_ENT2, res);
+    return res;
+#else
     __dom void *d = domains[dom_id];
     capstone_trace(CAPSTONE_TAG_ENT1, dom_id);
     d = __domcallsaves(d, CAPSTONE_DPI_CALL, &res);
@@ -1816,6 +1960,7 @@ static unsigned call_domain(unsigned dom_id) {
     domains[dom_id] = d;
 
     return res;
+#endif
 }
 
 
@@ -2614,14 +2759,24 @@ unsigned handle_trap_ecall(unsigned arg0, unsigned arg1,
                     res = managed_reset_region(arg0, 1);
                     break;
                 case SBI_CAPSTONE_PROCESS_COLLECT:
+#ifdef CAPSTONE_SUPERVISOR_CSR_EVENTS
+                    res = 0;
+#else
                     __asm__ volatile (".insn r 0x5b, 0x1, 0x23, %0, x0, x0" : "=r"(res));
+#endif
                     break;
                 case SBI_CAPSTONE_PROCESS_RESUME_SHARE:
                     res = supervised_invoke(arg0, 0, 0);
                     break;
                 case SBI_CAPSTONE_PROCESS_STATS:
+#ifdef CAPSTONE_SUPERVISOR_CSR_EVENTS
+                    /* Only the census exists on silicon (selector 7, "available"); the VM's counters do not. */
+                    res = 0;
+                    if (arg0 == 7) { SUP_CSR_READ(0xfc4, res); }
+#else
                     __asm__ volatile (".insn r 0x5b, 0x1, 0x23, %0, %1, x0"
                         : "=r"(res) : "r"(arg0));
+#endif
                     break;
 #endif
                 case SBI_EXT_CAPSTONE_DOM_CREATE:
