@@ -816,6 +816,14 @@ unsigned slot_paused[CAPSTONE_MAX_DOM_N];
 #define CAPSTONE_SUPERVISE_CLASSIC_MASK 0xffffffff
 #endif
 unsigned sup_classic_calls;
+/* Per-call board-diagnostic switches, set by the hook from CAPSTONE_SUPERVISE_QUIET_MASK / _FENCE_MASK (bit n = call n):
+   sup_quiet suppresses the per-invoke lines (a refused arm still reports); sup_fence puts a `fence` before every arm,
+   i.e. between an escape's SAVE walk and the resume's RESTORE walk. */
+unsigned sup_quiet;
+unsigned sup_fence;
+#ifndef CAPSTONE_SUPERVISE_TRACE_N
+#define CAPSTONE_SUPERVISE_TRACE_N 4
+#endif
 #endif
 #define SUP_CSR_READ(csr, v) __asm__ volatile ("csrr %0, " #csr : "=r"(v))
 #define SUP_CSR_WRITE(csr, v) __asm__ volatile ("csrw " #csr ", %0" :: "r"(v))
@@ -915,6 +923,11 @@ static unsigned supervised_invoke(unsigned id, unsigned request, void *argument)
     SUP_CSR_WRITE(0x7c4, resume);
     save = sup_save_area;
     sup_save_area = 0;
+#ifdef CAPSTONE_SUPERVISE_FENCE_MASK
+    if (sup_fence != 0) {
+        __asm__ volatile ("fence");
+    }
+#endif
     /* rd early-clobber: rd must not be rs1 or rs2. The ecall path runs with MIE = 0, so nothing can take an
        interrupt between the arm and the CALL. Exactly one CALL follows (scripts check the generated asm). */
     __asm__ volatile (".insn r 0x5b, 0x1, 0x22, %0, %1, %2"
@@ -927,7 +940,13 @@ static unsigned supervised_invoke(unsigned id, unsigned request, void *argument)
         capstone_report(CAPSTONE_TAG_SUPA, status);
     }
 #else
+#ifdef CAPSTONE_SUPERVISE_QUIET_MASK
+    if (sup_quiet == 0 || status != 0) {
+        capstone_report(CAPSTONE_TAG_SUPA, status);
+    }
+#else
     capstone_trace(CAPSTONE_TAG_SUPA, status);
+#endif
 #endif
     if (status == 1) {
         domains[id] = d;
@@ -962,7 +981,13 @@ static unsigned supervised_invoke(unsigned id, unsigned request, void *argument)
     supervised_events[3] = ev;
     slot_paused[id] = (kind == 1);
 #ifndef CAPSTONE_SUPERVISE_QUIET
+#ifdef CAPSTONE_SUPERVISE_QUIET_MASK
+    if (sup_quiet == 0) {
+        capstone_report(CAPSTONE_TAG_SUPK, kind);
+    }
+#else
     capstone_trace(CAPSTONE_TAG_SUPK, kind);
+#endif
 #endif
     return kind;
 }
@@ -1955,11 +1980,20 @@ static unsigned call_domain(unsigned dom_id) {
     unsigned sel;
     __dom void *d;
     sel = 1;
+    sup_quiet = 0;
+    sup_fence = 0;
     if (sup_classic_calls < 32) {
         sel = (CAPSTONE_SUPERVISE_CLASSIC_MASK >> sup_classic_calls) & 1;
+#ifdef CAPSTONE_SUPERVISE_QUIET_MASK
+        sup_quiet = (CAPSTONE_SUPERVISE_QUIET_MASK >> sup_classic_calls) & 1;
+#endif
+#ifdef CAPSTONE_SUPERVISE_FENCE_MASK
+        sup_fence = (CAPSTONE_SUPERVISE_FENCE_MASK >> sup_classic_calls) & 1;
+#endif
     }
     sup_classic_calls = sup_classic_calls + 1;
-    capstone_report(CAPSTONE_TAG_SUPM, sel);
+    /* SUPM = supervised (bit 0) | quiet (bit 4) | fence (bit 8) for this call */
+    capstone_report(CAPSTONE_TAG_SUPM, sel + 16 * sup_quiet + 256 * sup_fence);
     if (sel == 0) {
         d = domains[dom_id];
         capstone_trace(CAPSTONE_TAG_ENT1, dom_id);
@@ -1975,8 +2009,8 @@ static unsigned call_domain(unsigned dom_id) {
     kind = supervised_invoke(dom_id, CAPSTONE_DPI_CALL, &res);
     while (kind == 1) {
 #ifdef CAPSTONE_SUPERVISE_TRACE_EVENTS
-        /* Board diagnostic: the cause and pc of the first few preemptions. */
-        if (preemptions < 4) {
+        /* Board diagnostic: the cause and pc of the first CAPSTONE_SUPERVISE_TRACE_N preemptions (loud calls only). */
+        if (preemptions < CAPSTONE_SUPERVISE_TRACE_N && sup_quiet == 0) {
             capstone_report(CAPSTONE_TAG_MCAU, supervised_events[1]);
             capstone_report(CAPSTONE_TAG_MEPC, supervised_events[2]);
         }
