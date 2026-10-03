@@ -5,6 +5,10 @@
 
 #include "sbi_capstone.h"
 
+#if CAPSTONE_MAX_DOM_N != CAPSTONE_PROCESS_SLOTS
+#error "the driver sizes its context records by CAPSTONE_PROCESS_SLOTS"
+#endif
+
 /* Capstone-C defs */
 #define __linear __attribute__((linear))
 #define __dom __attribute__((dom))
@@ -775,7 +779,63 @@ static __linear void *managed_reclaim(__rev void *root) {
  * feature keeps the existing hardware instruction set unchanged. */
 #ifdef CAPSTONE_SUPERVISED_CALL
 unsigned supervised_events[4];
-unsigned supervised_results[CAPSTONE_MAX_DOM_N];
+
+/* CONTEXT SLOTS (docs/plans/delegation-threads.md in llvm-capstone).
+ *
+ * A slot holds one sealed context: an application's first context, which
+ * create_domain builds, or one the application minted itself and offered
+ * through its invocation descriptor, which ADOPT registers. Nothing here knows
+ * what a context is used for. A slot has a generation, never reissued, and an
+ * owning application: the slot of that application's first context, whose
+ * memory holds the descriptors of all its contexts.
+ *
+ * THE DESCRIPTOR. Every call entry lends the context a 64-byte block the
+ * domain has no other authority over (create_domain carves the application's
+ * blocks off the top of its data region before the domain receives that
+ * region): result word at 0, offer ticket at 16, offered seal at 32. The loan
+ * is one capability derived under its own revocation handle; it covers one
+ * logical call, every preemption and resume of it included, and is revoked
+ * when the call ends. An offered seal is taken out before the revoke. */
+#define CONTEXT_SLOT_FREE 0
+#define CONTEXT_SLOT_APP 1
+#define CONTEXT_SLOT_MINTED 2
+/* A domain of the unmanaged path: never stepped, adopted or reused. */
+#define CONTEXT_SLOT_UNMANAGED 3
+#define CONTEXT_DESC_PER_APP 16
+#define CONTEXT_DESC_AREA CAPSTONE_PROCESS_DESC_AREA
+/* The last generation a slot is assigned; after it the slot is never used
+   again. 31 bits, so that every id (gen << 32) | slot is a positive long: the
+   driver takes a negative SBI value for an error, and the launcher hands ids
+   to the domain as long with -errno below zero. */
+#define CONTEXT_GEN_LAST 0x7fffffff
+/* FOUR QUARTERS, not one 512-entry pool (32 applications, 16 descriptors
+   each): capstone-c gives every global its own exactly-sized capability at
+   start-up and computes each size as an addi immediate, so a global larger
+   than 2048 bytes does not assemble ("illegal operands `addi t1,t1,-8192'").
+   128 capabilities are exactly 2048 bytes. */
+#define CONTEXT_DESC_PART_N 128
+#if CONTEXT_DESC_PART_N != 128 || CAPSTONE_MAX_DOM_N * CONTEXT_DESC_PER_APP > 4 * CONTEXT_DESC_PART_N
+#error "the descriptor pool's four parts do not hold every application's descriptors"
+#endif
+unsigned slot_gen[CAPSTONE_MAX_DOM_N];
+unsigned slot_kind[CAPSTONE_MAX_DOM_N];
+unsigned slot_app[CAPSTONE_MAX_DOM_N];
+unsigned slot_desc[CAPSTONE_MAX_DOM_N];
+unsigned app_desc_used[CAPSTONE_MAX_DOM_N];
+__linear void *desc_pool_0[CONTEXT_DESC_PART_N];
+__linear void *desc_pool_1[CONTEXT_DESC_PART_N];
+__linear void *desc_pool_2[CONTEXT_DESC_PART_N];
+__linear void *desc_pool_3[CONTEXT_DESC_PART_N];
+__rev void *desc_rev[CAPSTONE_MAX_DOM_N];
+unsigned *desc_view[CAPSTONE_MAX_DOM_N];
+unsigned desc_loan[CAPSTONE_MAX_DOM_N];
+/* Slot k's context can never run again although its seal stays valid: a STEP
+   ended in a fault (the supervisor keeps the continuation as terminal and
+   never arms it again) or was refused (the seal's privilege is not C-mode). */
+unsigned slot_ended[CAPSTONE_MAX_DOM_N];
+__dom void *offer[CAPSTONE_MAX_DOM_N];
+unsigned offer_ticket[CAPSTONE_MAX_DOM_N];
+unsigned offer_live[CAPSTONE_MAX_DOM_N];
 
 /* Leave the VM's emergency reserve available for destruction of all 32 owners.
  * Application MREV/SPLIT also stop at this reserve. Creation fails before any
@@ -797,6 +857,17 @@ static unsigned supervised_invoke(unsigned id, unsigned request, void *argument)
     d = domains[id];
     __asm__ volatile (".insn r 0x5b, 0x1, 0x22, %0, %1, %2"
         : "=r"(status) : "r"(d), "r"(supervised_events));
+    /* 1: the seal is revoked (or reloaded untagged, ISSUES Q-11). The context
+       can never run again; say so instead of entering it. */
+    if (status == 1) {
+        domains[id] = d;
+        return CAPSTONE_PROCESS_STEP_DEAD;
+    }
+    /* 2: the seal's saved privilege is not C-mode; it is not entered. */
+    if (status == 2) {
+        domains[id] = d;
+        return CAPSTONE_PROCESS_STEP_REFUSED;
+    }
     if (status != 0) {
         domains[id] = d;
         return -1;
@@ -812,24 +883,355 @@ static unsigned supervised_invoke(unsigned id, unsigned request, void *argument)
     return supervised_events[0];
 }
 
-static unsigned supervised_call(unsigned id) {
-    unsigned *result, kind;
-    if (id >= dom_n) { return -1; }
-    result = &supervised_results[id];
-    __asm__ volatile (".insn i 0x5b, 0, %0, %1, 8"
-        : "=r"(result) : "r"(result));
-    result = __tighten(result, 2);
-    kind = supervised_invoke(id, CAPSTONE_DPI_CALL, result);
+static __linear void *desc_take(unsigned idx) {
+    __linear void *block;
+    unsigned part;
+    unsigned at;
+    part = idx >> 7;   /* CONTEXT_DESC_PART_N is 128 */
+    at = idx & 127;
+    if (part == 0) {
+        block = desc_pool_0[at];
+        desc_pool_0[at] = 0;
+    } else if (part == 1) {
+        block = desc_pool_1[at];
+        desc_pool_1[at] = 0;
+    } else if (part == 2) {
+        block = desc_pool_2[at];
+        desc_pool_2[at] = 0;
+    } else {
+        block = desc_pool_3[at];
+        desc_pool_3[at] = 0;
+    }
+    return block;
+}
+
+static void desc_put(unsigned idx, __linear void *block) {
+    unsigned part;
+    unsigned at;
+    part = idx >> 7;   /* CONTEXT_DESC_PART_N is 128 */
+    at = idx & 127;
+    if (part == 0) {
+        desc_pool_0[at] = block;
+    } else if (part == 1) {
+        desc_pool_1[at] = block;
+    } else if (part == 2) {
+        desc_pool_2[at] = block;
+    } else {
+        desc_pool_3[at] = block;
+    }
+}
+
+#ifdef CAPSTONE_TEST_GEN_PRESET
+/* Test firmware only (Probe A, A9): every slot starts at this generation, so
+   that a boot reaches CONTEXT_GEN_LAST within a few assignments. Applied at
+   the first assignment, before any generation has named an id. */
+unsigned test_gen_preset_done;
+static void test_gen_preset(void) {
+    unsigned k;
+    for (k = 0; k < CAPSTONE_MAX_DOM_N; k += 1) {
+        slot_gen[k] = CAPSTONE_TEST_GEN_PRESET;
+    }
+    test_gen_preset_done = 1;
+}
+#endif
+
+/* Slot bookkeeping in small functions of their own. capstone-c mis-allocates
+   registers when a long function stores into many arrays in a row: it spilled
+   an index, loaded an array capability into the same register and used that
+   capability as its own offset (`cincoffset t0, t0, t0`, 2026-09-29, in
+   create_domain and context_adopt; the firmware build now refuses the
+   pattern). Few live values per function keep that from happening. The
+   owning application is set by the caller: passing one variable as two
+   arguments of one call crashes capstone-c (codegen.rs:635, unwrap on None). */
+static unsigned context_assign(unsigned slot, unsigned kind, unsigned local) {
+    unsigned gen;
+#ifdef CAPSTONE_TEST_GEN_PRESET
+    if (test_gen_preset_done == 0) { test_gen_preset(); }
+#endif
+    slot_kind[slot] = kind;
+    slot_desc[slot] = local;
+    desc_loan[slot] = 0;
+    slot_ended[slot] = 0;
+    offer_live[slot] = 0;
+    gen = slot_gen[slot] + 1;
+    slot_gen[slot] = gen;
+    return ((gen << 16) << 16) | slot;
+}
+
+static void app_desc_mark(unsigned app, unsigned local, unsigned used) {
+    unsigned bits;
+    bits = app_desc_used[app];
+    if (used) {
+        bits = bits | (1 << local);
+    } else {
+        bits = bits & ~(1 << local);
+    }
+    app_desc_used[app] = bits;
+}
+
+/* A free descriptor of application app, or CONTEXT_DESC_PER_APP. */
+static unsigned app_desc_free(unsigned app) {
+    unsigned used;
+    unsigned candidate;
+    unsigned found;
+    used = app_desc_used[app];
+    found = CONTEXT_DESC_PER_APP;
+    for (candidate = 0; candidate < CONTEXT_DESC_PER_APP; candidate += 1) {
+        if (found == CONTEXT_DESC_PER_APP) {
+            if (((used >> candidate) & 1) == 0) {
+                found = candidate;
+            }
+        }
+    }
+    return found;
+}
+
+/* A free slot never used by an application's first context and with a
+   generation left, or CAPSTONE_MAX_DOM_N. */
+static unsigned context_free_slot(void) {
+    unsigned candidate;
+    unsigned found;
+    found = CAPSTONE_MAX_DOM_N;
+    for (candidate = 0; candidate < CAPSTONE_MAX_DOM_N; candidate += 1) {
+        if (found == CAPSTONE_MAX_DOM_N) {
+            if (slot_kind[candidate] == CONTEXT_SLOT_FREE) {
+                if (managed_domain_base[candidate] == 0) {
+                    if (slot_gen[candidate] != CONTEXT_GEN_LAST) {
+                        found = candidate;
+                    }
+                }
+            }
+        }
+    }
+    return found;
+}
+
+/* Revocation nodes. Every call's loan takes one (loan_begin's __mrev), and a
+   revoked node becomes free again only once the supervisor's collector has
+   swept its stale copies. The supervisor runs the collector by itself when
+   SUPERVISED code runs short of nodes, which an application that never
+   allocates one never does; the monitor has no reserve (capstone-qemu
+   capstone_require_node), so a long run of calls used to exhaust every node
+   and halt the monitor at the next loan (cause 30). Before a loan the monitor
+   therefore collects whenever fewer than CONTEXT_NODES_LOW are free, as the
+   driver's COLLECT does at a process's end, and refuses the step if even the
+   collector frees none. */
+#define CONTEXT_NODES_LOW 1024
+static unsigned nodes_free(void) {
+    unsigned n;
+    unsigned q;
+    q = 7;
+    __asm__ volatile (".insn r 0x5b, 0x1, 0x23, %0, %1, x0" : "=r"(n) : "r"(q));
+    return n;
+}
+
+static unsigned nodes_reserve(void) {
+    unsigned r;
+    if (nodes_free() < CONTEXT_NODES_LOW) {
+        __asm__ volatile (".insn r 0x5b, 0x1, 0x23, %0, x0, x0" : "=r"(r));
+    }
+    return nodes_free();
+}
+
+/* Lend slot k's descriptor for one logical call. The context receives a
+   write-only alias; the monitor keeps a full alias to read it back. */
+static void *loan_begin(unsigned k) {
+    unsigned idx;
+    __linear void *block;
+    __rev void *rev;
+    unsigned *view;
+    void *lent;
+    idx = slot_app[k] * CONTEXT_DESC_PER_APP + slot_desc[k];
+    block = desc_take(idx);
+    rev = __mrev(block);
+    desc_rev[k] = rev;
+    view = __delin(block);
+    view[0] = 0;
+    view[2] = 0;
+    desc_view[k] = view;
+    desc_loan[k] = 1;
+    lent = __tighten(view, 2);
+    return lent;
+}
+
+/* End slot k's loan: read the result, take an offered seal out, then revoke
+   every derivation of the block and return it, reinitialised, to the pool. */
+/* Whether slot k's outstanding offer still names a live seal. A revoked seal
+   reloads untagged (ISSUES Q-11), so its type is no longer 4. cap_type moves a
+   linear operand, so restore the slot after reading it (as context_seal_live
+   does for domains[]). */
+static unsigned offer_valid(unsigned k) {
+    __dom void *o;
+    unsigned ty;
+    if (offer_live[k] == 0) { return 0; }
+    o = offer[k];
+    ty = cap_type(o);
+    offer[k] = o;
+    return ty == 4;
+}
+
+static unsigned loan_end(unsigned k) {
+    unsigned idx;
+    unsigned *view;
+    unsigned result;
+    unsigned ticket;
+    __dom void *seal;
+    __linear void *block;
+    idx = slot_app[k] * CONTEXT_DESC_PER_APP + slot_desc[k];
+    view = desc_view[k];
+    result = view[0];
+    ticket = view[2];
+    /* ldc copies; it does not clear the source. Clear it here, or the block
+       keeps a second copy of the sealed context and offers it again on the
+       next call (seen 2026-09-29: a consumed offer came back with ticket 0). */
+    __asm__ volatile ("ldc(%0, %1, 32)" : "=r"(seal) : "r"(view));
+    __asm__ volatile ("stc(x0, %0, 32)" :: "r"(view));
+    /* A new seal is offered only when no still-valid offer is outstanding: a
+       first, live offer stays until it is adopted (its FULL is repeatable), and
+       a second offer's ticket is STALE. Once the first offer is revoked
+       (offer_valid is false) the new one replaces it. The consumed source slot
+       was already cleared above. */
+    if (cap_type(seal) == 4) {
+        if (offer_valid(k) == 0) {
+            offer[k] = seal;
+            offer_ticket[k] = ticket;
+            offer_live[k] = 1;
+        }
+    }
+    block = managed_reclaim(desc_rev[k]);
+    desc_put(idx, block);
+    desc_view[k] = 0;
+    desc_loan[k] = 0;
+    return result;
+}
+
+/* STEP: enter (or resume) the context in slot k of generation g. The whole
+ * event goes back in this one ecall: the kind is the SBI value (a1); result,
+ * cause, pc and address travel in a2..a5, written into the S-mode trap frame
+ * that return_to_sumode restores. STEP is the only function that clobbers
+ * a2..a5, and the driver's ecall declares it. */
+static unsigned context_step(unsigned k, unsigned g) {
+    unsigned kind;
+    unsigned result;
+    void *lent;
+    if (k >= dom_n) { return -1; }
+    if (slot_kind[k] == CONTEXT_SLOT_FREE) { return CAPSTONE_PROCESS_STEP_STALE; }
+    if (slot_kind[k] == CONTEXT_SLOT_UNMANAGED) { return CAPSTONE_PROCESS_STEP_STALE; }
+    if (slot_gen[k] != g) { return CAPSTONE_PROCESS_STEP_STALE; }
+    if (desc_loan[k] == 0) {
+        if (nodes_reserve() == 0) { return -1; }
+        lent = loan_begin(k);
+    } else {
+        /* A resume: the supervisor restores the callee's own registers, and the
+           loan it received at the call's first entry is still in force. */
+        lent = __tighten(desc_view[k], 2);
+    }
+    kind = supervised_invoke(k, CAPSTONE_DPI_CALL, lent);
+    if (kind == 2) { slot_ended[k] = 1; }
+    if (kind == CAPSTONE_PROCESS_STEP_REFUSED) { slot_ended[k] = 1; }
+    result = 0;
+    if (kind != 1) {
+        result = loan_end(k);
+    }
     if (kind == (unsigned)-1) { return -1; }
-    /* The whole event goes back in this one ecall. The kind is the SBI value
-     * (a1); result, cause, pc and address travel in a2..a5, written into the
-     * S-mode trap frame that return_to_sumode restores. STEP is the only
-     * function that clobbers a2..a5, and the driver's ecall declares it. */
-    smode_saved_context[SBI_TRAP_REGS_a2] = supervised_results[id];
+    smode_saved_context[SBI_TRAP_REGS_a2] = result;
     smode_saved_context[SBI_TRAP_REGS_a3] = supervised_events[1];
     smode_saved_context[SBI_TRAP_REGS_a4] = supervised_events[2];
     smode_saved_context[SBI_TRAP_REGS_a5] = supervised_events[3];
+    if (kind >= CAPSTONE_PROCESS_STEP_DEAD) {
+        smode_saved_context[SBI_TRAP_REGS_a3] = 0;
+        smode_saved_context[SBI_TRAP_REGS_a4] = 0;
+        smode_saved_context[SBI_TRAP_REGS_a5] = 0;
+    }
     return kind;
+}
+
+static unsigned supervised_forget(unsigned id) {
+    unsigned status;
+    __dom void *d;
+    if (id >= dom_n) {
+        return -1;
+    }
+    d = domains[id];
+    __asm__ volatile (".insn r 0x5b, 0x1, 0x22, %0, %1, x0"
+        : "=r"(status) : "r"(d));
+    domains[id] = d;
+    return status;
+}
+/* Remove slot k's registration: its continuation, an outstanding loan and an
+   unadopted offer. Whether the context completed is none of this function's
+   business, and its memory stays with its application. */
+static void context_remove(unsigned k) {
+    supervised_forget(k);
+    if (desc_loan[k] != 0) {
+        loan_end(k);
+    }
+    offer_live[k] = 0;
+    offer[k] = 0;
+    domains[k] = 0;
+}
+
+/* Retire minted slot k: its registration, loan and offer, and its descriptor. */
+static void context_retire(unsigned k) {
+    unsigned app;
+    context_remove(k);
+    app = slot_app[k];
+    app_desc_mark(app, slot_desc[k], 0);
+    slot_kind[k] = CONTEXT_SLOT_FREE;
+}
+
+/* Dead registrations: the seal is revoked (it reloads untagged, ISSUES Q-11,
+   so its type reads 7 instead of 4) or the context has ended (slot_ended).
+   They are retired when an adoption finds no descriptor (application `app`)
+   or no slot (any application), so they never exhaust either when nobody
+   forgets them. A slot with an outstanding offer is kept until the offer is
+   adopted: retiring it would discard the offered seal, the offering slot of
+   the adoption in progress included. */
+static unsigned context_seal_live(unsigned k) {
+    __dom void *d;
+    unsigned ty;
+    d = domains[k];
+    ty = cap_type(d);
+    domains[k] = d;
+    return ty == 4;
+}
+
+static void context_retire_dead(unsigned app, unsigned any) {
+    unsigned k;
+    unsigned owner;
+    for (k = 0; k < dom_n; k += 1) {
+        if (slot_kind[k] == CONTEXT_SLOT_MINTED) {
+            owner = slot_app[k];
+            if ((any | (owner == app)) != 0) {
+                if (offer_live[k] == 0) {
+                    if ((slot_ended[k] | (context_seal_live(k) == 0)) != 0) {
+                        context_retire(k);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/* A free slot for an application block, retiring dead registrations of any
+   application when none is free; CAPSTONE_MAX_DOM_N when there is none. */
+static unsigned block_free_slot(void) {
+    unsigned slot;
+    slot = context_free_slot();
+    if (slot == CAPSTONE_MAX_DOM_N) {
+        context_retire_dead(0, 1);
+        slot = context_free_slot();
+    }
+    return slot;
+}
+
+/* A cached block moved off its exhausted slot `from`: that slot keeps no
+   record, and it is never assigned again (its generation is the last). */
+static void block_leave_slot(unsigned from) {
+    managed_domain_root[from] = 0;
+    managed_domain_base[from] = 0;
+    managed_domain_size[from] = 0;
+    managed_domain_live[from] = 0;
 }
 #endif
 
@@ -1042,17 +1444,35 @@ static unsigned create_domain(unsigned base_addr, unsigned code_size,
 #ifdef CAPSTONE_SUPERVISED_CALL
     unsigned cached = 0;
     unsigned cache_region = 0;
+    unsigned cache_slot = 0;
     unsigned search;
     if (managed) {
         if (managed_can_allocate() == 0) { return -1; }
+        /* An application declares no globals region (its image is linked by
+           my_first_domain/link.ld), and the descriptor area below takes the top
+           of the data region, where the gp-free ABI parks gp. */
+        if (gpoff != 0) { return -1; }
         for (search = 0; search < dom_n; search += 1) {
             if (managed_domain_base[search] == base_addr) {
                 if (managed_domain_live[search] != 0) { return -1; }
                 if (managed_domain_size[search] != tot_size) { return -1; }
                 domain_slot = search;
+                cache_slot = search;
                 cached = 1;
                 cache_region = managed_domain_region[search];
                 break;
+            }
+        }
+        /* A new block takes a free slot, not the next index: minted contexts
+           may have raised dom_n to the table's end and left free slots below
+           it. A cached block whose slot has had its last generation moves to a
+           free one, so no id is ever reissued. */
+        if (cached == 0) {
+            domain_slot = block_free_slot();
+        }
+        if (cached != 0) {
+            if (slot_gen[cache_slot] == CONTEXT_GEN_LAST) {
+                domain_slot = block_free_slot();
             }
         }
     }
@@ -1120,6 +1540,11 @@ static unsigned create_domain(unsigned base_addr, unsigned code_size,
     __linear void *dom_data;
     __linear void *mem_r;
     __linear void **dom_seal;
+#ifdef CAPSTONE_SUPERVISED_CALL
+    __linear void *desc_rest;
+    __linear void *desc_piece;
+    unsigned desc_j;
+#endif
 
     /* needs one slot for the domain's own region: refuse BEFORE carving (item 1's check, here since
        item 5; on the board it precedes what used to be split_out_cap's post-carve RGNO spin) */
@@ -1147,7 +1572,10 @@ static unsigned create_domain(unsigned base_addr, unsigned code_size,
 #ifdef CAPSTONE_SUPERVISED_CALL
     if (cached) {
         managed_unmap(cache_region);
-        dom_code = managed_reclaim(managed_domain_root[domain_slot]);
+        dom_code = managed_reclaim(managed_domain_root[cache_slot]);
+        if (cache_slot != domain_slot) {
+            block_leave_slot(cache_slot);
+        }
     } else {
         dom_code = split_out_cap(base_addr, tot_size, 1);
     }
@@ -1169,6 +1597,22 @@ static unsigned create_domain(unsigned base_addr, unsigned code_size,
 
     dom_seal = __split(dom_code, base_addr + split_size);
     dom_data = __split(dom_seal, base_addr + split_size + data_off);
+#ifdef CAPSTONE_SUPERVISED_CALL
+    /* An application's descriptor blocks, one per context it may run at once,
+       come off the top of its data region before the domain receives that
+       region: the domain never holds authority over them. The driver adds the
+       area to the block it allocates, so the declared data is not reduced. */
+    if (managed) {
+        desc_rest = __split(dom_data, base_addr + tot_size - CONTEXT_DESC_AREA);
+        for (desc_j = 0; desc_j < CONTEXT_DESC_PER_APP - 1; desc_j += 1) {
+            desc_piece = desc_rest;
+            desc_rest = __split(desc_piece, base_addr + tot_size - CONTEXT_DESC_AREA
+                                + (desc_j + 1) * CAPSTONE_PROCESS_DESC_BYTES);
+            desc_put(domain_slot * CONTEXT_DESC_PER_APP + desc_j, desc_piece);
+        }
+        desc_put(domain_slot * CONTEXT_DESC_PER_APP + CONTEXT_DESC_PER_APP - 1, desc_rest);
+    }
+#endif
 
     /* Large-.rodata delivery (issue C-4b). Copy the initialized-globals bytes of the
        loaded image, [base+GPFREE_GLOBALS_OFFSET, base+code_size), into the FRONT of
@@ -1332,7 +1776,15 @@ static unsigned create_domain(unsigned base_addr, unsigned code_size,
     // PRINT(dom);
 
     domains[domain_slot] = dom;
-    if (domain_slot == dom_n) { dom_n += 1; }
+    if (domain_slot >= dom_n) { dom_n = domain_slot + 1; }
+#ifdef CAPSTONE_SUPERVISED_CALL
+    if (managed) {
+        app_desc_used[domain_slot] = 1;
+        slot_app[domain_slot] = domain_slot;
+        return context_assign(domain_slot, CONTEXT_SLOT_APP, 0);
+    }
+    slot_kind[domain_slot] = CONTEXT_SLOT_UNMANAGED;
+#endif
     return domain_slot;
 }
 
@@ -1972,27 +2424,80 @@ static unsigned schedule_domain(unsigned dom_id) {
 }
 
 #ifdef CAPSTONE_SUPERVISED_CALL
-static unsigned supervised_forget(unsigned id) {
-    unsigned status;
-    __dom void *d;
-    if (id >= dom_n) {
-        return -1;
-    }
-    d = domains[id];
-    __asm__ volatile (".insn r 0x5b, 0x1, 0x22, %0, %1, x0"
-        : "=r"(status) : "r"(d));
-    domains[id] = d;
-    return status;
+/* FORGET a minted context. An old generation cannot reach a replacement. */
+static unsigned context_forget(unsigned k, unsigned g) {
+    if (k >= dom_n) { return CAPSTONE_PROCESS_STALE; }
+    if (slot_gen[k] != g) { return CAPSTONE_PROCESS_STALE; }
+    if (slot_kind[k] != CONTEXT_SLOT_MINTED) { return CAPSTONE_PROCESS_STALE; }
+    context_retire(k);
+    return 0;
 }
+
+/* ADOPT the seal slot k offered with this ticket into a free slot of the same
+ * application. The new slot's owner is the offering context's owner: only code
+ * running in one of that application's contexts can write k's descriptor. When
+ * no slot or descriptor is free the offer stays where it is. */
+static unsigned context_adopt(unsigned k, unsigned g, unsigned ticket) {
+    unsigned app;
+    unsigned local;
+    unsigned slot;
+    if (k >= dom_n) { return CAPSTONE_PROCESS_STALE; }
+    if (slot_kind[k] == CONTEXT_SLOT_FREE) { return CAPSTONE_PROCESS_STALE; }
+    if (slot_kind[k] == CONTEXT_SLOT_UNMANAGED) { return CAPSTONE_PROCESS_STALE; }
+    if (slot_gen[k] != g) { return CAPSTONE_PROCESS_STALE; }
+    if (offer_live[k] == 0) { return CAPSTONE_PROCESS_EMPTY; }
+    if (offer_ticket[k] != ticket) { return CAPSTONE_PROCESS_STALE; }
+    app = slot_app[k];
+    local = app_desc_free(app);
+    if (local == CONTEXT_DESC_PER_APP) {
+        context_retire_dead(app, 0);
+        local = app_desc_free(app);
+    }
+    if (local == CONTEXT_DESC_PER_APP) { return CAPSTONE_PROCESS_FULL; }
+    slot = context_free_slot();
+    if (slot == CAPSTONE_MAX_DOM_N) {
+        context_retire_dead(0, 1);
+        slot = context_free_slot();
+    }
+    if (slot == CAPSTONE_MAX_DOM_N) { return CAPSTONE_PROCESS_FULL; }
+    domains[slot] = offer[k];
+    offer[k] = 0;
+    offer_live[k] = 0;
+    app_desc_mark(app, local, 1);
+    slot_app[slot] = app;
+    if (slot >= dom_n) { dom_n = slot + 1; }
+    return context_assign(slot, CONTEXT_SLOT_MINTED, local);
+}
+
+/* Every minted context of application app, before its memory is reclaimed. */
+static void context_release_app(unsigned app) {
+    unsigned k;
+    for (k = 0; k < dom_n; k += 1) {
+        if (slot_kind[k] == CONTEXT_SLOT_MINTED) {
+            if (slot_app[k] == app) {
+                context_remove(k);
+                slot_kind[k] = CONTEXT_SLOT_FREE;
+            }
+        }
+    }
+}
+
 static unsigned managed_destroy_domain(unsigned id) {
     __linear void *memory;
     unsigned r;
+    unsigned j;
     if (id >= dom_n) { return -1; }
     if (managed_domain_base[id] == 0) { return -1; }
     if (managed_domain_live[id] == 0) { return 0; }
-    supervised_forget(id);
-    domains[id] = 0;
+    context_release_app(id);
+    context_remove(id);
     memory = managed_reclaim(managed_domain_root[id]);
+    /* The reclaim revoked every descriptor block carved from this memory. */
+    for (j = 0; j < CONTEXT_DESC_PER_APP; j += 1) {
+        desc_put(id * CONTEXT_DESC_PER_APP + j, 0);
+    }
+    app_desc_used[id] = 0;
+    slot_kind[id] = CONTEXT_SLOT_FREE;
     managed_domain_root[id] = __mrev(memory);
     r = managed_domain_region[id];
     regions[r] = __delin(memory);
@@ -2083,13 +2588,21 @@ unsigned handle_trap_ecall(unsigned arg0, unsigned arg1,
             switch(func_code) {
 #ifdef CAPSTONE_SUPERVISED_CALL
                 case SBI_CAPSTONE_PROCESS_STEP:
-                    res = supervised_call(arg0);
+                    res = context_step(arg0, arg1);
                     break;
                 case SBI_CAPSTONE_PROCESS_FORGET:
-                    res = supervised_forget(arg0);
+                    res = context_forget(arg0, arg1);
+                    break;
+                case SBI_CAPSTONE_PROCESS_ADOPT:
+                    res = context_adopt(arg0, arg1, arg2);
                     break;
                 case SBI_CAPSTONE_PROCESS_DESTROY:
-                    res = managed_destroy_domain(arg0);
+                    res = -1;
+                    if (arg0 < dom_n) {
+                        if (slot_gen[arg0] == arg1) {
+                            res = managed_destroy_domain(arg0);
+                        }
+                    }
                     break;
                 case SBI_CAPSTONE_PROCESS_REGION_CREATE:
                     res = managed_create_region(arg0, arg1);
