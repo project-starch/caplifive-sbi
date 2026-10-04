@@ -58,6 +58,8 @@
 #define CAPSTONE_TAG_DENT 0x44454e54 /* "DENT" create_domain: entry_offset within that base */
 #define CAPSTONE_TAG_SUPA 0x53555041 /* "SUPA" supervised_invoke: cssupervise status (0 armed) */
 #define CAPSTONE_TAG_SUPK 0x5355504b /* "SUPK" supervised_invoke: event kind (0 ret, 1 preempt, 2 fault) */
+#define CAPSTONE_TAG_STPB 0x53545042 /* "STPB" context_step entered: slot */
+#define CAPSTONE_TAG_STPE 0x53545045 /* "STPE" context_step leaving for Linux: kind, after loan_end */
 #define CAPSTONE_TAG_SUPN 0x5355504e /* "SUPN" classic test hook: preemptions in one call */
 #define CAPSTONE_TAG_SUPM 0x5355504d /* "SUPM" classic test hook: this call supervised (1) or plain (0) */
 /* Error codes for sites that previously had none (they spun with no code at all).
@@ -1266,6 +1268,7 @@ static unsigned context_step(unsigned k, unsigned g) {
     unsigned kind;
     unsigned result;
     void *lent;
+    capstone_trace(CAPSTONE_TAG_STPB, k);
     if (k >= dom_n) { return -1; }
     if (slot_kind[k] == CONTEXT_SLOT_FREE) { return CAPSTONE_PROCESS_STEP_STALE; }
     if (slot_kind[k] == CONTEXT_SLOT_UNMANAGED) { return CAPSTONE_PROCESS_STEP_STALE; }
@@ -1298,6 +1301,7 @@ static unsigned context_step(unsigned k, unsigned g) {
         smode_saved_context[SBI_TRAP_REGS_a4] = 0;
         smode_saved_context[SBI_TRAP_REGS_a5] = 0;
     }
+    capstone_trace(CAPSTONE_TAG_STPE, kind);
     return kind;
 }
 
