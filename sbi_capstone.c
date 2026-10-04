@@ -756,11 +756,17 @@ static void managed_unmap(unsigned id) {
     region_shared_base[id] = 0;
 }
 
-static __linear void *managed_reclaim(__rev void *root) {
-    __linear void *memory;
+/* Reinitialise what a REVOKE returned. The revoke itself stays in the CALLER, next to the load of the revocation
+ * capability, and no __rev value is ever passed to a function. capstone-c treats __rev as copyable and so
+ * caller-saves a live __rev argument with `stc` right before the call (`stc(a0, sp, N); call managed_reclaim` at
+ * every former call site). On silicon STC moves every capability type but NONLIN: it writes cnull back to the
+ * register (capstone-ariane capstone_dyn_unit.anvil:544-548 at 715bdd1fe; llvm-capstone ISSUES Q-12, where
+ * capstone-qemu still copies). The callee then revoked NOT_CAP, raised cause 24 inside M-mode, and the nested trap
+ * at _cap_trap_entry+4 wedged the core: every process-ABI step on silicon (llvm-capstone ISSUES C-76, found by the
+ * B0 board runs of 2026-10-04). A __linear argument is moved into the call, not caller-saved. */
+static __linear void *managed_reinit(__linear void *memory) {
     unsigned cursor;
     unsigned end;
-    memory = __revoke(root);
     if (cap_type(memory) == 3) {
         cursor = __capfield(memory, 2);
         end = cap_end(memory);
@@ -1098,7 +1104,8 @@ static unsigned loan_end(unsigned k) {
             offer_live[k] = 1;
         }
     }
-    block = managed_reclaim(desc_rev[k]);
+    block = __revoke(desc_rev[k]);
+    block = managed_reinit(block);
     desc_put(idx, block);
     desc_view[k] = 0;
     desc_loan[k] = 0;
@@ -1572,7 +1579,8 @@ static unsigned create_domain(unsigned base_addr, unsigned code_size,
 #ifdef CAPSTONE_SUPERVISED_CALL
     if (cached) {
         managed_unmap(cache_region);
-        dom_code = managed_reclaim(managed_domain_root[cache_slot]);
+        dom_code = __revoke(managed_domain_root[cache_slot]);
+        dom_code = managed_reinit(dom_code);
         if (cache_slot != domain_slot) {
             block_leave_slot(cache_slot);
         }
@@ -2491,7 +2499,8 @@ static unsigned managed_destroy_domain(unsigned id) {
     if (managed_domain_live[id] == 0) { return 0; }
     context_release_app(id);
     context_remove(id);
-    memory = managed_reclaim(managed_domain_root[id]);
+    memory = __revoke(managed_domain_root[id]);
+    memory = managed_reinit(memory);
     /* The reclaim revoked every descriptor block carved from this memory. */
     for (j = 0; j < CONTEXT_DESC_PER_APP; j += 1) {
         desc_put(id * CONTEXT_DESC_PER_APP + j, 0);
@@ -2527,7 +2536,8 @@ static unsigned managed_reset_region(unsigned id, unsigned prepare) {
         if (managed_can_allocate() == 0) { return -1; }
     }
     managed_unmap(id);
-    memory = managed_reclaim(managed_region_root[id]);
+    memory = __revoke(managed_region_root[id]);
+    memory = managed_reinit(memory);
     managed_region_root[id] = __mrev(memory);
     if (prepare) {
         regions[id] = memory;
