@@ -60,6 +60,8 @@
 #define CAPSTONE_TAG_SUPK 0x5355504b /* "SUPK" supervised_invoke: event kind (0 ret, 1 preempt, 2 fault) */
 #define CAPSTONE_TAG_STPB 0x53545042 /* "STPB" context_step entered: slot */
 #define CAPSTONE_TAG_STPE 0x53545045 /* "STPE" context_step leaving for Linux: kind, after loan_end */
+#define CAPSTONE_TAG_LNDE 0x4c4e4445 /* "LNDE" loan_end progress: the stage just completed (1..6) */
+#define CAPSTONE_TAG_MRCL 0x4d52434c /* "MRCL" managed_reclaim progress: 1 revoked, 2 reinitialised */
 #define CAPSTONE_TAG_SUPN 0x5355504e /* "SUPN" classic test hook: preemptions in one call */
 #define CAPSTONE_TAG_SUPM 0x5355504d /* "SUPM" classic test hook: this call supervised (1) or plain (0) */
 /* Error codes for sites that previously had none (they spun with no code at all).
@@ -767,6 +769,7 @@ static __linear void *managed_reclaim(__rev void *root) {
     unsigned cursor;
     unsigned end;
     memory = __revoke(root);
+    capstone_trace(CAPSTONE_TAG_MRCL, 1);
     if (cap_type(memory) == 3) {
         cursor = __capfield(memory, 2);
         end = cap_end(memory);
@@ -777,6 +780,7 @@ static __linear void *managed_reclaim(__rev void *root) {
         }
         C_INIT(memory, memory, 0);
     }
+    capstone_trace(CAPSTONE_TAG_MRCL, 2);
     return memory;
 }
 #endif
@@ -1235,11 +1239,14 @@ static unsigned loan_end(unsigned k) {
     view = desc_view[k];
     result = view[0];
     ticket = view[2];
+    capstone_trace(CAPSTONE_TAG_LNDE, 1);
     /* ldc copies; it does not clear the source. Clear it here, or the block
        keeps a second copy of the sealed context and offers it again on the
        next call (seen 2026-09-29: a consumed offer came back with ticket 0). */
     __asm__ volatile ("ldc(%0, %1, 32)" : "=r"(seal) : "r"(view));
+    capstone_trace(CAPSTONE_TAG_LNDE, 2);
     __asm__ volatile ("stc(x0, %0, 32)" :: "r"(view));
+    capstone_trace(CAPSTONE_TAG_LNDE, 3);
     /* A new seal is offered only when no still-valid offer is outstanding: a
        first, live offer stays until it is adopted (its FULL is repeatable), and
        a second offer's ticket is STALE. Once the first offer is revoked
@@ -1252,8 +1259,11 @@ static unsigned loan_end(unsigned k) {
             offer_live[k] = 1;
         }
     }
+    capstone_trace(CAPSTONE_TAG_LNDE, 4);
     block = managed_reclaim(desc_rev[k]);
+    capstone_trace(CAPSTONE_TAG_LNDE, 5);
     desc_put(idx, block);
+    capstone_trace(CAPSTONE_TAG_LNDE, 6);
     desc_view[k] = 0;
     desc_loan[k] = 0;
     return result;
