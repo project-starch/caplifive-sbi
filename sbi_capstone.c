@@ -58,6 +58,13 @@
 #define CAPSTONE_TAG_DENT 0x44454e54 /* "DENT" create_domain: entry_offset within that base */
 #define CAPSTONE_TAG_SUPA 0x53555041 /* "SUPA" supervised_invoke: cssupervise status (0 armed) */
 #define CAPSTONE_TAG_SUPK 0x5355504b /* "SUPK" supervised_invoke: event kind (0 ret, 1 preempt, 2 fault) */
+/* B0.7 step diagnostics (STPB/STPE/LNBG/LNDE/MRCL): ~16 UART lines per step, which at 57,600 baud starves and
+   garbles Linux's console in a long run, so they are opt-in. */
+#ifdef CAPSTONE_LOAN_TRACE
+#define LOAN_TRACE(tag, v) capstone_trace(tag, v)
+#else
+#define LOAN_TRACE(tag, v)
+#endif
 #define CAPSTONE_TAG_STPB 0x53545042 /* "STPB" context_step entered: slot */
 #define CAPSTONE_TAG_STPE 0x53545045 /* "STPE" context_step leaving for Linux: kind, after loan_end */
 #define CAPSTONE_TAG_LNBG 0x4c4e4247 /* "LNBG" loan_begin: 0x10/0x20/0x30/0x50 + the type of block, rev, block after mrev, view */
@@ -777,7 +784,7 @@ static void managed_unmap(unsigned id) {
 static __linear void *managed_reinit(__linear void *memory) {
     unsigned cursor;
     unsigned end;
-    capstone_trace(CAPSTONE_TAG_MRCL, 0x10 + cap_type(memory));
+    LOAN_TRACE(CAPSTONE_TAG_MRCL, 0x10 + cap_type(memory));
     if (cap_type(memory) == 3) {
         cursor = __capfield(memory, 2);
         end = cap_end(memory);
@@ -788,7 +795,7 @@ static __linear void *managed_reinit(__linear void *memory) {
         }
         C_INIT(memory, memory, 0);
     }
-    capstone_trace(CAPSTONE_TAG_MRCL, 2);
+    LOAN_TRACE(CAPSTONE_TAG_MRCL, 2);
     return memory;
 }
 #endif
@@ -1209,13 +1216,13 @@ static void *loan_begin(unsigned k) {
     void *lent;
     idx = slot_app[k] * CONTEXT_DESC_PER_APP + slot_desc[k];
     block = desc_take(idx);
-    capstone_trace(CAPSTONE_TAG_LNBG, 0x10 + cap_type(block));
+    LOAN_TRACE(CAPSTONE_TAG_LNBG, 0x10 + cap_type(block));
     rev = __mrev(block);
-    capstone_trace(CAPSTONE_TAG_LNBG, 0x20 + cap_type(rev));
-    capstone_trace(CAPSTONE_TAG_LNBG, 0x30 + cap_type(block));
+    LOAN_TRACE(CAPSTONE_TAG_LNBG, 0x20 + cap_type(rev));
+    LOAN_TRACE(CAPSTONE_TAG_LNBG, 0x30 + cap_type(block));
     desc_rev[k] = rev;
     view = __delin(block);
-    capstone_trace(CAPSTONE_TAG_LNBG, 0x50 + cap_type(view));
+    LOAN_TRACE(CAPSTONE_TAG_LNBG, 0x50 + cap_type(view));
     view[0] = 0;
     view[2] = 0;
     desc_view[k] = view;
@@ -1251,14 +1258,14 @@ static unsigned loan_end(unsigned k) {
     view = desc_view[k];
     result = view[0];
     ticket = view[2];
-    capstone_trace(CAPSTONE_TAG_LNDE, 1);
+    LOAN_TRACE(CAPSTONE_TAG_LNDE, 1);
     /* ldc copies; it does not clear the source. Clear it here, or the block
        keeps a second copy of the sealed context and offers it again on the
        next call (seen 2026-09-29: a consumed offer came back with ticket 0). */
     __asm__ volatile ("ldc(%0, %1, 32)" : "=r"(seal) : "r"(view));
-    capstone_trace(CAPSTONE_TAG_LNDE, 2);
+    LOAN_TRACE(CAPSTONE_TAG_LNDE, 2);
     __asm__ volatile ("stc(x0, %0, 32)" :: "r"(view));
-    capstone_trace(CAPSTONE_TAG_LNDE, 3);
+    LOAN_TRACE(CAPSTONE_TAG_LNDE, 3);
     /* A new seal is offered only when no still-valid offer is outstanding: a
        first, live offer stays until it is adopted (its FULL is repeatable), and
        a second offer's ticket is STALE. Once the first offer is revoked
@@ -1271,12 +1278,12 @@ static unsigned loan_end(unsigned k) {
             offer_live[k] = 1;
         }
     }
-    capstone_trace(CAPSTONE_TAG_LNDE, 4);
+    LOAN_TRACE(CAPSTONE_TAG_LNDE, 4);
     block = __revoke(desc_rev[k]);
     block = managed_reinit(block);
-    capstone_trace(CAPSTONE_TAG_LNDE, 5);
+    LOAN_TRACE(CAPSTONE_TAG_LNDE, 5);
     desc_put(idx, block);
-    capstone_trace(CAPSTONE_TAG_LNDE, 6);
+    LOAN_TRACE(CAPSTONE_TAG_LNDE, 6);
     desc_view[k] = 0;
     desc_loan[k] = 0;
     return result;
@@ -1291,7 +1298,7 @@ static unsigned context_step(unsigned k, unsigned g) {
     unsigned kind;
     unsigned result;
     void *lent;
-    capstone_trace(CAPSTONE_TAG_STPB, k);
+    LOAN_TRACE(CAPSTONE_TAG_STPB, k);
     if (k >= dom_n) { return -1; }
     if (slot_kind[k] == CONTEXT_SLOT_FREE) { return CAPSTONE_PROCESS_STEP_STALE; }
     if (slot_kind[k] == CONTEXT_SLOT_UNMANAGED) { return CAPSTONE_PROCESS_STEP_STALE; }
@@ -1324,7 +1331,7 @@ static unsigned context_step(unsigned k, unsigned g) {
         smode_saved_context[SBI_TRAP_REGS_a4] = 0;
         smode_saved_context[SBI_TRAP_REGS_a5] = 0;
     }
-    capstone_trace(CAPSTONE_TAG_STPE, kind);
+    LOAN_TRACE(CAPSTONE_TAG_STPE, kind);
     return kind;
 }
 
