@@ -60,9 +60,9 @@
 #define CAPSTONE_TAG_SUPK 0x5355504b /* "SUPK" supervised_invoke: event kind (0 ret, 1 preempt, 2 fault) */
 #define CAPSTONE_TAG_STPB 0x53545042 /* "STPB" context_step entered: slot */
 #define CAPSTONE_TAG_STPE 0x53545045 /* "STPE" context_step leaving for Linux: kind, after loan_end */
-#define CAPSTONE_TAG_LNBG 0x4c4e4247 /* "LNBG" loan_begin: 0x10/0x20/0x30/0x40/0x50 + the type of block, rev, block after mrev, desc_rev[k] reloaded, view */
+#define CAPSTONE_TAG_LNBG 0x4c4e4247 /* "LNBG" loan_begin: 0x10/0x20/0x30/0x50 + the type of block, rev, block after mrev, view */
 #define CAPSTONE_TAG_LNDE 0x4c4e4445 /* "LNDE" loan_end progress: the stage just completed (1..6) */
-#define CAPSTONE_TAG_MRCL 0x4d52434c /* "MRCL" managed_reclaim progress: 0xf entered, 0x10+type root before revoke, 1 revoked, 2 reinitialised */
+#define CAPSTONE_TAG_MRCL 0x4d52434c /* "MRCL" managed_reinit: 0x10 + the type REVOKE returned, 2 reinitialised */
 #define CAPSTONE_TAG_SUPN 0x5355504e /* "SUPN" classic test hook: preemptions in one call */
 #define CAPSTONE_TAG_SUPM 0x5355504d /* "SUPM" classic test hook: this call supervised (1) or plain (0) */
 /* Error codes for sites that previously had none (they spun with no code at all).
@@ -765,17 +765,19 @@ static void managed_unmap(unsigned id) {
     region_shared_base[id] = 0;
 }
 
-static __linear void *managed_reclaim(__rev void *root) {
-    __linear void *memory;
+/* Reinitialise what a REVOKE returned. The revoke itself stays in the CALLER, next to the load of the revocation
+ * capability, and no __rev value is ever passed to a function. capstone-c treats __rev as copyable and so
+ * caller-saves a live __rev argument with `stc` right before the call (`stc(a0, sp, N); call managed_reclaim` at
+ * all four former call sites). On silicon STC moves every capability type except NONLIN: it writes cnull back to
+ * the register (capstone_dyn_unit.anvil:544-548 at 715bdd1fe; ISSUES Q-12, where capstone-qemu still copies). So
+ * the callee received cnull, its REVOKE raised cause 24 inside M-mode, and the nested trap at _cap_trap_entry+4
+ * wedged the core (B0.7 attempts 5-9, 2026-10-04). A __linear argument is moved into the call, not saved.
+ * MRCL 0x10 + type traces what REVOKE returned: silicon returns LINEAR (0) for a block whose descendants were
+ * DELINed, so the UNINIT reinitialisation below does not run there. */
+static __linear void *managed_reinit(__linear void *memory) {
     unsigned cursor;
     unsigned end;
-    /* B0.7 attempt 8: 0xF = entered (the prologue's stores done); 0x10 + type = root read as a capability just
-       before the revoke. An lcc on a NON-capability faults (cause 24), so a missing 0x1t with 0xF present says
-       root reloaded as an integer. */
-    capstone_trace(CAPSTONE_TAG_MRCL, 0xf);
-    capstone_trace(CAPSTONE_TAG_MRCL, 0x10 + cap_type(root));
-    memory = __revoke(root);
-    capstone_trace(CAPSTONE_TAG_MRCL, 1);
+    capstone_trace(CAPSTONE_TAG_MRCL, 0x10 + cap_type(memory));
     if (cap_type(memory) == 3) {
         cursor = __capfield(memory, 2);
         end = cap_end(memory);
@@ -1212,7 +1214,6 @@ static void *loan_begin(unsigned k) {
     capstone_trace(CAPSTONE_TAG_LNBG, 0x20 + cap_type(rev));
     capstone_trace(CAPSTONE_TAG_LNBG, 0x30 + cap_type(block));
     desc_rev[k] = rev;
-    capstone_trace(CAPSTONE_TAG_LNBG, 0x40 + cap_type(desc_rev[k]));
     view = __delin(block);
     capstone_trace(CAPSTONE_TAG_LNBG, 0x50 + cap_type(view));
     view[0] = 0;
@@ -1271,8 +1272,8 @@ static unsigned loan_end(unsigned k) {
         }
     }
     capstone_trace(CAPSTONE_TAG_LNDE, 4);
-    capstone_trace(CAPSTONE_TAG_LNDE, 0x40 + cap_type(desc_rev[k]));
-    block = managed_reclaim(desc_rev[k]);
+    block = __revoke(desc_rev[k]);
+    block = managed_reinit(block);
     capstone_trace(CAPSTONE_TAG_LNDE, 5);
     desc_put(idx, block);
     capstone_trace(CAPSTONE_TAG_LNDE, 6);
@@ -1767,7 +1768,8 @@ static unsigned create_domain(unsigned base_addr, unsigned code_size,
 #ifdef CAPSTONE_SUPERVISED_CALL
     if (cached) {
         managed_unmap(cache_region);
-        dom_code = managed_reclaim(managed_domain_root[cache_slot]);
+        dom_code = __revoke(managed_domain_root[cache_slot]);
+        dom_code = managed_reinit(dom_code);
         if (cache_slot != domain_slot) {
             block_leave_slot(cache_slot);
         }
@@ -2755,7 +2757,8 @@ static unsigned managed_destroy_domain(unsigned id) {
     if (managed_domain_live[id] == 0) { return 0; }
     context_release_app(id);
     context_remove(id);
-    memory = managed_reclaim(managed_domain_root[id]);
+    memory = __revoke(managed_domain_root[id]);
+    memory = managed_reinit(memory);
     /* The reclaim revoked every descriptor block carved from this memory. */
     for (j = 0; j < CONTEXT_DESC_PER_APP; j += 1) {
         desc_put(id * CONTEXT_DESC_PER_APP + j, 0);
@@ -2791,7 +2794,8 @@ static unsigned managed_reset_region(unsigned id, unsigned prepare) {
         if (managed_can_allocate() == 0) { return -1; }
     }
     managed_unmap(id);
-    memory = managed_reclaim(managed_region_root[id]);
+    memory = __revoke(managed_region_root[id]);
+    memory = managed_reinit(memory);
     managed_region_root[id] = __mrev(memory);
     if (prepare) {
         regions[id] = memory;
