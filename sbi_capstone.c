@@ -60,6 +60,7 @@
 #define CAPSTONE_TAG_SUPK 0x5355504b /* "SUPK" supervised_invoke: event kind (0 ret, 1 preempt, 2 fault) */
 #define CAPSTONE_TAG_STPB 0x53545042 /* "STPB" context_step entered: slot */
 #define CAPSTONE_TAG_STPE 0x53545045 /* "STPE" context_step leaving for Linux: kind, after loan_end */
+#define CAPSTONE_TAG_LNBG 0x4c4e4247 /* "LNBG" loan_begin: 0x10/0x20/0x30/0x40/0x50 + the type of block, rev, block after mrev, desc_rev[k] reloaded, view */
 #define CAPSTONE_TAG_LNDE 0x4c4e4445 /* "LNDE" loan_end progress: the stage just completed (1..6) */
 #define CAPSTONE_TAG_MRCL 0x4d52434c /* "MRCL" managed_reclaim progress: 0xf entered, 0x10+type root before revoke, 1 revoked, 2 reinitialised */
 #define CAPSTONE_TAG_SUPN 0x5355504e /* "SUPN" classic test hook: preemptions in one call */
@@ -1206,9 +1207,14 @@ static void *loan_begin(unsigned k) {
     void *lent;
     idx = slot_app[k] * CONTEXT_DESC_PER_APP + slot_desc[k];
     block = desc_take(idx);
+    capstone_trace(CAPSTONE_TAG_LNBG, 0x10 + cap_type(block));
     rev = __mrev(block);
+    capstone_trace(CAPSTONE_TAG_LNBG, 0x20 + cap_type(rev));
+    capstone_trace(CAPSTONE_TAG_LNBG, 0x30 + cap_type(block));
     desc_rev[k] = rev;
+    capstone_trace(CAPSTONE_TAG_LNBG, 0x40 + cap_type(desc_rev[k]));
     view = __delin(block);
+    capstone_trace(CAPSTONE_TAG_LNBG, 0x50 + cap_type(view));
     view[0] = 0;
     view[2] = 0;
     desc_view[k] = view;
@@ -1265,6 +1271,7 @@ static unsigned loan_end(unsigned k) {
         }
     }
     capstone_trace(CAPSTONE_TAG_LNDE, 4);
+    capstone_trace(CAPSTONE_TAG_LNDE, 0x40 + cap_type(desc_rev[k]));
     block = managed_reclaim(desc_rev[k]);
     capstone_trace(CAPSTONE_TAG_LNDE, 5);
     desc_put(idx, block);
