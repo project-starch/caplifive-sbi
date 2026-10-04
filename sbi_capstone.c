@@ -61,7 +61,7 @@
 #define CAPSTONE_TAG_STPB 0x53545042 /* "STPB" context_step entered: slot */
 #define CAPSTONE_TAG_STPE 0x53545045 /* "STPE" context_step leaving for Linux: kind, after loan_end */
 #define CAPSTONE_TAG_LNDE 0x4c4e4445 /* "LNDE" loan_end progress: the stage just completed (1..6) */
-#define CAPSTONE_TAG_MRCL 0x4d52434c /* "MRCL" managed_reclaim progress: 1 revoked, 2 reinitialised */
+#define CAPSTONE_TAG_MRCL 0x4d52434c /* "MRCL" managed_reclaim progress: 0xf entered, 0x10+type root before revoke, 1 revoked, 2 reinitialised */
 #define CAPSTONE_TAG_SUPN 0x5355504e /* "SUPN" classic test hook: preemptions in one call */
 #define CAPSTONE_TAG_SUPM 0x5355504d /* "SUPM" classic test hook: this call supervised (1) or plain (0) */
 /* Error codes for sites that previously had none (they spun with no code at all).
@@ -768,6 +768,11 @@ static __linear void *managed_reclaim(__rev void *root) {
     __linear void *memory;
     unsigned cursor;
     unsigned end;
+    /* B0.7 attempt 8: 0xF = entered (the prologue's stores done); 0x10 + type = root read as a capability just
+       before the revoke. An lcc on a NON-capability faults (cause 24), so a missing 0x1t with 0xF present says
+       root reloaded as an integer. */
+    capstone_trace(CAPSTONE_TAG_MRCL, 0xf);
+    capstone_trace(CAPSTONE_TAG_MRCL, 0x10 + cap_type(root));
     memory = __revoke(root);
     capstone_trace(CAPSTONE_TAG_MRCL, 1);
     if (cap_type(memory) == 3) {
