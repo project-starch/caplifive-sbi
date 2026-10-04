@@ -1595,6 +1595,11 @@ static unsigned create_domain(unsigned base_addr, unsigned code_size,
        globals boundary, and those always declare it (.capstone_gp_initdesc, verified
        present in a built board domain), so keying on it is exact rather than heuristic. */
     unsigned gpoff = 0;
+    /* The top of the data region the DOMAIN receives. A managed application loses the top
+       CONTEXT_DESC_AREA of its block to context descriptors (below), so its globals blob and
+       the gp park must fit under that, not under tot_size. Function scope: capstone-c rejects
+       a declaration in a nested block. */
+    unsigned data_top = tot_size;
     if (globals_off) {
         gpoff = globals_off;
     }
@@ -1609,10 +1614,13 @@ static unsigned create_domain(unsigned base_addr, unsigned code_size,
     unsigned search;
     if (managed) {
         if (managed_can_allocate() == 0) { return -1; }
-        /* An application declares no globals region (its image is linked by
-           my_first_domain/link.ld), and the descriptor area below takes the top
-           of the data region, where the gp-free ABI parks gp. */
-        if (gpoff != 0) { return -1; }
+        /* An application MAY declare a globals region (B0, docs/plans/b0-silicon-delegated-
+           runtime.md: a gp-captable image, the silicon ABI). Until 2026-10-04 that was refused,
+           because the descriptor area below takes the top of the data region where the gp-free
+           ABI parks gp. The park and the globals blob now go under the descriptor area instead
+           (data_top); the gp-captable glue carves its table from its data capability's END,
+           which after the descriptor split is data_top, so it needs no offset of its own. */
+        data_top = tot_size - CONTEXT_DESC_AREA;
         for (search = 0; search < dom_n; search += 1) {
             if (managed_domain_base[search] == base_addr) {
                 if (managed_domain_live[search] != 0) { return -1; }
@@ -1826,8 +1834,8 @@ static unsigned create_domain(unsigned base_addr, unsigned code_size,
        a domain that has no globals at all. */
     if(gpoff != 0
        && code_size > gpoff
-       && tot_size > split_size + data_off
-       && (code_size - gpoff) > (tot_size - split_size - DOMAIN_DATA_SIZE)) {
+       && data_top > split_size + data_off
+       && (code_size - gpoff) > (data_top - split_size - DOMAIN_DATA_SIZE)) {
         /* The blob does not fit in dom_data. This used to SKIP the copy silently,
            on the reasoning that "the glue only reads the blob for globals that took
            the copy path" -- which is exactly backwards once a global DOES take it:
@@ -1839,7 +1847,7 @@ static unsigned create_domain(unsigned base_addr, unsigned code_size,
     }
     if(gpoff != 0
        && code_size > gpoff
-       && tot_size > split_size + data_off) {
+       && data_top > split_size + data_off) {
         /* 8-BYTE UNITS, not 16. With dom_code/dom_data correctly typed as `__linear void *`
            (one declarator per line above), subscripting steps ONE WORD and the loop body emits a
            scalar ld/sd -- which is the whole point: it never touches compress_cap, so plain data
@@ -1885,7 +1893,7 @@ static unsigned create_domain(unsigned base_addr, unsigned code_size,
 
     // store gp (linear; glue delins on first entry) into the cscratch top slot
     if (dom_gp != 0) {
-        C_SET_CURSOR(dom_data, dom_data, base_addr + tot_size - 16);
+        C_SET_CURSOR(dom_data, dom_data, base_addr + data_top - 16);
         *(__linear void **)dom_data = dom_gp;
         C_SET_CURSOR(dom_data, dom_data, base_addr + split_size + data_off);
     }
