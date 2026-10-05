@@ -1747,6 +1747,8 @@ static unsigned create_domain(unsigned base_addr, unsigned code_size,
     __linear void *desc_rest;
     __linear void *desc_piece;
     unsigned desc_j;
+    void *dom_code_nl;
+    unsigned code_parked;
 #endif
 
     /* needs one slot for the domain's own region: refuse BEFORE carving (item 1's check, here since
@@ -1934,7 +1936,32 @@ static unsigned create_domain(unsigned base_addr, unsigned code_size,
     }
 
     // construct the sealed region of the domain
+#ifdef CAPSTONE_SUPERVISED_CALL
+    /* B1.3 (llvm-capstone docs/plans/b0-silicon-delegated-runtime.md): a managed gp-captable application mints
+       contexts, and each context's seal needs a CODE capability whose cursor is the context entry. On silicon the
+       domain cannot make one: auipc/lla give integers and no instruction copies PCC into a register. So the monitor
+       hands it one. dom_code is delinearized and a copy is parked at data_top - 32, beside the gp park; the glue
+       reads it on its first entry, before it carves anything from the top of its data region. The domain is
+       sealed with the same NONLIN capability (pc_cap_check accepts LINEAR or NONLIN). Reclaim is unchanged: every
+       alias is derived from managed_domain_root, whose revoke kills them all. Other domains are untouched. */
+    code_parked = 0;
+    if (managed != 0) {
+        if (gpoff != 0 && code_size > gpoff) {
+            dom_code_nl = __delin(dom_code);
+            C_SET_CURSOR(dom_data, dom_data, base_addr + data_top - 32);
+            *(void **)dom_data = dom_code_nl;
+            C_SET_CURSOR(dom_data, dom_data, base_addr + split_size + data_off);
+            code_parked = 1;
+        }
+    }
+    if (code_parked != 0) {
+        dom_seal[0] = dom_code_nl;
+    } else {
+        dom_seal[0] = dom_code;
+    }
+#else
     dom_seal[0] = dom_code;
+#endif
 #ifdef CAPSTONE_DOMAIN_TRAP_VECTOR
     /* THE ACCEPTANCE TEST for "a domain enters with NO trap vector".
      *
