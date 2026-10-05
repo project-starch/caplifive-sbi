@@ -1734,6 +1734,20 @@ static unsigned create_domain(unsigned base_addr, unsigned code_size,
     split_size = split_size - (split_size & (repr_gran - 1));
     data_off = DOMAIN_DATA_SIZE + repr_gran - 1;
     data_off = data_off - (data_off & (repr_gran - 1));
+#ifdef CAPSTONE_SUPERVISED_CALL
+    /* THE TOP NEEDS THE SAME ROUNDING (B1, measured on silicon 2026-10-05). The managed descriptor area takes
+       1024 bytes off the top, so data_top = tot_size - 1024 was only 1 KiB-aligned. The cursor moves below (the gp
+       and code parks) re-encode dom_data lossily, and the top then ROUNDS UP to the granule (ariane_pkg.sv's
+       compress_bounds; base down, top up). With a 2 KiB granule (~2 MiB region) the domain's data capability
+       reached 1 KiB past data_top: over the whole descriptor area it must never hold, and with the glue's END - 32
+       landing there instead of on the code park (b1-thread, boot B1e: END 0xac300000 against QEMU's exact
+       0x...ffc00 for the same image). Aligning data_top DOWN to the granule, in absolute terms, keeps the top
+       exact through every re-encode. The descriptor area is split off at this aligned top; its first block
+       absorbs the gap (less than one granule), and every other block keeps its place. */
+    if (managed) {
+        data_top = (base_addr + data_top) - ((base_addr + data_top) & (repr_gran - 1)) - base_addr;
+    }
+#endif
     /* ONE DECLARATOR PER DECLARATION (Phase B item 5A, 2026-09-08): capstone-c accumulates the `*`
        across declarators, so the merged line typed dom_code as void** and dom_data as void*** and the
        copy below stepped 16 bytes per subscript through ldc/stc. Exact on QEMU, lossy on silicon
@@ -1809,7 +1823,7 @@ static unsigned create_domain(unsigned base_addr, unsigned code_size,
        region: the domain never holds authority over them. The driver adds the
        area to the block it allocates, so the declared data is not reduced. */
     if (managed) {
-        desc_rest = __split(dom_data, base_addr + tot_size - CONTEXT_DESC_AREA);
+        desc_rest = __split(dom_data, base_addr + data_top);   /* the aligned top; see repr_gran */
         for (desc_j = 0; desc_j < CONTEXT_DESC_PER_APP - 1; desc_j += 1) {
             desc_piece = desc_rest;
             desc_rest = __split(desc_piece, base_addr + tot_size - CONTEXT_DESC_AREA
