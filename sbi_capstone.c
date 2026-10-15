@@ -1556,6 +1556,14 @@ static void *split_out_cap(unsigned base, unsigned len, unsigned linear) {
         }
     }
 #endif
+#ifdef CAPSTONE_TARGET_FPGA
+    /* R-55 (bounds): SPLIT rounds a long piece outward under a full-scheme encoder, so the piece carved above
+       can cover far more than [base, base + len) (a CMA REGION_CREATE decoded from 0x80000000, ~700 MiB, and
+       the module refused to map it). SHRINK narrows `region` in place to exactly the request, keeps its
+       node, and clamps the cursor to base. `region` is __linear, so capstone-c writes the register back to
+       its home slot after the template (the C_RECLAIM note); checked in the generated assembly. */
+    __asm__ volatile(".insn r 0x5b, 0x1, 0x1, %0, %1, %2" :: "r"(region), "r"(base), "r"(base + len));
+#endif
 
     __linear void *region_linear;
     unsigned ty = cap_type(region);
