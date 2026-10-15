@@ -410,6 +410,25 @@ unsigned *smode_saved_context;
 unsigned region_shared_base[CAPSTONE_MAX_REGION_N];
 
 #ifdef CAPSTONE_TARGET_FPGA
+/* R-55 (regions, 2026-10-15): every slot's NOMINAL bounds [region_nbase, region_nend), the range it was carved as.
+ * A full-scheme bounds encoder (caplifive_fpb_afcd19bea, the Sublet bitstream) rounds a long region's DECODED bounds
+ * outward, and decisions taken on cap_base/cap_end then went wrong twice over:
+ *  - split_out_cap took nearly every carve for a middle carve and kept a fragment slot each time: about 11 slots per
+ *    R-43 a2 invocation against 6, so the table filled at invocation 8 of 12;
+ *  - a remainder's decoded bounds covered the piece just carved, and every live slot can be loaded into the CPMP for
+ *    S-mode (swap_cpmp), so Linux could reach a domain's memory.
+ * exact_regions (cap_env_init; 0 unless the encoder rounds, i.e. region 1's decoded base is not _cap_text_end): 1 during
+ * the boot carves, whose 128-byte-aligned points a cut could straddle, and 2 after them. At 1 or 2 coverage and
+ * head/tail are decided on these bounds; at 2 region_make_exact also cuts every remainder into pieces whose decoded
+ * bounds are exactly their nominal ones. region_nend == 0 means "not known": the decoded bounds
+ * stand. The model, which reproduces the slot ids of 0568f93a9's and the respin's a2 runs exactly, and its predictions
+ * are in llvm-capstone tests/runtime-qemu/silicon-ladder/r55-regions/. */
+unsigned region_nbase[CAPSTONE_MAX_REGION_N];
+unsigned region_nend[CAPSTONE_MAX_REGION_N];
+unsigned exact_regions;
+#endif
+
+#ifdef CAPSTONE_TARGET_FPGA
 /* ---------------------------------------------------------------------------
  * I-4: making monitor errors VISIBLE on the FPGA console.
  *
@@ -731,6 +750,8 @@ unsigned make_hole(unsigned i) {
     region_live[i] = 0;
     regions[i] = 0;
     region_shared_base[i] = 0;
+    region_nbase[i] = 0;
+    region_nend[i] = 0;
     capstone_report(CAPSTONE_TAG_HOLE, i);
     capstone_report(CAPSTONE_TAG_RGNN, region_n);
     return 0;
@@ -1441,6 +1462,230 @@ static void block_leave_slot(unsigned from) {
 }
 #endif
 
+#ifdef CAPSTONE_TARGET_FPGA
+#define CAPSTONE_TAG_EXCT 0x45584354 /* "EXCT" region_make_exact: a piece's decoded bounds are not its nominal ones; value = nominal base, BASE/ALEN follow */
+#define CAPSTONE_TAG_EXCS 0x45584353 /* "EXCS" region_make_exact: a cut the capability's decoded bounds do not allow, not executed; value = the cut */
+
+/* R-55 (regions): the full scheme's exactness granule of a length, as the kernel module's capstone_repr_granule and
+ * check-repr's full_granule: 1 below 4 KiB, else 2^(hb(len) - 9). Built by doubling and halving: capstone-c evaluates
+ * a shift at 32 bits. */
+static unsigned repr_granule(unsigned len) {
+    unsigned hb;
+    unsigned v;
+    unsigned g;
+    unsigned k;
+    if(len < 4096) {
+        return 1;
+    }
+    hb = 0;
+    v = len;
+    while(v >= 2) {
+        v = v / 2;
+        hb += 1;
+    }
+    g = 1;
+    for(k = 9; k < hb; k += 1) {
+        g = g + g;
+    }
+    return g;
+}
+
+/* [b, e) is exact iff both ends are granule multiples (for such ends the renormalisation step cannot fire). */
+static unsigned repr_exact(unsigned b, unsigned e) {
+    unsigned g;
+    g = repr_granule(e - b);
+    if((b & (g - 1)) != 0) {
+        return 0;
+    }
+    if((e & (g - 1)) != 0) {
+        return 0;
+    }
+    return 1;
+}
+
+/* The largest exact piece from nb: its end is the most aligned point q <= min(ne, nb + 1023 * lowbit(nb)) with
+ * [nb, q) exact (a longer piece has a coarser granule than nb's alignment). [nb, nb + lowbit(nb)) is always exact,
+ * so the scan finds one. */
+static unsigned repr_greedy_end(unsigned nb, unsigned ne) {
+    unsigned a;
+    unsigned lim;
+    unsigned p;
+    unsigned q;
+    unsigned best;
+    if(repr_exact(nb, ne)) {
+        return ne;
+    }
+    lim = ne;
+    if(nb != 0) {
+        a = nb & (0 - nb);
+        if(nb + 1023 * a < ne) {
+            lim = nb + 1023 * a;
+        }
+    }
+    p = 1;
+    while(p <= lim / 2) {
+        p = p + p;
+    }
+    best = 0;
+    while(p != 0) {
+        q = lim - (lim & (p - 1));
+        if(best == 0) {
+            if(q > nb) {
+                if(repr_exact(nb, q)) {
+                    best = q;
+                }
+            }
+        }
+        p = p / 2;
+    }
+    return best;
+}
+
+/* The end of the next exact piece of [nb, ne): ne if exact; else, with G = granule(ne - nb), h = align_up(nb, G),
+ * t = align_down(ne, G): the greedy head while nb is below h, the middle [h, t) once nb is G-aligned, the greedy rest
+ * when the range has no G-aligned middle. Cuts fall on multiples of the remainder's own granule or inside a piece
+ * shorter than it, so a later request aligned to its size (or to 1 MiB, CMA's cap, which is >= G while Linux's region
+ * ends at CAPSTONE_DRAM_TOP) never straddles one. */
+static unsigned repr_piece_end(unsigned nb, unsigned ne) {
+    unsigned g;
+    unsigned h;
+    unsigned t;
+    if(repr_exact(nb, ne)) {
+        return ne;
+    }
+    g = repr_granule(ne - nb);
+    h = nb + ((g - (nb & (g - 1))) & (g - 1));
+    t = ne - (ne & (g - 1));
+    if(h < t) {
+        if(h > nb) {
+            return repr_greedy_end(nb, h);
+        }
+        return t;
+    }
+    return repr_greedy_end(nb, ne);
+}
+
+/* Append a live, non-resident slot with known nominal bounds; the caller has checked the table's room. */
+static void region_append(__linear void *cap, unsigned nb, unsigned ne) {
+    regions[region_n] = cap;
+    region_live[region_n] = 1;
+    region_cpmp[region_n] = -1;
+    region_shared_base[region_n] = 0;
+    region_nbase[region_n] = nb;
+    region_nend[region_n] = ne;
+    region_n += 1;
+}
+
+/* R-55 (regions): cut slot i's LINEAR capability into pieces whose decoded bounds are their nominal ones. Each cut is a
+ * SPLIT at the piece's end, then a SHRINK of the lower piece to [nb, q); the bounds are read back and a piece that is
+ * still not exact is reported (EXCT). The first piece stays in slot i, the rest are appended; the pieces are counted
+ * first, and if the table cannot hold them nothing is cut (RGNF). A cut or SHRINK the capability's decoded bounds do
+ * not allow (a SHORT region) is reported (EXCS) and never executed: what is left stays in one inexact piece. */
+static void region_make_exact(unsigned i) {
+    __linear void *cap;
+    __linear void *rest;
+    unsigned nb;
+    unsigned ne;
+    unsigned q;
+    unsigned n;
+    unsigned first;
+    unsigned done;
+    unsigned lo;
+    unsigned hi;
+    if(exact_regions != 2) {
+        return;
+    }
+    if(region_live[i] == 0) {
+        return;
+    }
+    if(region_nend[i] == 0) {
+        return;
+    }
+    nb = region_nbase[i];
+    ne = region_nend[i];
+    n = 0;
+    q = nb;
+    while(q < ne) {
+        q = repr_piece_end(q, ne);
+        n += 1;
+    }
+    if(region_n + n - 1 > CAPSTONE_MAX_REGION_N) {
+        REPORT_REGION_OVERFLOW();
+        return;
+    }
+    if(region_cpmp[i] != -1) {
+        cap = read_cpmp(region_cpmp[i]);
+    } else {
+        cap = regions[i];
+    }
+    if(cap_type(cap) != CAP_TYPE_LINEAR) {
+        if(region_cpmp[i] != -1) {
+            write_cpmp(region_cpmp[i], cap);
+        } else {
+            regions[i] = cap;
+        }
+        return;
+    }
+    first = 1;
+    done = 0;
+    while(done == 0) {
+        q = repr_piece_end(nb, ne);
+        lo = cap_base(cap);
+        hi = cap_end(cap);
+        if(q < ne) {
+            if(lo > nb) {
+                q = ne;
+            }
+            if(q >= hi) {
+                q = ne;
+            }
+            if(q == ne) {
+                capstone_report(CAPSTONE_TAG_EXCS, nb);
+            }
+        }
+        if(q < ne) {
+            rest = __split(cap, q);
+        }
+        lo = cap_base(cap);
+        hi = cap_end(cap);
+        if(lo <= nb) {
+            if(q <= hi) {
+                __asm__ volatile(".insn r 0x5b, 0x1, 0x1, %0, %1, %2" :: "r"(cap), "r"(nb), "r"(q));
+            }
+        }
+        lo = cap_base(cap);
+        hi = cap_end(cap);
+        if(lo != nb) {
+            capstone_report(CAPSTONE_TAG_EXCT, nb);
+            capstone_report(CAPSTONE_TAG_BASE, lo);
+            capstone_report(CAPSTONE_TAG_ALEN, hi - lo);
+        } else if(hi != q) {
+            capstone_report(CAPSTONE_TAG_EXCT, nb);
+            capstone_report(CAPSTONE_TAG_BASE, lo);
+            capstone_report(CAPSTONE_TAG_ALEN, hi - lo);
+        }
+        if(first) {
+            if(region_cpmp[i] != -1) {
+                write_cpmp(region_cpmp[i], cap);
+            } else {
+                regions[i] = cap;
+            }
+            region_nbase[i] = nb;
+            region_nend[i] = q;
+            first = 0;
+        } else {
+            region_append(cap, nb, q);
+        }
+        if(q == ne) {
+            done = 1;
+        } else {
+            cap = rest;
+            nb = q;
+        }
+    }
+}
+#endif
+
 static void *split_out_cap(unsigned base, unsigned len, unsigned linear) {
     __linear void *region;
 
@@ -1449,6 +1694,12 @@ static void *split_out_cap(unsigned base, unsigned len, unsigned linear) {
 #else
     __linear void *mem_l;
     __linear void *mem_r;
+#ifdef CAPSTONE_TARGET_FPGA
+    unsigned nom_base;
+    unsigned nom_end;
+    unsigned kept_slot;
+    unsigned right_slot;
+#endif
     unsigned fill_n;
     __linear void *fill_i;
     unsigned i;
@@ -1463,6 +1714,19 @@ static void *split_out_cap(unsigned base, unsigned len, unsigned linear) {
             mem_l = regions[i];
         region_base = cap_base(mem_l);
         region_end = cap_end(mem_l);
+#ifdef CAPSTONE_TARGET_FPGA
+        /* R-55 (regions): with exact_regions, a slot covers the request when its NOMINAL bounds do, and only if its
+           decoded bounds do as well (the SPLITs below act on those); head and tail are then judged on the nominal
+           bounds (nom_base/nom_end), so a carve at a region's nominal start leaves no fragment. */
+        nom_base = region_base;
+        nom_end = region_end;
+        if(exact_regions != 0) {
+            if(region_nend[i] != 0) {
+                nom_base = region_nbase[i];
+                nom_end = region_nend[i];
+            }
+        }
+#endif
         /* THE SITE WITH NO RE-SHARE. A revoked region stays region_live, so an unrelated later
          * create_region whose range falls inside it picks this slot and SPLITs the handle -- and
          * SPLIT demands LINEAR. Nothing in the share path protects this one, because nobody shared
@@ -1471,8 +1735,15 @@ static void *split_out_cap(unsigned base, unsigned len, unsigned linear) {
         if (cap_type(mem_l) == CAP_TYPE_UNINIT) {
             C_DO_RECLAIM(mem_l, fill_n, fill_i);
         }
+#ifdef CAPSTONE_TARGET_FPGA
+        if(base >= nom_base && base + len <= nom_end) {
+            if(base >= region_base && base + len <= region_end)
+                break;
+        }
+#else
         if(base >= region_base && base + len <= region_end)
             break;
+#endif
         if(region_cpmp[i] != -1)
             write_cpmp(region_cpmp[i], mem_l);
         else
@@ -1493,6 +1764,10 @@ static void *split_out_cap(unsigned base, unsigned len, unsigned linear) {
 #else
     if(i >= region_n)
         capstone_error(CAPSTONE_NO_REGION);
+#endif
+#ifdef CAPSTONE_TARGET_FPGA
+    region_base = nom_base;   /* R-55 (regions): head and tail on the nominal bounds (the decoded ones when not known) */
+    region_end = nom_end;
 #endif
 
     if(base == region_base)
@@ -1563,6 +1838,36 @@ static void *split_out_cap(unsigned base, unsigned len, unsigned linear) {
        node, and clamps the cursor to base. `region` is __linear, so capstone-c writes the register back to
        its home slot after the template (the C_RECLAIM note); checked in the generated assembly. */
     __asm__ volatile(".insn r 0x5b, 0x1, 0x1, %0, %1, %2" :: "r"(region), "r"(base), "r"(base + len));
+    /* R-55 (regions): what slot i, and the slot a middle carve appended, now nominally hold; then cut them into exact
+       pieces (region_make_exact does nothing unless exact_regions). An exact fit left slot i a hole. */
+    kept_slot = -1;
+    right_slot = -1;
+    if(base + len == region_end) {
+        if(base != region_base) {
+            region_nbase[i] = region_base;
+            region_nend[i] = base;
+            kept_slot = i;
+        }
+    } else {
+        if(base == region_base) {
+            region_nbase[i] = base + len;
+            region_nend[i] = region_end;
+            kept_slot = i;
+        } else {
+            region_nbase[i] = region_base;
+            region_nend[i] = base;
+            kept_slot = i;
+            region_nbase[region_n - 1] = base + len;
+            region_nend[region_n - 1] = region_end;
+            right_slot = region_n - 1;
+        }
+    }
+    if(kept_slot != -1) {
+        region_make_exact(kept_slot);
+    }
+    if(right_slot != -1) {
+        region_make_exact(right_slot);
+    }
 #endif
 
     __linear void *region_linear;
@@ -1589,6 +1894,10 @@ static void *split_out_cap(unsigned base, unsigned len, unsigned linear) {
         }
         regions[region_n] = region;
         region_live[region_n] = 1;
+#ifdef CAPSTONE_TARGET_FPGA
+        region_nbase[region_n] = base;
+        region_nend[region_n] = base + len;
+#endif
         region_n += 1;
     }
 
@@ -1822,6 +2131,10 @@ static unsigned create_domain(unsigned base_addr, unsigned code_size,
     if (managed) {
         if (cached == 0) {
             cache_region = region_n;
+#ifdef CAPSTONE_TARGET_FPGA
+            region_nbase[cache_region] = base_addr;   /* R-55 (regions): the block this slot will hold */
+            region_nend[cache_region] = base_addr + tot_size;
+#endif
             region_n += 1;
             managed_unmap(cache_region);
         }
@@ -2203,6 +2516,10 @@ static unsigned create_region(unsigned base, unsigned len) {
     }
     regions[region_n] = region;
     region_live[region_n] = 1;
+#ifdef CAPSTONE_TARGET_FPGA
+    region_nbase[region_n] = base;   /* R-55 (regions) */
+    region_nend[region_n] = base + len;
+#endif
     region_n += 1;
 
     return region_n - 1;
@@ -2530,12 +2847,26 @@ static unsigned share_child_region(unsigned dom_id, unsigned parent_id,
     if (head) {
         regions[region_n] = head;
         region_live[region_n] = 1;
+#ifdef CAPSTONE_TARGET_FPGA
+        region_nbase[region_n] = pbase;   /* R-55 (regions) */
+        region_nend[region_n] = cstart;
+#endif
         region_n += 1;
+#ifdef CAPSTONE_TARGET_FPGA
+        region_make_exact(region_n - 1);
+#endif
     }
     if (tail) {
         regions[region_n] = tail;
         region_live[region_n] = 1;
+#ifdef CAPSTONE_TARGET_FPGA
+        region_nbase[region_n] = cend;
+        region_nend[region_n] = pend;
+#endif
         region_n += 1;
+#ifdef CAPSTONE_TARGET_FPGA
+        region_make_exact(region_n - 1);
+#endif
     }
 
     /* 3. Tighten permission and share the child (linear borrow). */
@@ -2655,6 +2986,10 @@ static unsigned pop_region(unsigned pop_num) {
 
         region_cpmp[region_i] = -1;
         region_live[region_i] = 0;
+#ifdef CAPSTONE_TARGET_FPGA
+        region_nbase[region_i] = 0;
+        region_nend[region_i] = 0;
+#endif
     }
 
     region_n -= pop_num;
@@ -3302,6 +3637,10 @@ static void dpi_share_region(void *region) {
     regions[region_n] = incoming;
     region_live[region_n] = 1;
     region_shared_base[region_n] = shared_base;
+#ifdef CAPSTONE_TARGET_FPGA
+    region_nbase[region_n] = 0;   /* R-55 (regions): not known; its decoded bounds stand */
+    region_nend[region_n] = 0;
+#endif
     region_n += 1;
 }
 
