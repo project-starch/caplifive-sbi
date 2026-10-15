@@ -25,7 +25,16 @@
  * per-boot ceiling); the domain count was lowered to 32 in the 2025 bring-up without a stated
  * reason. Converging QEMU onto these values is a Phase B item (monitor-unification.md). */
 #define CAPSTONE_MAX_DOM_N   32
-#define CAPSTONE_MAX_REGION_N   96
+/* R-55 (regions, 2026-10-15): 127. Exact remainders under a full-scheme encoder take more slots than the 96 the
+ * board ran since 2026-08-18: R-43 a2's twelve invocations and its closing k800 need 111 by the replay
+ * (r55-regions/); 0568f93a9's run used 89. 127 is the most capstone-c can carve: dom_init reserves each global with
+ * one `addi t1, t1, -size`, a 12-bit immediate, and regions[] is 16 bytes a slot (160 slots failed to assemble).
+ * The kernel module's MAX_REGION_N and libcapstone's must match. */
+#define CAPSTONE_MAX_REGION_N   127
+/* The top of the board's DRAM window: memory@80000000 is 0x3c2d2000 bytes (CMA at 0xac000000 + 256 MiB), and
+ * nothing S-mode uses lies above 0xc0000000. cap_env_init ends Linux's region here, so every remainder is <= 1 GiB
+ * and its granule <= 1 MiB (R-55 regions). */
+#define CAPSTONE_DRAM_TOP   0xc0000000
 #else
 #define C_PRINT(v) __asm__ volatile(".insn r 0x5b, 0x1, 0x43, x0, %0, x0" :: "r"(v))
 #define PRINT(reg)     .insn r 0x5b, 0x1, 0x43, x0, reg, x0
