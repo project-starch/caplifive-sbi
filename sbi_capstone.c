@@ -58,6 +58,9 @@
 #define CAPSTONE_TAG_DENT 0x44454e54 /* "DENT" create_domain: entry_offset within that base */
 #define CAPSTONE_TAG_SUPA 0x53555041 /* "SUPA" supervised_invoke: cssupervise status (0 armed) */
 #define CAPSTONE_TAG_SUPK 0x5355504b /* "SUPK" supervised_invoke: event kind (0 ret, 1 preempt, 2 fault) */
+#define CAPSTONE_TAG_SUPC 0x53555043 /* "SUPC" supervised_invoke, a FAULT event: cause (csupcause) */
+#define CAPSTONE_TAG_SUPE 0x53555045 /* "SUPE" supervised_invoke, a FAULT event: epc (csupepc) */
+#define CAPSTONE_TAG_SUPT 0x53555054 /* "SUPT" supervised_invoke, a FAULT event: tval (csuptval) */
 /* B0.7 step diagnostics (STPB/STPE/LNBG/LNDE/MRCL): ~16 UART lines per step, which at 57,600 baud starves and
    garbles Linux's console in a long run, so they are opt-in. */
 #ifdef CAPSTONE_LOAN_TRACE
@@ -1001,6 +1004,14 @@ static unsigned supervised_invoke(unsigned id, unsigned request, void *argument)
     SUP_CSR_READ(0xfc3, ev);
     supervised_events[3] = ev;
     slot_paused[id] = (kind == 1);
+    /* A FAULT event is reported whatever the quiet switches say: it is rare, it ends the domain, and the launcher
+       may not say where it happened (B2 on silicon, 2026-10-05: a fault in a region-share entry left capstone-exec
+       with SIGSEGV and an empty stderr). Three lines, once. */
+    if (kind == 2) {
+        capstone_report(CAPSTONE_TAG_SUPC, supervised_events[1]);
+        capstone_report(CAPSTONE_TAG_SUPE, supervised_events[2]);
+        capstone_report(CAPSTONE_TAG_SUPT, supervised_events[3]);
+    }
 #ifndef CAPSTONE_SUPERVISE_QUIET
 #ifdef CAPSTONE_SUPERVISE_QUIET_MASK
     if (sup_quiet == 0) {
@@ -1688,10 +1699,11 @@ static unsigned create_domain(unsigned base_addr, unsigned code_size,
     code_size = (((code_size - 1) >> 4) + 1) << 4;
     /* CAPABILITY-BOUNDS REPRESENTABILITY (issue C-13, root-caused 2026-07-29).
        The register file stores capability metadata COMPRESSED. compress_bounds
-       (capstone-ariane core/include/ariane_pkg.sv:749-800) has an exact "cursorless"
+       (capstone-ariane core/include/ariane_pkg.sv:793-851 at 776d9d859; this comment
+       first cited :749-800 of an earlier revision) has an exact "cursorless"
        encoding only while start == cursor; otherwise it truncates the BASE DOWNWARD to
-       a 2^(E+3) granule (:788 `B[13:3] = {bounds.start >> E}[13:3]`, with no round-up,
-       unlike the top at :790).
+       a 2^(E+3) granule (:832 `B[13:3] = {bounds.start >> E}[13:3]`, with no round-up,
+       unlike the top at :834-835).
 
        dom_data leaves SPLIT cursorless-exact, but the C_SET_CURSOR below (used to park
        gp at the top of the region) moves the cursor off the start, so the very next
