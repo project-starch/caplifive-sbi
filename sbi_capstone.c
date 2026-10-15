@@ -58,6 +58,18 @@
 #define CAPSTONE_TAG_DENT 0x44454e54 /* "DENT" create_domain: entry_offset within that base */
 #define CAPSTONE_TAG_SUPA 0x53555041 /* "SUPA" supervised_invoke: cssupervise status (0 armed) */
 #define CAPSTONE_TAG_SUPK 0x5355504b /* "SUPK" supervised_invoke: event kind (0 ret, 1 preempt, 2 fault) */
+/* B0.7 step diagnostics (STPB/STPE/LNBG/LNDE/MRCL): ~16 UART lines per step, which at 57,600 baud starves and
+   garbles Linux's console in a long run, so they are opt-in. */
+#ifdef CAPSTONE_LOAN_TRACE
+#define LOAN_TRACE(tag, v) capstone_trace(tag, v)
+#else
+#define LOAN_TRACE(tag, v)
+#endif
+#define CAPSTONE_TAG_STPB 0x53545042 /* "STPB" context_step entered: slot */
+#define CAPSTONE_TAG_STPE 0x53545045 /* "STPE" context_step leaving for Linux: kind, after loan_end */
+#define CAPSTONE_TAG_LNBG 0x4c4e4247 /* "LNBG" loan_begin: 0x10/0x20/0x30/0x50 + the type of block, rev, block after mrev, view */
+#define CAPSTONE_TAG_LNDE 0x4c4e4445 /* "LNDE" loan_end progress: the stage just completed (1..6) */
+#define CAPSTONE_TAG_MRCL 0x4d52434c /* "MRCL" managed_reinit: 0x10 + the type REVOKE returned, 2 reinitialised */
 #define CAPSTONE_TAG_SUPN 0x5355504e /* "SUPN" classic test hook: preemptions in one call */
 #define CAPSTONE_TAG_SUPM 0x5355504d /* "SUPM" classic test hook: this call supervised (1) or plain (0) */
 /* Error codes for sites that previously had none (they spun with no code at all).
@@ -763,14 +775,16 @@ static void managed_unmap(unsigned id) {
 /* Reinitialise what a REVOKE returned. The revoke itself stays in the CALLER, next to the load of the revocation
  * capability, and no __rev value is ever passed to a function. capstone-c treats __rev as copyable and so
  * caller-saves a live __rev argument with `stc` right before the call (`stc(a0, sp, N); call managed_reclaim` at
- * every former call site). On silicon STC moves every capability type but NONLIN: it writes cnull back to the
- * register (capstone-ariane capstone_dyn_unit.anvil:544-548 at 715bdd1fe; llvm-capstone ISSUES Q-12, where
- * capstone-qemu still copies). The callee then revoked NOT_CAP, raised cause 24 inside M-mode, and the nested trap
- * at _cap_trap_entry+4 wedged the core: every process-ABI step on silicon (llvm-capstone ISSUES C-76, found by the
- * B0 board runs of 2026-10-04). A __linear argument is moved into the call, not caller-saved. */
+ * all four former call sites). On silicon STC moves every capability type except NONLIN: it writes cnull back to
+ * the register (capstone_dyn_unit.anvil:544-548 at 715bdd1fe; ISSUES Q-12, where capstone-qemu still copies). So
+ * the callee received cnull, its REVOKE raised cause 24 inside M-mode, and the nested trap at _cap_trap_entry+4
+ * wedged the core (B0.7 attempts 5-9, 2026-10-04). A __linear argument is moved into the call, not saved.
+ * MRCL 0x10 + type traces what REVOKE returned: silicon returns LINEAR (0) for a block whose descendants were
+ * DELINed, so the UNINIT reinitialisation below does not run there. */
 static __linear void *managed_reinit(__linear void *memory) {
     unsigned cursor;
     unsigned end;
+    LOAN_TRACE(CAPSTONE_TAG_MRCL, 0x10 + cap_type(memory));
     if (cap_type(memory) == 3) {
         cursor = __capfield(memory, 2);
         end = cap_end(memory);
@@ -781,6 +795,7 @@ static __linear void *managed_reinit(__linear void *memory) {
         }
         C_INIT(memory, memory, 0);
     }
+    LOAN_TRACE(CAPSTONE_TAG_MRCL, 2);
     return memory;
 }
 #endif
@@ -1201,9 +1216,13 @@ static void *loan_begin(unsigned k) {
     void *lent;
     idx = slot_app[k] * CONTEXT_DESC_PER_APP + slot_desc[k];
     block = desc_take(idx);
+    LOAN_TRACE(CAPSTONE_TAG_LNBG, 0x10 + cap_type(block));
     rev = __mrev(block);
+    LOAN_TRACE(CAPSTONE_TAG_LNBG, 0x20 + cap_type(rev));
+    LOAN_TRACE(CAPSTONE_TAG_LNBG, 0x30 + cap_type(block));
     desc_rev[k] = rev;
     view = __delin(block);
+    LOAN_TRACE(CAPSTONE_TAG_LNBG, 0x50 + cap_type(view));
     view[0] = 0;
     view[2] = 0;
     desc_view[k] = view;
@@ -1239,11 +1258,14 @@ static unsigned loan_end(unsigned k) {
     view = desc_view[k];
     result = view[0];
     ticket = view[2];
+    LOAN_TRACE(CAPSTONE_TAG_LNDE, 1);
     /* ldc copies; it does not clear the source. Clear it here, or the block
        keeps a second copy of the sealed context and offers it again on the
        next call (seen 2026-09-29: a consumed offer came back with ticket 0). */
     __asm__ volatile ("ldc(%0, %1, 32)" : "=r"(seal) : "r"(view));
+    LOAN_TRACE(CAPSTONE_TAG_LNDE, 2);
     __asm__ volatile ("stc(x0, %0, 32)" :: "r"(view));
+    LOAN_TRACE(CAPSTONE_TAG_LNDE, 3);
     /* A new seal is offered only when no still-valid offer is outstanding: a
        first, live offer stays until it is adopted (its FULL is repeatable), and
        a second offer's ticket is STALE. Once the first offer is revoked
@@ -1256,9 +1278,12 @@ static unsigned loan_end(unsigned k) {
             offer_live[k] = 1;
         }
     }
+    LOAN_TRACE(CAPSTONE_TAG_LNDE, 4);
     block = __revoke(desc_rev[k]);
     block = managed_reinit(block);
+    LOAN_TRACE(CAPSTONE_TAG_LNDE, 5);
     desc_put(idx, block);
+    LOAN_TRACE(CAPSTONE_TAG_LNDE, 6);
     desc_view[k] = 0;
     desc_loan[k] = 0;
     return result;
@@ -1273,6 +1298,7 @@ static unsigned context_step(unsigned k, unsigned g) {
     unsigned kind;
     unsigned result;
     void *lent;
+    LOAN_TRACE(CAPSTONE_TAG_STPB, k);
     if (k >= dom_n) { return -1; }
     if (slot_kind[k] == CONTEXT_SLOT_FREE) { return CAPSTONE_PROCESS_STEP_STALE; }
     if (slot_kind[k] == CONTEXT_SLOT_UNMANAGED) { return CAPSTONE_PROCESS_STEP_STALE; }
@@ -1305,6 +1331,7 @@ static unsigned context_step(unsigned k, unsigned g) {
         smode_saved_context[SBI_TRAP_REGS_a4] = 0;
         smode_saved_context[SBI_TRAP_REGS_a5] = 0;
     }
+    LOAN_TRACE(CAPSTONE_TAG_STPE, kind);
     return kind;
 }
 
@@ -1602,6 +1629,11 @@ static unsigned create_domain(unsigned base_addr, unsigned code_size,
        globals boundary, and those always declare it (.capstone_gp_initdesc, verified
        present in a built board domain), so keying on it is exact rather than heuristic. */
     unsigned gpoff = 0;
+    /* The top of the data region the DOMAIN receives. A managed application loses the top
+       CONTEXT_DESC_AREA of its block to context descriptors (below), so its globals blob and
+       the gp park must fit under that, not under tot_size. Function scope: capstone-c rejects
+       a declaration in a nested block. */
+    unsigned data_top = tot_size;
     if (globals_off) {
         gpoff = globals_off;
     }
@@ -1616,10 +1648,13 @@ static unsigned create_domain(unsigned base_addr, unsigned code_size,
     unsigned search;
     if (managed) {
         if (managed_can_allocate() == 0) { return -1; }
-        /* An application declares no globals region (its image is linked by
-           my_first_domain/link.ld), and the descriptor area below takes the top
-           of the data region, where the gp-free ABI parks gp. */
-        if (gpoff != 0) { return -1; }
+        /* An application MAY declare a globals region (B0, docs/plans/b0-silicon-delegated-
+           runtime.md: a gp-captable image, the silicon ABI). Until 2026-10-04 that was refused,
+           because the descriptor area below takes the top of the data region where the gp-free
+           ABI parks gp. The park and the globals blob now go under the descriptor area instead
+           (data_top); the gp-captable glue carves its table from its data capability's END,
+           which after the descriptor split is data_top, so it needs no offset of its own. */
+        data_top = tot_size - CONTEXT_DESC_AREA;
         for (search = 0; search < dom_n; search += 1) {
             if (managed_domain_base[search] == base_addr) {
                 if (managed_domain_live[search] != 0) { return -1; }
@@ -1699,6 +1734,20 @@ static unsigned create_domain(unsigned base_addr, unsigned code_size,
     split_size = split_size - (split_size & (repr_gran - 1));
     data_off = DOMAIN_DATA_SIZE + repr_gran - 1;
     data_off = data_off - (data_off & (repr_gran - 1));
+#ifdef CAPSTONE_SUPERVISED_CALL
+    /* THE TOP NEEDS THE SAME ROUNDING (B1, measured on silicon 2026-10-05). The managed descriptor area takes
+       1024 bytes off the top, so data_top = tot_size - 1024 was only 1 KiB-aligned. The cursor moves below (the gp
+       and code parks) re-encode dom_data lossily, and the top then ROUNDS UP to the granule (ariane_pkg.sv's
+       compress_bounds; base down, top up). With a 2 KiB granule (~2 MiB region) the domain's data capability
+       reached 1 KiB past data_top: over the whole descriptor area it must never hold, and with the glue's END - 32
+       landing there instead of on the code park (b1-thread, boot B1e: END 0xac300000 against QEMU's exact
+       0x...ffc00 for the same image). Aligning data_top DOWN to the granule, in absolute terms, keeps the top
+       exact through every re-encode. The descriptor area is split off at this aligned top; its first block
+       absorbs the gap (less than one granule), and every other block keeps its place. */
+    if (managed) {
+        data_top = (base_addr + data_top) - ((base_addr + data_top) & (repr_gran - 1)) - base_addr;
+    }
+#endif
     /* ONE DECLARATOR PER DECLARATION (Phase B item 5A, 2026-09-08): capstone-c accumulates the `*`
        across declarators, so the merged line typed dom_code as void** and dom_data as void*** and the
        copy below stepped 16 bytes per subscript through ldc/stc. Exact on QEMU, lossy on silicon
@@ -1712,6 +1761,8 @@ static unsigned create_domain(unsigned base_addr, unsigned code_size,
     __linear void *desc_rest;
     __linear void *desc_piece;
     unsigned desc_j;
+    void *dom_code_nl;
+    unsigned code_parked;
 #endif
 
     /* needs one slot for the domain's own region: refuse BEFORE carving (item 1's check, here since
@@ -1772,7 +1823,7 @@ static unsigned create_domain(unsigned base_addr, unsigned code_size,
        region: the domain never holds authority over them. The driver adds the
        area to the block it allocates, so the declared data is not reduced. */
     if (managed) {
-        desc_rest = __split(dom_data, base_addr + tot_size - CONTEXT_DESC_AREA);
+        desc_rest = __split(dom_data, base_addr + data_top);   /* the aligned top; see repr_gran */
         for (desc_j = 0; desc_j < CONTEXT_DESC_PER_APP - 1; desc_j += 1) {
             desc_piece = desc_rest;
             desc_rest = __split(desc_piece, base_addr + tot_size - CONTEXT_DESC_AREA
@@ -1834,8 +1885,8 @@ static unsigned create_domain(unsigned base_addr, unsigned code_size,
        a domain that has no globals at all. */
     if(gpoff != 0
        && code_size > gpoff
-       && tot_size > split_size + data_off
-       && (code_size - gpoff) > (tot_size - split_size - DOMAIN_DATA_SIZE)) {
+       && data_top > split_size + data_off
+       && (code_size - gpoff) > (data_top - split_size - DOMAIN_DATA_SIZE)) {
         /* The blob does not fit in dom_data. This used to SKIP the copy silently,
            on the reasoning that "the glue only reads the blob for globals that took
            the copy path" -- which is exactly backwards once a global DOES take it:
@@ -1847,7 +1898,7 @@ static unsigned create_domain(unsigned base_addr, unsigned code_size,
     }
     if(gpoff != 0
        && code_size > gpoff
-       && tot_size > split_size + data_off) {
+       && data_top > split_size + data_off) {
         /* 8-BYTE UNITS, not 16. With dom_code/dom_data correctly typed as `__linear void *`
            (one declarator per line above), subscripting steps ONE WORD and the loop body emits a
            scalar ld/sd -- which is the whole point: it never touches compress_cap, so plain data
@@ -1893,13 +1944,38 @@ static unsigned create_domain(unsigned base_addr, unsigned code_size,
 
     // store gp (linear; glue delins on first entry) into the cscratch top slot
     if (dom_gp != 0) {
-        C_SET_CURSOR(dom_data, dom_data, base_addr + tot_size - 16);
+        C_SET_CURSOR(dom_data, dom_data, base_addr + data_top - 16);
         *(__linear void **)dom_data = dom_gp;
         C_SET_CURSOR(dom_data, dom_data, base_addr + split_size + data_off);
     }
 
     // construct the sealed region of the domain
+#ifdef CAPSTONE_SUPERVISED_CALL
+    /* B1.3 (llvm-capstone docs/plans/b0-silicon-delegated-runtime.md): a managed gp-captable application mints
+       contexts, and each context's seal needs a CODE capability whose cursor is the context entry. On silicon the
+       domain cannot make one: auipc/lla give integers and no instruction copies PCC into a register. So the monitor
+       hands it one. dom_code is delinearized and a copy is parked at data_top - 32, beside the gp park; the glue
+       reads it on its first entry, before it carves anything from the top of its data region. The domain is
+       sealed with the same NONLIN capability (pc_cap_check accepts LINEAR or NONLIN). Reclaim is unchanged: every
+       alias is derived from managed_domain_root, whose revoke kills them all. Other domains are untouched. */
+    code_parked = 0;
+    if (managed != 0) {
+        if (gpoff != 0 && code_size > gpoff) {
+            dom_code_nl = __delin(dom_code);
+            C_SET_CURSOR(dom_data, dom_data, base_addr + data_top - 32);
+            *(void **)dom_data = dom_code_nl;
+            C_SET_CURSOR(dom_data, dom_data, base_addr + split_size + data_off);
+            code_parked = 1;
+        }
+    }
+    if (code_parked != 0) {
+        dom_seal[0] = dom_code_nl;
+    } else {
+        dom_seal[0] = dom_code;
+    }
+#else
     dom_seal[0] = dom_code;
+#endif
 #ifdef CAPSTONE_DOMAIN_TRAP_VECTOR
     /* THE ACCEPTANCE TEST for "a domain enters with NO trap vector".
      *
