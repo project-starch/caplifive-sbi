@@ -1556,6 +1556,14 @@ static void *split_out_cap(unsigned base, unsigned len, unsigned linear) {
         }
     }
 #endif
+#ifdef CAPSTONE_TARGET_FPGA
+    /* R-55 (bounds): SPLIT rounds a long piece outward under a full-scheme encoder, so the piece carved above
+       can cover far more than [base, base + len) (a CMA REGION_CREATE decoded from 0x80000000, ~700 MiB, and
+       the module refused to map it). SHRINK narrows `region` in place to exactly the request, keeps its
+       node, and clamps the cursor to base. `region` is __linear, so capstone-c writes the register back to
+       its home slot after the template (the C_RECLAIM note); checked in the generated assembly. */
+    __asm__ volatile(".insn r 0x5b, 0x1, 0x1, %0, %1, %2" :: "r"(region), "r"(base), "r"(base + len));
+#endif
 
     __linear void *region_linear;
     unsigned ty = cap_type(region);
@@ -1921,6 +1929,12 @@ static unsigned create_domain(unsigned base_addr, unsigned code_size,
         unsigned gpoff_c = gpoff >> 3;                          /* image offset, in words */
         unsigned glob_c  = (code_size - gpoff) >> 3;
         unsigned ci;
+#ifdef CAPSTONE_TARGET_FPGA
+        /* R-55: dom_code is the seal SPLIT's lower piece and dom_data may be the descriptor SPLIT's, so each
+           cursor is its piece's DECODED start; under a full-scheme encoder that is below the carve point. */
+        C_SET_CURSOR(dom_code, dom_code, base_addr);
+        C_SET_CURSOR(dom_data, dom_data, base_addr + split_size + data_off);
+#endif
         for(ci = 0; ci < glob_c; ci += 1)
             dom_data[ci] = dom_code[gpoff_c + ci];
     }
@@ -2171,6 +2185,9 @@ static unsigned create_region(unsigned base, unsigned len) {
         return -1;
     }
     void *region = split_out_cap(base, len, 1);
+#ifdef CAPSTONE_TARGET_FPGA
+    C_SET_CURSOR(region, region, base);   /* R-55: handed to domains at this cursor */
+#endif
 
     if(region_n >= CAPSTONE_MAX_REGION_N) {
         /* I-4 site RGNO. Was UNGUARDED: three of the four appends had no bounds check,
@@ -2499,6 +2516,9 @@ static unsigned share_child_region(unsigned dom_id, unsigned parent_id,
     if (cend != pend) {
         tail = __split(body, cend); /* body -> [cstart,cend); tail -> [cend,pend) */
     }
+#ifdef CAPSTONE_TARGET_FPGA
+    C_SET_CURSOR(body, body, cstart);   /* R-55: the child is handed body at this cursor */
+#endif
 
     if (region_cpmp[parent_id] != -1) {
         write_cpmp(region_cpmp[parent_id], rev);
