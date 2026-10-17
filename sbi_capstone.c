@@ -171,6 +171,20 @@
 #define CAPSTONE_TAG_DOMN 0x444f4d4e /* "DOMN" dom_n */
 #define CAPSTONE_TAG_RGNF 0x52474e46 /* "RGNF" region table full: a carve REFUSED before touching the pool (Phase B item 1), not a fault */
 #define CAPSTONE_TAG_RGNN 0x52474e4e /* "RGNN" region_n */
+#ifdef CAPSTONE_CPMX_DIAG
+/* The CPMX diagnostic (vp2 boot 3-T1's third run, 2026-10-18): the region table and the CPMP entries at the fault. */
+#define CAPSTONE_TAG_RDID 0x52444944 /* "RDID" a live region's id */
+#define CAPSTONE_TAG_RDSL 0x5244534c /* "RDSL" its CPMP slot, or all ones when not loaded */
+#define CAPSTONE_TAG_RDBA 0x52444241 /* "RDBA" its decoded base */
+#define CAPSTONE_TAG_RDEN 0x5244454e /* "RDEN" its decoded end, low 32 bits */
+#define CAPSTONE_TAG_RDEH 0x52444548 /* "RDEH" its decoded end, high bits */
+#define CAPSTONE_TAG_RDPM 0x5244504d /* "RDPM" its permissions (lcc selector 5) */
+#define CAPSTONE_TAG_CPID 0x43504944 /* "CPID" a loaded CPMP entry: id | region << 8 */
+#define CAPSTONE_TAG_CPBA 0x43504241 /* "CPBA" its decoded base */
+#define CAPSTONE_TAG_CPEN 0x4350454e /* "CPEN" its decoded end, low 32 bits */
+#define CAPSTONE_TAG_CPPM 0x4350504d /* "CPPM" its permissions */
+#define CAPSTONE_TAG_CPHT 0x43504854 /* "CPHT" this LOADED entry covers mtval */
+#endif
 #define CAPSTONE_TAG_RGID 0x52474944 /* "RGID" region_id */
 #define CAPSTONE_TAG_CPID 0x43504944 /* "CPID" cpmp index */
 #define CAPSTONE_TAG_AREV 0x41524556 /* "AREV" annotation_rev */
@@ -3457,6 +3471,61 @@ void handle_interrupt(unsigned int_code) {
     }
 }
 
+#ifdef CAPSTONE_CPMX_DIAG
+/* vp2 boot 3-T1's third run (2026-10-18): an S-mode INSTRUCTION FETCH at physical 0x81d2e940, a page of Linux's memory
+   that data loads and stores reached, faulted and reached swap_cpmp, which found no not-yet-loaded live region covering
+   it (CPMX). swap_cpmp's lookup skips loaded regions, so CPMX alone cannot tell "no region covers the page" from "a
+   LOADED entry covers it and the fetch was refused anyway". This reports every live region (id, CPMP slot, decoded
+   bounds, permissions), every loaded CPMP entry, and CPHT for a loaded entry covering mtval. Read-only: each
+   capability is read and written back, as print_regions does. FPGA diagnostic builds only. */
+static void report_cpmx_diag(unsigned badaddr) {
+    unsigned i;
+    unsigned b;
+    unsigned e;
+    unsigned p;
+    __linear void *tmp;
+    capstone_report(CAPSTONE_TAG_RGNN, region_n);
+    for(i = 0; i < region_n; i += 1) {
+        if(region_live[i] == 0)
+            continue;
+        if(region_cpmp[i] != -1) {
+            tmp = read_cpmp(region_cpmp[i]);
+            b = cap_base(tmp);
+            e = cap_end(tmp);
+            p = __capfield(tmp, 5);
+            write_cpmp(region_cpmp[i], tmp);
+        } else {
+            tmp = regions[i];
+            b = cap_base(tmp);
+            e = cap_end(tmp);
+            p = __capfield(tmp, 5);
+            regions[i] = tmp;
+        }
+        capstone_report(CAPSTONE_TAG_RDID, i);
+        capstone_report(CAPSTONE_TAG_RDSL, region_cpmp[i]);
+        capstone_report(CAPSTONE_TAG_RDBA, b);
+        capstone_report(CAPSTONE_TAG_RDEN, e);
+        capstone_report(CAPSTONE_TAG_RDEH, e >> 32);
+        capstone_report(CAPSTONE_TAG_RDPM, p);
+    }
+    for(i = 0; i < CPMP_COUNT; i += 1) {
+        if(cpmp_region[i] == -1)
+            continue;
+        tmp = read_cpmp(i);
+        b = cap_base(tmp);
+        e = cap_end(tmp);
+        p = __capfield(tmp, 5);
+        write_cpmp(i, tmp);
+        capstone_report(CAPSTONE_TAG_CPID, i | (cpmp_region[i] << 8));
+        capstone_report(CAPSTONE_TAG_CPBA, b);
+        capstone_report(CAPSTONE_TAG_CPEN, e);
+        capstone_report(CAPSTONE_TAG_CPPM, p);
+        if(b <= badaddr && badaddr < e)
+            capstone_report(CAPSTONE_TAG_CPHT, i);
+    }
+}
+#endif
+
 /* FPGA: returns 1 when the fault came from S or U and no region covers it (handle_exception injects it into S),
    else 0. QEMU: void, as before, so its monitor stays byte-identical. */
 #ifdef CAPSTONE_TARGET_FPGA
@@ -3493,6 +3562,9 @@ static void swap_cpmp(unsigned badaddr) {
          *
          * Reporting FIRST, because fault_return_from_domain does not return. */
 #ifdef CAPSTONE_TARGET_FPGA
+#ifdef CAPSTONE_CPMX_DIAG
+        report_cpmx_diag(badaddr);
+#endif
         print_regions();
         print_cpmps();
         capstone_report(CAPSTONE_TAG_MTVL, badaddr);
