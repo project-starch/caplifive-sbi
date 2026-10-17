@@ -99,6 +99,10 @@ _cap_trap_entry:
 _handle_non_ecall:
     mv a0, t0
     call handle_exception
+#if defined(CAPSTONE_TARGET_QEMU) && defined(CAPSTONE_S_TRAP_INJECT)
+    li t1, -2
+    beq a0, t1, _inject_s_trap
+#endif
 #ifdef CAPSTONE_TARGET_FPGA
     li t1, -1
     beq a0, t1, _handle_branch_1
@@ -116,11 +120,45 @@ _handle_non_ecall:
     csrw mepc, t2
 _handle_branch_1:
 #endif
+#if defined(CAPSTONE_TARGET_QEMU) && defined(CAPSTONE_S_TRAP_INJECT)
+_handle_branch_1:
+#endif
     CINCOFFSETIMM(sp, sp, 16)
     RESTORE_REG(a0, sp)
     RESTORE_REG(a1, sp)
     CINCOFFSETIMM(sp, sp, -16)
     j return_to_sumode
+
+#if defined(CAPSTONE_TARGET_QEMU) && defined(CAPSTONE_S_TRAP_INJECT)
+/* The vp2 kit's QEMU firmware: the FPGA monitor's _inject_s_trap (capstone-sbi 83966bc), byte for byte. */
+_inject_s_trap:
+    csrr a5, mcause
+    csrr a6, mtval
+    csrw scause, a5
+    csrw stval, a6
+    csrr t0, mepc
+    csrw sepc, t0
+    csrr t2, mstatus
+    srli t2, t2, 11
+    andi t2, t2, 3               /* the trap's MPP: 1 = S, 0 = U */
+    csrr t0, sstatus
+    andi t1, t0, 2               /* SIE -> SPIE */
+    slli t1, t1, 4
+    andi t0, t0, ~0x122          /* clear SPP, SPIE, SIE */
+    or t0, t0, t1
+    beqz t2, _inject_s_from_u
+    ori t0, t0, 0x100            /* SPP = 1: from S */
+_inject_s_from_u:
+    csrw sstatus, t0
+    csrr t0, stvec
+    andi t0, t0, -4              /* direct mode: the vector base */
+    csrw mepc, t0
+    li t1, 0x1800
+    csrc mstatus, t1             /* MPP := 0 ... */
+    li t1, 0x0800
+    csrs mstatus, t1             /* ... then S, for the mret into stvec */
+    j _handle_branch_1
+#endif
 
 _handle_ints:
     # handle interrupts

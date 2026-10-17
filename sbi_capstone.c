@@ -42,6 +42,10 @@
 #define CAPSTONE_TAG_CERR 0x43455252 /* "CERR" generic capstone_error() */
 #define CAPSTONE_TAG_IRQX 0x49525158 /* "IRQX" handle_interrupt: unhandled interrupt */
 #define CAPSTONE_TAG_EXCX 0x45584358 /* "EXCX" handle_exception: unhandled cause */
+#if defined(CAPSTONE_TARGET_QEMU) && defined(CAPSTONE_S_TRAP_INJECT)
+#define CAPSTONE_TAG_INJS 0x494e4a53 /* "INJS" a trap from S or U injected into S (the vp2 kit's QEMU firmware) */
+#define CAPSTONE_TAG_INJL 0x494e4a4c /* "INJL" an injection would land on the faulting pc itself: stop */
+#endif
 #define CAPSTONE_TAG_ILLX 0x494c4c58 /* "ILLX" illegal instruction that is not CSR time */
 #define CAPSTONE_TAG_CPMX 0x43504d58 /* "CPMX" swap_cpmp: no region covers the fault addr */
 #define CAPSTONE_TAG_SPLA 0x53504c41 /* "SPLA" split_out_cap: no region covers the request */
@@ -2665,7 +2669,15 @@ void handle_interrupt(unsigned int_code) {
     }
 }
 
+#if defined(CAPSTONE_TARGET_QEMU) && defined(CAPSTONE_S_TRAP_INJECT)
+/* The vp2 kit's QEMU firmware: returns 1 when no region covers a fault from S or U (handle_exception injects it
+   into S, as the FPGA monitor does since capstone-sbi 83966bc), else 0. Without the define: void, as before. */
+#define SWAP_CPMP_RETURN(v) return (v)
+static unsigned swap_cpmp(unsigned badaddr) {
+#else
+#define SWAP_CPMP_RETURN(v) return
 static void swap_cpmp(unsigned badaddr) {
+#endif
     unsigned region_id, cpmp_id, start_addr, end_addr;
     unsigned ejected_region_id;
     __linear void *tmp;
@@ -2702,8 +2714,16 @@ static void swap_cpmp(unsigned badaddr) {
         C_PRINT(badaddr);
         C_PRINT(region_n);
 #endif
+#if defined(CAPSTONE_TARGET_QEMU) && defined(CAPSTONE_S_TRAP_INJECT)
+        {
+            unsigned st;
+            C_READ_CSR(mstatus, st);
+            if (((st >> 11) & 3) != 3)
+                return 1; /* from S or U: the OS's own access fault; handle_exception injects it into S */
+        }
+#endif
         fault_return_from_domain(CAPSTONE_NO_CPMP_REGION);
-        return; /* not reached: fault_return_from_domain switches domains */
+        SWAP_CPMP_RETURN(0); /* not reached: fault_return_from_domain switches domains */
     }
 
     // check if there is free cpmp entry
@@ -2813,6 +2833,51 @@ unsigned handle_exception(unsigned cause) {
     return time_val;
 }
 #else /* CAPSTONE_TARGET_QEMU */
+#if defined(CAPSTONE_TARGET_QEMU) && defined(CAPSTONE_S_TRAP_INJECT)
+/* The vp2 kit's QEMU firmware (CAPSTONE_S_TRAP_INJECT, 2026-10-18): the FPGA monitor's S-trap injection (capstone-sbi
+ * 83966bc), so the kit's QEMU reference treats a trap from S or U the way the board does. A trap from S or U that the
+ * monitor does not service returns CAPSTONE_INJECT_S, and the entry's _inject_s_trap delivers it into S (SPP from MPP,
+ * mepc = stvec) and leaves through _handle_branch_1. A trap from M -- a classic domain's fault -- still runs
+ * fault_return_from_domain, so a classic caller still receives CAPSTONE_DOMAIN_FAULT_RETVAL. Without the define this
+ * function is the void one below and the build is byte-identical to before. */
+#define CAPSTONE_INJECT_S ((unsigned)-2)
+static unsigned inject_into_s(unsigned cause) {
+    unsigned sv;
+    unsigned ep;
+    C_READ_CSR(stvec, sv);
+    C_READ_CSR(mepc, ep);
+    if (((sv >> 2) << 2) == ep) {
+        /* the injection would land on the faulting pc itself: a livelock; stop with a report */
+        C_PRINT(CAPSTONE_TAG_INJL);
+        C_PRINT(cause);
+        C_PRINT(ep);
+        while(1);
+    }
+    C_PRINT(CAPSTONE_TAG_INJS);
+    C_PRINT(cause);
+    return CAPSTONE_INJECT_S;
+}
+unsigned handle_exception(unsigned cause) {
+    unsigned badaddr;
+    unsigned st;
+    switch(cause) {
+        case CAUSE_LOAD_ACCESS:
+        case CAUSE_STORE_ACCESS:
+        case CAUSE_FETCH_ACCESS:
+            C_READ_CSR(mtval, badaddr);
+            debug_counter_tick(DEBUG_COUNTER_CPMP_SWAP);
+            if (swap_cpmp(badaddr))
+                return inject_into_s(CAPSTONE_NO_CPMP_REGION);
+            return 0;
+        default:
+            C_READ_CSR(mstatus, st);
+            if (((st >> 11) & 3) != 3)
+                return inject_into_s(cause);
+            fault_return_from_domain(cause);
+    }
+    return 0;
+}
+#else
 void handle_exception(unsigned cause) {
     unsigned badaddr;
     switch(cause) {
@@ -2832,6 +2897,7 @@ void handle_exception(unsigned cause) {
             fault_return_from_domain(cause);
     }
 }
+#endif /* CAPSTONE_S_TRAP_INJECT */
 #endif
 
 
