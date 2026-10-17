@@ -130,13 +130,17 @@ _handle_branch_1:
     j return_to_sumode
 
 #if defined(CAPSTONE_TARGET_QEMU) && defined(CAPSTONE_S_TRAP_INJECT)
-/* The vp2 kit's QEMU firmware: the FPGA monitor's _inject_s_trap (capstone-sbi 83966bc), byte for byte. */
+/* The vp2 kit's QEMU firmware: the FPGA monitor's _inject_s_trap (capstone-sbi 83966bc) in its CEPC form. Under cap_mem,
+ * this QEMU's trap from S or U writes only CEPC (cpu_helper.c:1986-1991), never mepc, and mret returns through CEPC
+ * while capstone_u_active is clear (op_helper.c:352-356). So the faulting pc is read from CEPC and the return target
+ * written to it, as the ecall path above does. On the RTL CEPC's cursor and mepc are one register
+ * (csr_regfile.sv:2616-2621), so the S-visible state is the FPGA block's (the RTL lane, 2026-10-18). */
 _inject_s_trap:
     csrr a5, mcause
     csrr a6, mtval
     csrw scause, a5
     csrw stval, a6
-    csrr t0, mepc
+    CCSRRW(t0, CCSR_CEPC, x0)    /* the faulting pc (the CEPC is rewritten below) */
     csrw sepc, t0
     csrr t2, mstatus
     srli t2, t2, 11
@@ -152,7 +156,7 @@ _inject_s_from_u:
     csrw sstatus, t0
     csrr t0, stvec
     andi t0, t0, -4              /* direct mode: the vector base */
-    csrw mepc, t0
+    CCSRRW(x0, CCSR_CEPC, t0)    /* the return target: mret returns through CEPC */
     li t1, 0x1800
     csrc mstatus, t1             /* MPP := 0 ... */
     li t1, 0x0800

@@ -2747,6 +2747,9 @@ static void swap_cpmp(unsigned badaddr) {
     region_cpmp[region_id] = cpmp_id;
     tmp = regions[region_id];
     write_cpmp(cpmp_id, tmp);
+#if defined(CAPSTONE_TARGET_QEMU) && defined(CAPSTONE_S_TRAP_INJECT)
+    return 0;   /* the CPMP was loaded: nothing to inject (the auditor found this return missing, 2026-10-18) */
+#endif
 }
 
 #ifdef CAPSTONE_TARGET_FPGA
@@ -2845,7 +2848,9 @@ static unsigned inject_into_s(unsigned cause) {
     unsigned sv;
     unsigned ep;
     C_READ_CSR(stvec, sv);
-    C_READ_CSR(mepc, ep);
+    /* the faulting pc is in CEPC on this QEMU's cap-mode trap path, not in mepc; read it and put it back */
+    C_READ_CCSR(cepc, ep);
+    C_WRITE_CCSR(cepc, ep);
     if (((sv >> 2) << 2) == ep) {
         /* the injection would land on the faulting pc itself: a livelock; stop with a report */
         C_PRINT(CAPSTONE_TAG_INJL);
