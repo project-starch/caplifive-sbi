@@ -44,6 +44,9 @@
 #define CAPSTONE_TAG_EXCX 0x45584358 /* "EXCX" handle_exception: unhandled cause */
 #define CAPSTONE_TAG_ILLX 0x494c4c58 /* "ILLX" illegal instruction that is not CSR time */
 #define CAPSTONE_TAG_CPMX 0x43504d58 /* "CPMX" swap_cpmp: no region covers the fault addr */
+#define CAPSTONE_TAG_INJS 0x494e4a53 /* "INJS" an OS-origin trap (MPP S or U) injected into S: value = mcause */
+#define CAPSTONE_TAG_NODM 0x4e4f444d /* "NODM" fault_return_from_domain with no domain call outstanding: stop */
+#define CAPSTONE_TAG_INJL 0x494e4a4c /* "INJL" an injection would land on the faulting pc itself: stop */
 #define CAPSTONE_TAG_SPLA 0x53504c41 /* "SPLA" split_out_cap: no region covers the request */
 #define CAPSTONE_TAG_SPLB 0x53504c42 /* "SPLB" split_out_cap: exact-fit region unsupported */
 #define CAPSTONE_TAG_HOLE 0x484f4c45 /* "HOLE" split_out_cap: exact-fit slot retired in place (Q-03); value = slot index, RGNN follows */
@@ -398,6 +401,19 @@ unsigned next_eject_cpmp;
 
 __domret void *caller_dom;
 unsigned* caller_buf;
+/* Domain calls outstanding (every __domcall/__domcallsaves site increments before and decrements after). A classic
+ * domain runs at M privilege, so its trap arrives with MPP = M, the same as the monitor's own; only this count
+ * separates the two, and fault_return_from_domain refuses to tear down a domain when it is 0 (2026-10-17: a
+ * trap from S Linux with no domain active ran it, and the core wedged at _cap_trap_entry+4). FPGA build only: its one
+ * reader, the check in fault_return_from_domain, is FPGA-only, and the QEMU monitor stays byte-identical. */
+#ifdef CAPSTONE_TARGET_FPGA
+unsigned dom_calls_active;
+#define DOM_CALL_ENTER() dom_calls_active = dom_calls_active + 1
+#define DOM_CALL_EXIT() dom_calls_active = dom_calls_active - 1
+#else
+#define DOM_CALL_ENTER()
+#define DOM_CALL_EXIT()
+#endif
 
 /* has S-mode been executed? */
 unsigned smode_initialised;
@@ -1006,7 +1022,9 @@ static unsigned supervised_invoke(unsigned id, unsigned request, void *argument)
        domain would otherwise run with the monitor's CPMP0..15 live. The swap keeps Linux-region capabilities
        out of the domain; the escape's SAVE/RESTORE then carries the swapped-out (empty) CPMPs, and the
        compiler's swap-in after CALL + 4 restores the real ones. */
+    DOM_CALL_ENTER();
     d = __domcallsaves(d, request, argument);
+    DOM_CALL_EXIT();
     domains[id] = d;
     SUP_CSR_READ(0xfc0, ev);
     if ((ev & 1) == 0) {
@@ -1075,7 +1093,9 @@ static unsigned supervised_invoke(unsigned id, unsigned request, void *argument)
      * domain cannot touch a CPMP CCSR at all. The S-mode save the compiler
      * wraps around __domcallsaves (16 CPMP swaps out and back, each a TLB
      * flush in QEMU, plus 9 S/M CSR swaps) would only repeat that. */
+    DOM_CALL_ENTER();
     d = __domcall(d, request, argument);
+    DOM_CALL_EXIT();
     domains[id] = d;
     return supervised_events[0];
 }
@@ -2420,7 +2440,9 @@ static unsigned call_domain(unsigned dom_id) {
     if (sel == 0) {
         d = domains[dom_id];
         capstone_trace(CAPSTONE_TAG_ENT1, dom_id);
+        DOM_CALL_ENTER();
         d = __domcallsaves(d, CAPSTONE_DPI_CALL, &res);
+        DOM_CALL_EXIT();
         capstone_trace(CAPSTONE_TAG_ENT2, res);
         domains[dom_id] = d;
         return res;
@@ -2463,7 +2485,9 @@ static unsigned call_domain(unsigned dom_id) {
 #else
     __dom void *d = domains[dom_id];
     capstone_trace(CAPSTONE_TAG_ENT1, dom_id);
+    DOM_CALL_ENTER();
     d = __domcallsaves(d, CAPSTONE_DPI_CALL, &res);
+    DOM_CALL_EXIT();
     capstone_trace(CAPSTONE_TAG_ENT2, res);
     domains[dom_id] = d;
 
@@ -2482,7 +2506,9 @@ static unsigned call_domain_with_cap(unsigned dom_id, unsigned base, unsigned le
     __asm__ ("scc(%0, %1, %2)" : "=r"(region) : "r"(region), "r"(cursor));
 
     __dom void *d = domains[dom_id];
+    DOM_CALL_ENTER();
     d = __domcallsaves(d, CAPSTONE_DPI_CALL, region);
+    DOM_CALL_EXIT();
     domains[dom_id] = d;
 
     return 0;
@@ -2750,7 +2776,9 @@ static unsigned shared_region_annotated(unsigned dom_id, unsigned region_id, uns
         return supervised_invoke(dom_id, CAPSTONE_DPI_REGION_SHARE, r);
     }
 #endif
+    DOM_CALL_ENTER();
     d = __domcallsaves(d, CAPSTONE_DPI_REGION_SHARE, r);
+    DOM_CALL_EXIT();
     /* I-4 progress SHA6: the domain returned from the share entry. */
     capstone_trace(CAPSTONE_TAG_SHA6, dom_id);
     domains[dom_id] = d;
@@ -2887,7 +2915,9 @@ static unsigned share_child_region(unsigned dom_id, unsigned parent_id,
         return -1;
     }
 
+    DOM_CALL_ENTER();
     d = __domcallsaves(d, CAPSTONE_DPI_REGION_SHARE, child);
+    DOM_CALL_EXIT();
     domains[dom_id] = d;
 
     return 0;
@@ -2907,10 +2937,14 @@ static unsigned share_region(unsigned dom_id, unsigned region_id) {
     __dom void *d = domains[dom_id];
 
     if (region_cpmp[region_id] != -1) {
+        DOM_CALL_ENTER();
         d = __domcallsaves(d, CAPSTONE_DPI_REGION_SHARE, read_cpmp(region_cpmp[region_id]));
+        DOM_CALL_EXIT();
     }
     else {
+        DOM_CALL_ENTER();
         d = __domcallsaves(d, CAPSTONE_DPI_REGION_SHARE, regions[region_id]);
+        DOM_CALL_EXIT();
     }
 
     domains[dom_id] = d;
@@ -3047,6 +3081,18 @@ static void return_from_domain(unsigned retval) {
  * context. The cause is emitted for the log but the caller only needs to see
  * that the call faulted (CAPSTONE_DOMAIN_FAULT_RETVAL). Does not return. */
 static void fault_return_from_domain(unsigned cause) {
+#ifdef CAPSTONE_TARGET_FPGA
+    /* FPGA host only. sbi.dom (this source built for CAPSTONE_TARGET_QEMU as a domain) is entered from the host, so its
+       own count is 0 while its S-mode borrower runs, and its fault-return to the host is a designed, tested path
+       (0x0FA017ED; the revoke-matrix and sqlite revoke probes). (claim-auditor, 2026-10-17) */
+    if (dom_calls_active == 0) {
+        /* No domain to tear down: this is the monitor's own fault (MPP = M), or a caller that should have injected
+           an OS-origin trap. Returning through caller_dom here jumps into whatever it holds; stop with a report. */
+        capstone_report(CAPSTONE_TAG_NODM, cause);
+        capstone_uart_flush();
+        while(1);
+    }
+#endif
     C_PRINT(CAPSTONE_ERR_STARTER);
     C_PRINT(cause);
     return_from_domain(CAPSTONE_DOMAIN_FAULT_RETVAL);
@@ -3099,7 +3145,9 @@ static unsigned schedule_domain(unsigned dom_id) {
         return -1;
     }
     __dom void *d = domains[dom_id];
+    DOM_CALL_ENTER();
     d = __ihdomcallsaves(CAPSTONE_IHI_THREAD_SPAWN, d); // TODO: this shall
+    DOM_CALL_EXIT();
     domains[dom_id] = d;
     return 0;
 }
@@ -3409,7 +3457,15 @@ void handle_interrupt(unsigned int_code) {
     }
 }
 
+/* FPGA: returns 1 when the fault came from S or U and no region covers it (handle_exception injects it into S),
+   else 0. QEMU: void, as before, so its monitor stays byte-identical. */
+#ifdef CAPSTONE_TARGET_FPGA
+#define SWAP_CPMP_RETURN(v) return (v)
+static unsigned swap_cpmp(unsigned badaddr) {
+#else
+#define SWAP_CPMP_RETURN(v) return
 static void swap_cpmp(unsigned badaddr) {
+#endif
     unsigned region_id, cpmp_id, start_addr, end_addr;
     unsigned ejected_region_id;
     __linear void *tmp;
@@ -3446,8 +3502,18 @@ static void swap_cpmp(unsigned badaddr) {
         C_PRINT(badaddr);
         C_PRINT(region_n);
 #endif
+#ifdef CAPSTONE_TARGET_FPGA
+        {
+            unsigned st;
+            C_READ_CSR(mstatus, st);
+            if (((st >> 11) & 3) != 3) {
+                /* From S or U: the OS's own access fault, not a domain's. handle_exception injects it into S. */
+                return 1;
+            }
+        }
+#endif
         fault_return_from_domain(CAPSTONE_NO_CPMP_REGION);
-        return; /* not reached: fault_return_from_domain switches domains */
+        SWAP_CPMP_RETURN(0); /* not reached: fault_return_from_domain switches domains */
     }
 
     // check if there is free cpmp entry
@@ -3471,9 +3537,34 @@ static void swap_cpmp(unsigned badaddr) {
     region_cpmp[region_id] = cpmp_id;
     tmp = regions[region_id];
     write_cpmp(cpmp_id, tmp);
+#ifdef CAPSTONE_TARGET_FPGA
+    return 0;
+#endif
 }
 
 #ifdef CAPSTONE_TARGET_FPGA
+/* handle_exception returns -1 (resume, no rd write-back), CAPSTONE_INJECT_S (inject the trap into S: the trap
+ * entry runs csm_inject's sequence fed from mcause/mtval/mepc, SPP from MPP, and leaves through return_to_sumode,
+ * which undoes the CSCRATCH swap), or the emulated `time` value. medeleg cannot route 24..30 to S on this RTL
+ * (Q-24), and the kernel must receive its own faults rather than have the monitor stop the core. */
+#define CAPSTONE_INJECT_S ((unsigned)-2)
+/* Report and inject, unless the injection would land on the faulting pc itself (stvec unset, or the kernel's own trap
+   vector faulting): that re-faults forever, a livelock that floods the UART, so stop with a report instead. */
+static unsigned inject_into_s(unsigned cause) {
+    unsigned sv;
+    unsigned ep;
+    C_READ_CSR(stvec, sv);
+    C_READ_CSR(mepc, ep);
+    if (((sv >> 2) << 2) == ep) {
+        capstone_report(CAPSTONE_TAG_INJL, cause);
+        capstone_report(CAPSTONE_TAG_MEPC, ep);
+        capstone_uart_flush();
+        while(1);
+    }
+    capstone_report(CAPSTONE_TAG_INJS, cause);
+    capstone_uart_flush();
+    return CAPSTONE_INJECT_S;
+}
 unsigned handle_exception(unsigned cause) {
     unsigned badaddr;
     unsigned time_val;
@@ -3500,11 +3591,17 @@ unsigned handle_exception(unsigned cause) {
                 C_READ_CSR(mepc, dbg_epc);
                 capstone_report(CAPSTONE_TAG_MEPC, dbg_epc);
                 capstone_uart_flush();
-                /* kept: a debugger halting the wedged core still finds mcause in
-                   a5 and mepc in a6 (the existing gdb workflow). */
-                __asm__ ("csrr a5, mcause");
-                __asm__ ("csrr a6, mepc");
-                while(1);
+                C_READ_CSR(mstatus, dbg_mstatus);
+                if (((dbg_mstatus >> 11) & 3) != 3) {
+                    /* From S or U: inject it into S (2026-10-17; it used to spin here, wedging the core). */
+                    time_val = inject_into_s(cause);
+                } else {
+                    /* kept: a debugger halting the wedged core still finds mcause in
+                       a5 and mepc in a6 (the existing gdb workflow). */
+                    __asm__ ("csrr a5, mcause");
+                    __asm__ ("csrr a6, mepc");
+                    while(1);
+                }
             }
         break;
         case CAUSE_LOAD_ACCESS:
@@ -3512,8 +3609,10 @@ unsigned handle_exception(unsigned cause) {
         case CAUSE_FETCH_ACCESS:
             C_READ_CSR(mtval, badaddr);
             debug_counter_tick(DEBUG_COUNTER_CPMP_SWAP);
-            swap_cpmp(badaddr);
-            time_val = -1;
+            if (swap_cpmp(badaddr))
+                time_val = inject_into_s(CAPSTONE_NO_CPMP_REGION);
+            else
+                time_val = -1;
             break;
         default:
             /* I-4 site EXCX: a trap cause the monitor does not handle at all. */
@@ -3551,8 +3650,19 @@ unsigned handle_exception(unsigned cause) {
              * classified on, so the wedge-rate baseline must be re-established and
              * tests/rtl-smoke/s07-rate.py's S07-WEDGE class re-checked against the new shape
              * before old and new numbers are compared. */
-            fault_return_from_domain(cause);
-            time_val = -1;
+            if (((dbg_mstatus >> 11) & 3) != 3) {
+                /* 2026-10-17, vp2 Tier 1 boot 1: a cause-24 trap from S (the kernel module's LDC on an integer base)
+                   reached this path with no domain active and ran fault_return_from_domain; return_to_sumode never
+                   undid the CSCRATCH swap, and the next trap's CINCOFFSETIMM(sp) at _cap_trap_entry+4 faulted on S's
+                   integer sp forever (the trap log's tval was that kernel stack address). A trap from S or U is
+                   the OS's: inject it into S, which the kernel handles (an oops in the kernel, a signal for a task).
+                   A classic domain runs at M (the RTL lane, csr_regfile.sv), so MPP = M is a domain's or the
+                   monitor's own, and fault_return_from_domain tells them apart. */
+                time_val = inject_into_s(cause);
+            } else {
+                fault_return_from_domain(cause);
+                time_val = -1;
+            }
     }
     return time_val;
 }

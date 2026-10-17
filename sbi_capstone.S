@@ -115,6 +115,8 @@ _handle_non_ecall:
     mv a0, t0
     call handle_exception
 #ifdef CAPSTONE_TARGET_FPGA
+    li t1, -2
+    beq a0, t1, _inject_s_trap
     li t1, -1
     beq a0, t1, _handle_branch_1
 
@@ -147,6 +149,42 @@ _handle_branch_1:
     RESTORE_REG(a1, sp)
     CINCOFFSETIMM(sp, sp, -16)
     j return_to_sumode
+
+#ifdef CAPSTONE_TARGET_FPGA
+/* handle_exception returned CAPSTONE_INJECT_S: a trap from S or U that the monitor does not service, which belongs to
+ * the kernel. medeleg cannot route causes 24..30 to S on this RTL (Q-24), so deliver it in software: csm_inject's
+ * sequence (capstone_csmint.S) fed from mcause/mtval/mepc, with SPP from MPP (1 for S, 0 for U), SPIE = SIE, SIE = 0,
+ * mepc = stvec (direct mode) and MPP := S for the mret. Leaving through _handle_branch_1 restores a0/a1 and
+ * return_to_sumode every other GPR and the CSCRATCH swap (2026-10-17: the old path skipped that swap and wedged).
+ * Clobbers t0-t2, a5, a6 before those restores. */
+_inject_s_trap:
+    csrr a5, mcause
+    csrr a6, mtval
+    csrw scause, a5
+    csrw stval, a6
+    csrr t0, mepc
+    csrw sepc, t0
+    csrr t2, mstatus
+    srli t2, t2, 11
+    andi t2, t2, 3               /* the trap's MPP: 1 = S, 0 = U */
+    csrr t0, sstatus
+    andi t1, t0, 2               /* SIE -> SPIE */
+    slli t1, t1, 4
+    andi t0, t0, ~0x122          /* clear SPP, SPIE, SIE */
+    or t0, t0, t1
+    beqz t2, _inject_s_from_u
+    ori t0, t0, 0x100            /* SPP = 1: from S */
+_inject_s_from_u:
+    csrw sstatus, t0
+    csrr t0, stvec
+    andi t0, t0, -4              /* direct mode: the vector base */
+    csrw mepc, t0
+    li t1, 0x1800
+    csrc mstatus, t1             /* MPP := 0 ... */
+    li t1, 0x0800
+    csrs mstatus, t1             /* ... then S, for the mret into stvec */
+    j _handle_branch_1
+#endif
 
 _handle_ints:
     # handle interrupts
