@@ -24,15 +24,28 @@
  * The walk never sets A or D (vp2's walker faults on a clear A/D instead of updating them): a load needs V, A, and R or
  * (X and mstatus.MXR); a store needs V, R, W, A and D; a U page needs mstatus.SUM; a superpage must be aligned.
  *
+ * DESCRIPTOR v7 (2026-10-17, the runtime lane's ruling, Q-23: trusted S performs no capability memory access, so the
+ * mint writes the capability where S needs it): six words, 8-aligned.
+ *   w0 base; w1 end; w2 perms (bits 0-3) | bit 8 NONLIN (else LINEAR), every other bit 0; w3 cursor (base <= cursor
+ *   <= end); w4 a second slot's address (0 = none; the same alignment and translation checks as the first slot; not
+ *   allowed with LINEAR); w5 reserved, 0.
+ * The new refusals sit inside today's order: the second slot's 6 and 15 right after the first slot's, and the new 29s
+ * (w2's other bits, w5, the cursor, a second slot with LINEAR) with today's, before representability.
+ *
  * Refusals, in QEMU's order, each injected into S before any write:
  *   an operand that is sp (x2) -> 2, tval the instruction (the monitor keeps S's sp in CSCRATCH, not in the frame);
- *   desc & 7 -> 4 (tval desc); a descriptor word not readable -> 13 (tval its VA); slot & 15 -> 6 (tval slot);
- *   the slot not writable -> 15 (tval slot); base >= end or perms > 15 -> 29; [base, end) not representable -> 29
+ *   desc & 7 -> 4 (tval desc); a descriptor word not readable -> 13 (tval its VA, words read w0..w5);
+ *   slot & 15 -> 6 (tval slot); the slot not writable -> 15 (tval slot); w4 != 0: w4 & 15 -> 6, w4 not writable -> 15
+ *   (tval w4); base >= end, w2 & ~0x10F, w5 != 0, cursor outside [base, end], or w4 != 0 with LINEAR -> 29;
+ *   [base, end) not representable -> 29
  *   (a length of 4 KiB and up needs a granule-aligned base and a granule-multiple length, granule 2^(msb(len)-9):
  *   capstone_repr_ok); fewer than two free identities in the table at srevroot (capacity - next + free_count, from the
  *   header's words 0-2 as QEMU reads them, cap_rev_table.c:77-126) -> 30.
- * Then: mint the LINEAR capability; the csupctl.table window is EXACTLY csrsi csupctl, 8; csnode; csrci csupctl, 8 (the
- * RTL lane's rule); STC through a physical capability over the slot's page; rd = the ancestor id; mepc + 4.
+ * Then: mint (CAPCREATE, CAPTYPE LINEAR or NONLIN from w2 bit 8, CAPBOUND [base, end), CAPPERM w2 & 15); the
+ * csupctl.table window is EXACTLY csrsi csupctl, 8; csnode; csrci csupctl, 8 (the RTL lane's rule); SCC to the cursor,
+ * outside the window (a register operation, no memory); STC through a physical capability over the slot's page, then
+ * over the second slot's when w4 != 0 (the capability is NONLIN there, so it stays in the register and the second STC
+ * stores the same capability); rd = the ancestor id; mepc + 4. One node either way.
  *
  * CSNODE's own refusals (30 below two free identities, 29 a corrupt table) are a DEFENCE behind the pre-check: for the
  * window, mtvec points at csm_window_trap, so a CSNODE fault lands there instead of in the monitor's trap entry (which
@@ -46,6 +59,7 @@
 #define CSM_CAPPERM(rd, rs1)         .insn r 0x7B, 0x0, 0x7, rd, rs1, x0
 #define CSM_CAPBOUND(rd, rs1, rs2)   .insn r 0x7B, 0x0, 0x8, rd, rs1, rs2
 #define CSM_CINCOFFSET(rd, rs1, rs2) .insn r 0x5B, 0x1, 0xc, rd, rs1, rs2
+#define CSM_SCC(rd, rs1, rs2)        .insn r 0x5B, 0x1, 0x5, rd, rs1, rs2
 #define CSM_MOVC(rd, rs1)            .insn r 0x5B, 0x1, 0xa, rd, rs1, x0
 #define CSM_LCC(rd, rs1, sel)        .insn r 0x5B, 0x1, 0x4, rd, rs1, sel
 #define CSM_STC(data, addr, imm)     .insn s 0x5B, 0x4, data, imm(addr)
@@ -139,7 +153,7 @@ csmint_dispatch:
   mv a6, a3
   j csm_inject
 4:
-  /* ---- the descriptor's three words, each walked and read physically; a word not readable -> 13 */
+  /* ---- the descriptor's six words (v7), each walked and read physically; a word not readable -> 13 */
   mv s6, a3
   CSM_WALK(s6, a2, 0, csm_desc_fault, csm_w1)
   CSM_PHYS(t6, a2, t3, t4)
@@ -151,7 +165,19 @@ csmint_dispatch:
   addi s6, a3, 16
   CSM_WALK(s6, a2, 0, csm_desc_fault, csm_w3)
   CSM_PHYS(t6, a2, t3, t4)
-  ld s9, 0(t6)                 /* s9: perms */
+  ld s9, 0(t6)                 /* s9: w2, perms | NONLIN << 8 */
+  addi s6, a3, 24
+  CSM_WALK(s6, a2, 0, csm_desc_fault, csm_w3c)
+  CSM_PHYS(t6, a2, t3, t4)
+  ld a1, 0(t6)                 /* a1: w3, the cursor */
+  addi s6, a3, 32
+  CSM_WALK(s6, a2, 0, csm_desc_fault, csm_w3d)
+  CSM_PHYS(t6, a2, t3, t4)
+  ld s0, 0(t6)                 /* s0: w4, the second slot (0: none) */
+  addi s6, a3, 40
+  CSM_WALK(s6, a2, 0, csm_desc_fault, csm_w3e)
+  CSM_PHYS(t6, a2, t3, t4)
+  ld s1, 0(t6)                 /* s1: w5, reserved */
   /* ---- slot & 15 -> 6 */
   andi t0, a4, 15
   beqz t0, 5f
@@ -161,10 +187,30 @@ csmint_dispatch:
 5:
   /* ---- the slot, walked as a store (15 if refused); s10: its physical address */
   CSM_WALK(a4, s10, 1, csm_slot_fault, csm_w4)
+  /* ---- v7: the second slot, the same checks (6, then 15), tval w4; s3: its physical address, 0 for none */
+  li s3, 0
+  beqz s0, 51f
+  andi t0, s0, 15
+  beqz t0, 52f
+  li a5, 6
+  mv a6, s0
+  j csm_inject
+52:
+  CSM_WALK(s0, s3, 1, csm_slot2_fault, csm_w4b)
+51:
   /* ---- the descriptor: base < end, perms <= 15, representable (29) */
   bgeu s7, s8, csm_bad_desc
-  li t0, 15
-  bltu t0, s9, csm_bad_desc
+  li t0, ~0x10F
+  and t0, s9, t0
+  bnez t0, csm_bad_desc        /* w2: only perms bits 0-3 and NONLIN bit 8 */
+  bnez s1, csm_bad_desc        /* w5 reserved */
+  bltu a1, s7, csm_bad_desc    /* cursor < base */
+  bltu s8, a1, csm_bad_desc    /* cursor > end */
+  beqz s0, 53f
+  srli t0, s9, 8
+  andi t0, t0, 1
+  beqz t0, csm_bad_desc        /* a second slot needs NONLIN */
+53:
   sub t0, s8, s7               /* len */
   li t1, 4096
   bltu t0, t1, 7f
@@ -201,9 +247,15 @@ csmint_dispatch:
   /* ---- mint the LINEAR capability */
   CSM_CAPCREATE(s11)
   li t0, CSM_TYPE_LIN
+  srli t1, s9, 8
+  andi t1, t1, 1
+  beqz t1, 54f
+  li t0, CSM_TYPE_NONLIN
+54:
   CSM_CAPTYPE(s11, t0)
   CSM_CAPBOUND(s11, s7, s8)
-  CSM_CAPPERM(s11, s9)
+  andi t0, s9, 15
+  CSM_CAPPERM(s11, t0)
   csrr s6, mepc                /* a CSNODE refusal traps from M and overwrites mepc and mstatus */
   csrr s7, mstatus
   /* ---- the window's trap vector. On the RTL the vector is mtvec in both modes: CCSR ctvec is {tag, metadata} over
@@ -219,9 +271,15 @@ csmint_dispatch:
   CSM_CSNODE(a6, s11)
   csrci CSM_CSUPCTL, 8
   CSM_CCSRRW(x0, CSM_CCSR_CTVEC, s8)       /* the monitor's vector back */
-  /* ---- STC through a physical capability over the slot's page */
+  /* ---- SCC to the cursor, outside the window (a register operation) */
+  CSM_SCC(s11, s11, a1)
+  /* ---- STC through a physical capability over the slot's page; then the second slot's, when there is one */
   CSM_PHYS(t6, s10, t3, t4)
   CSM_STC(s11, t6, 0)
+  beqz s3, 55f
+  CSM_PHYS(t6, s3, t3, t4)
+  CSM_STC(s11, t6, 0)
+55:
   /* ---- rd := the ancestor; mepc + 4 */
   beqz s5, 8f
   slli t1, s5, 3
@@ -259,6 +317,10 @@ csm_desc_fault:
 csm_slot_fault:
   li a5, 15
   mv a6, a4
+  j csm_inject
+csm_slot2_fault:
+  li a5, 15
+  mv a6, s0
   j csm_inject
 csm_bad_desc:
   li a5, 29
