@@ -46,6 +46,7 @@
 #define CAPSTONE_TAG_CPMX 0x43504d58 /* "CPMX" swap_cpmp: no region covers the fault addr */
 #define CAPSTONE_TAG_INJS 0x494e4a53 /* "INJS" an OS-origin trap (MPP S or U) injected into S: value = mcause */
 #define CAPSTONE_TAG_NODM 0x4e4f444d /* "NODM" fault_return_from_domain with no domain call outstanding: stop */
+#define CAPSTONE_TAG_INJL 0x494e4a4c /* "INJL" an injection would land on the faulting pc itself: stop */
 #define CAPSTONE_TAG_SPLA 0x53504c41 /* "SPLA" split_out_cap: no region covers the request */
 #define CAPSTONE_TAG_SPLB 0x53504c42 /* "SPLB" split_out_cap: exact-fit region unsupported */
 #define CAPSTONE_TAG_HOLE 0x484f4c45 /* "HOLE" split_out_cap: exact-fit slot retired in place (Q-03); value = slot index, RGNN follows */
@@ -3072,6 +3073,10 @@ static void return_from_domain(unsigned retval) {
  * context. The cause is emitted for the log but the caller only needs to see
  * that the call faulted (CAPSTONE_DOMAIN_FAULT_RETVAL). Does not return. */
 static void fault_return_from_domain(unsigned cause) {
+#ifdef CAPSTONE_TARGET_FPGA
+    /* FPGA host only. sbi.dom (this source built for CAPSTONE_TARGET_QEMU as a domain) is entered from the host, so its
+       own count is 0 while its S-mode borrower runs, and its fault-return to the host is a designed, tested path
+       (0x0FA017ED; the revoke-matrix and sqlite revoke probes). (claim-auditor, 2026-10-17) */
     if (dom_calls_active == 0) {
         /* No domain to tear down: this is the monitor's own fault (MPP = M), or a caller that should have injected
            an OS-origin trap. Returning through caller_dom here jumps into whatever it holds; stop with a report. */
@@ -3079,6 +3084,7 @@ static void fault_return_from_domain(unsigned cause) {
         capstone_uart_flush();
         while(1);
     }
+#endif
     C_PRINT(CAPSTONE_ERR_STARTER);
     C_PRINT(cause);
     return_from_domain(CAPSTONE_DOMAIN_FAULT_RETVAL);
@@ -3485,9 +3491,7 @@ static unsigned swap_cpmp(unsigned badaddr) {
             unsigned st;
             C_READ_CSR(mstatus, st);
             if (((st >> 11) & 3) != 3) {
-                /* From S or U: the OS's own access fault, not a domain's. Inject it into S. */
-                capstone_report(CAPSTONE_TAG_INJS, CAPSTONE_NO_CPMP_REGION);
-                capstone_uart_flush();
+                /* From S or U: the OS's own access fault, not a domain's. handle_exception injects it into S. */
                 return 1;
             }
         }
@@ -3526,6 +3530,23 @@ static unsigned swap_cpmp(unsigned badaddr) {
  * which undoes the CSCRATCH swap), or the emulated `time` value. medeleg cannot route 24..30 to S on this RTL
  * (Q-24), and the kernel must receive its own faults rather than have the monitor stop the core. */
 #define CAPSTONE_INJECT_S ((unsigned)-2)
+/* Report and inject, unless the injection would land on the faulting pc itself (stvec unset, or the kernel's own trap
+   vector faulting): that re-faults forever, a livelock that floods the UART, so stop with a report instead. */
+static unsigned inject_into_s(unsigned cause) {
+    unsigned sv;
+    unsigned ep;
+    C_READ_CSR(stvec, sv);
+    C_READ_CSR(mepc, ep);
+    if (((sv >> 2) << 2) == ep) {
+        capstone_report(CAPSTONE_TAG_INJL, cause);
+        capstone_report(CAPSTONE_TAG_MEPC, ep);
+        capstone_uart_flush();
+        while(1);
+    }
+    capstone_report(CAPSTONE_TAG_INJS, cause);
+    capstone_uart_flush();
+    return CAPSTONE_INJECT_S;
+}
 unsigned handle_exception(unsigned cause) {
     unsigned badaddr;
     unsigned time_val;
@@ -3555,9 +3576,7 @@ unsigned handle_exception(unsigned cause) {
                 C_READ_CSR(mstatus, dbg_mstatus);
                 if (((dbg_mstatus >> 11) & 3) != 3) {
                     /* From S or U: inject it into S (2026-10-17; it used to spin here, wedging the core). */
-                    capstone_report(CAPSTONE_TAG_INJS, cause);
-                    capstone_uart_flush();
-                    time_val = CAPSTONE_INJECT_S;
+                    time_val = inject_into_s(cause);
                 } else {
                     /* kept: a debugger halting the wedged core still finds mcause in
                        a5 and mepc in a6 (the existing gdb workflow). */
@@ -3573,7 +3592,7 @@ unsigned handle_exception(unsigned cause) {
             C_READ_CSR(mtval, badaddr);
             debug_counter_tick(DEBUG_COUNTER_CPMP_SWAP);
             if (swap_cpmp(badaddr))
-                time_val = CAPSTONE_INJECT_S;
+                time_val = inject_into_s(CAPSTONE_NO_CPMP_REGION);
             else
                 time_val = -1;
             break;
@@ -3615,15 +3634,13 @@ unsigned handle_exception(unsigned cause) {
              * before old and new numbers are compared. */
             if (((dbg_mstatus >> 11) & 3) != 3) {
                 /* 2026-10-17, vp2 Tier 1 boot 1: a cause-24 trap from S (the kernel module's LDC on an integer base)
-                   reached this path with no domain active; fault_return_from_domain returned through a stale
-                   caller_dom, return_to_sumode never undid the CSCRATCH swap, and the next trap's
-                   CINCOFFSETIMM(sp) at _cap_trap_entry+4 faulted on S's integer sp forever. A trap from S or U is
+                   reached this path with no domain active and ran fault_return_from_domain; return_to_sumode never
+                   undid the CSCRATCH swap, and the next trap's CINCOFFSETIMM(sp) at _cap_trap_entry+4 faulted on S's
+                   integer sp forever (the trap log's tval was that kernel stack address). A trap from S or U is
                    the OS's: inject it into S, which the kernel handles (an oops in the kernel, a signal for a task).
                    A classic domain runs at M (the RTL lane, csr_regfile.sv), so MPP = M is a domain's or the
                    monitor's own, and fault_return_from_domain tells them apart. */
-                capstone_report(CAPSTONE_TAG_INJS, cause);
-                capstone_uart_flush();
-                time_val = CAPSTONE_INJECT_S;
+                time_val = inject_into_s(cause);
             } else {
                 fault_return_from_domain(cause);
                 time_val = -1;
