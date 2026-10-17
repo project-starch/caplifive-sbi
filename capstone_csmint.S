@@ -35,9 +35,9 @@
  * RTL lane's rule); STC through a physical capability over the slot's page; rd = the ancestor id; mepc + 4.
  *
  * CSNODE's own refusals (30 below two free identities, 29 a corrupt table) are a DEFENCE behind the pre-check: for the
- * window, CTVEC holds the monitor's trap-vector capability with its cursor moved to csm_window_trap, so a CSNODE fault
- * lands there instead of in the monitor's trap entry, and its cause is injected into S. The path is negative-tested by
- * putting the table into a state the pre-check passes and CSNODE refuses.
+ * window, mtvec points at csm_window_trap, so a CSNODE fault lands there instead of in the monitor's trap entry (which
+ * is not reentrant), and its cause is injected into S. The path is negative-tested by putting the table into a state
+ * the pre-check passes and CSNODE refuses.
  */
 
 #define CSM_CSNODE(rd, rs1)          .insn r 0x5B, 0x1, 0x54, rd, rs1, x0
@@ -206,15 +206,14 @@ csmint_dispatch:
   CSM_CAPPERM(s11, s9)
   csrr s6, mepc                /* a CSNODE refusal traps from M and overwrites mepc and mstatus */
   csrr s7, mstatus
-  /* ---- CTVEC := the monitor's vector capability with its cursor at csm_window_trap; the original kept in s8.
-   * CTVEC holds null for the instructions between the swap and the install; MIE is 0 in a trap handler. */
+  /* ---- the window's trap vector. On the RTL the vector is mtvec in both modes: CCSR ctvec is {tag, metadata} over
+   * mtvec's cursor, a trap does not take its PCC from it, and CCSRRW with rs1 = x0 copies without writing (the RTL
+   * lane, bf3db3175: csr_regfile.sv's ctvec arm, frontend.sv's npc_metadata). So: copy the vector capability into s8,
+   * point mtvec at csm_window_trap for the window (a plain csrw untags the pair, which nothing in the window reads),
+   * and put cursor, metadata and tag back with one CCSRRW afterwards. */
   CSM_CCSRRW(s8, CSM_CCSR_CTVEC, x0)
-  CSM_MOVC(t2, s8)
-  CSM_LCC(t3, t2, x2)          /* its cursor */
-  lla t4, csm_window_trap
-  sub t4, t4, t3
-  CSM_CINCOFFSET(t2, t2, t4)
-  CSM_CCSRRW(x0, CSM_CCSR_CTVEC, t2)
+  lla t0, csm_window_trap
+  csrw mtvec, t0
   /* ---- the window */
   csrsi CSM_CSUPCTL, 8
   CSM_CSNODE(a6, s11)
@@ -237,7 +236,8 @@ csmint_dispatch:
   li a0, 1
   ret
 
-/* A CSNODE refusal inside the window lands here, in M: clear the bit, put back CTVEC, mepc and mstatus, inject. */
+/* A CSNODE refusal inside the window lands here, in M (mepc = the CSNODE): clear the bit (its write flushes), put
+ * back the trap vector, mepc and mstatus, inject. */
 .align 2
 csm_window_trap:
   csrci CSM_CSUPCTL, 8
