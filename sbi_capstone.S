@@ -97,6 +97,21 @@ _cap_trap_entry:
     j return_to_sumode
 
 _handle_non_ecall:
+#if defined(CAPSTONE_TARGET_FPGA) && defined(CAPSTONE_VP2_CSMINT)
+    # vp2: an S-mode CSMINT traps here as an illegal instruction and is emulated by csmint_dispatch
+    # (capstone_csmint.S, validated in RTL simulation as va-csmint-emu and va-csmint-mon). It takes a capability over
+    # the frame with its cursor at S's x0 slot, which is sp + 16 here (the layout the rd write-back below uses), as a
+    # copy so sp is untouched. Handled: rd is in the frame and mepc advanced, or the refusal was injected into S; either
+    # way the return path restores the frame. Not a CSMINT: fall through to handle_exception's `time` emulation.
+    li t1, CAUSE_ILLEGAL_INSTRUCTION
+    bne t0, t1, 1f
+    MOVC(a0, sp)
+    CINCOFFSETIMM(a0, a0, 16)
+    call csmint_dispatch
+    bnez a0, _handle_branch_1
+    csrr t0, mcause
+1:
+#endif
     mv a0, t0
     call handle_exception
 #ifdef CAPSTONE_TARGET_FPGA
@@ -215,3 +230,8 @@ resume_smode:
     CINCOFFSETIMM(sp, sp, -16)
 
     j return_to_sumode
+
+#if defined(CAPSTONE_TARGET_FPGA) && defined(CAPSTONE_VP2_CSMINT)
+/* vp2: the CSMINT emulation, in .cap_text with the rest of this file */
+#include "capstone_csmint.S"
+#endif
