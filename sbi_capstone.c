@@ -404,8 +404,16 @@ unsigned* caller_buf;
 /* Domain calls outstanding (every __domcall/__domcallsaves site increments before and decrements after). A classic
  * domain runs at M privilege, so its trap arrives with MPP = M, the same as the monitor's own; only this count
  * separates the two, and fault_return_from_domain refuses to tear down a domain when it is 0 (2026-10-17: a
- * trap from S Linux with no domain active ran it, and the core wedged at _cap_trap_entry+4). */
+ * trap from S Linux with no domain active ran it, and the core wedged at _cap_trap_entry+4). FPGA build only: its one
+ * reader, the check in fault_return_from_domain, is FPGA-only, and the QEMU monitor stays byte-identical. */
+#ifdef CAPSTONE_TARGET_FPGA
 unsigned dom_calls_active;
+#define DOM_CALL_ENTER() dom_calls_active = dom_calls_active + 1
+#define DOM_CALL_EXIT() dom_calls_active = dom_calls_active - 1
+#else
+#define DOM_CALL_ENTER()
+#define DOM_CALL_EXIT()
+#endif
 
 /* has S-mode been executed? */
 unsigned smode_initialised;
@@ -1014,9 +1022,9 @@ static unsigned supervised_invoke(unsigned id, unsigned request, void *argument)
        domain would otherwise run with the monitor's CPMP0..15 live. The swap keeps Linux-region capabilities
        out of the domain; the escape's SAVE/RESTORE then carries the swapped-out (empty) CPMPs, and the
        compiler's swap-in after CALL + 4 restores the real ones. */
-    dom_calls_active = dom_calls_active + 1;
+    DOM_CALL_ENTER();
     d = __domcallsaves(d, request, argument);
-    dom_calls_active = dom_calls_active - 1;
+    DOM_CALL_EXIT();
     domains[id] = d;
     SUP_CSR_READ(0xfc0, ev);
     if ((ev & 1) == 0) {
@@ -1085,9 +1093,9 @@ static unsigned supervised_invoke(unsigned id, unsigned request, void *argument)
      * domain cannot touch a CPMP CCSR at all. The S-mode save the compiler
      * wraps around __domcallsaves (16 CPMP swaps out and back, each a TLB
      * flush in QEMU, plus 9 S/M CSR swaps) would only repeat that. */
-    dom_calls_active = dom_calls_active + 1;
+    DOM_CALL_ENTER();
     d = __domcall(d, request, argument);
-    dom_calls_active = dom_calls_active - 1;
+    DOM_CALL_EXIT();
     domains[id] = d;
     return supervised_events[0];
 }
@@ -2432,9 +2440,9 @@ static unsigned call_domain(unsigned dom_id) {
     if (sel == 0) {
         d = domains[dom_id];
         capstone_trace(CAPSTONE_TAG_ENT1, dom_id);
-        dom_calls_active = dom_calls_active + 1;
+        DOM_CALL_ENTER();
         d = __domcallsaves(d, CAPSTONE_DPI_CALL, &res);
-        dom_calls_active = dom_calls_active - 1;
+        DOM_CALL_EXIT();
         capstone_trace(CAPSTONE_TAG_ENT2, res);
         domains[dom_id] = d;
         return res;
@@ -2477,9 +2485,9 @@ static unsigned call_domain(unsigned dom_id) {
 #else
     __dom void *d = domains[dom_id];
     capstone_trace(CAPSTONE_TAG_ENT1, dom_id);
-    dom_calls_active = dom_calls_active + 1;
+    DOM_CALL_ENTER();
     d = __domcallsaves(d, CAPSTONE_DPI_CALL, &res);
-    dom_calls_active = dom_calls_active - 1;
+    DOM_CALL_EXIT();
     capstone_trace(CAPSTONE_TAG_ENT2, res);
     domains[dom_id] = d;
 
@@ -2498,9 +2506,9 @@ static unsigned call_domain_with_cap(unsigned dom_id, unsigned base, unsigned le
     __asm__ ("scc(%0, %1, %2)" : "=r"(region) : "r"(region), "r"(cursor));
 
     __dom void *d = domains[dom_id];
-    dom_calls_active = dom_calls_active + 1;
+    DOM_CALL_ENTER();
     d = __domcallsaves(d, CAPSTONE_DPI_CALL, region);
-    dom_calls_active = dom_calls_active - 1;
+    DOM_CALL_EXIT();
     domains[dom_id] = d;
 
     return 0;
@@ -2768,9 +2776,9 @@ static unsigned shared_region_annotated(unsigned dom_id, unsigned region_id, uns
         return supervised_invoke(dom_id, CAPSTONE_DPI_REGION_SHARE, r);
     }
 #endif
-    dom_calls_active = dom_calls_active + 1;
+    DOM_CALL_ENTER();
     d = __domcallsaves(d, CAPSTONE_DPI_REGION_SHARE, r);
-    dom_calls_active = dom_calls_active - 1;
+    DOM_CALL_EXIT();
     /* I-4 progress SHA6: the domain returned from the share entry. */
     capstone_trace(CAPSTONE_TAG_SHA6, dom_id);
     domains[dom_id] = d;
@@ -2907,9 +2915,9 @@ static unsigned share_child_region(unsigned dom_id, unsigned parent_id,
         return -1;
     }
 
-    dom_calls_active = dom_calls_active + 1;
+    DOM_CALL_ENTER();
     d = __domcallsaves(d, CAPSTONE_DPI_REGION_SHARE, child);
-    dom_calls_active = dom_calls_active - 1;
+    DOM_CALL_EXIT();
     domains[dom_id] = d;
 
     return 0;
@@ -2929,14 +2937,14 @@ static unsigned share_region(unsigned dom_id, unsigned region_id) {
     __dom void *d = domains[dom_id];
 
     if (region_cpmp[region_id] != -1) {
-        dom_calls_active = dom_calls_active + 1;
+        DOM_CALL_ENTER();
         d = __domcallsaves(d, CAPSTONE_DPI_REGION_SHARE, read_cpmp(region_cpmp[region_id]));
-        dom_calls_active = dom_calls_active - 1;
+        DOM_CALL_EXIT();
     }
     else {
-        dom_calls_active = dom_calls_active + 1;
+        DOM_CALL_ENTER();
         d = __domcallsaves(d, CAPSTONE_DPI_REGION_SHARE, regions[region_id]);
-        dom_calls_active = dom_calls_active - 1;
+        DOM_CALL_EXIT();
     }
 
     domains[dom_id] = d;
@@ -3137,9 +3145,9 @@ static unsigned schedule_domain(unsigned dom_id) {
         return -1;
     }
     __dom void *d = domains[dom_id];
-    dom_calls_active = dom_calls_active + 1;
+    DOM_CALL_ENTER();
     d = __ihdomcallsaves(CAPSTONE_IHI_THREAD_SPAWN, d); // TODO: this shall
-    dom_calls_active = dom_calls_active - 1;
+    DOM_CALL_EXIT();
     domains[dom_id] = d;
     return 0;
 }
@@ -3449,7 +3457,15 @@ void handle_interrupt(unsigned int_code) {
     }
 }
 
+/* FPGA: returns 1 when the fault came from S or U and no region covers it (handle_exception injects it into S),
+   else 0. QEMU: void, as before, so its monitor stays byte-identical. */
+#ifdef CAPSTONE_TARGET_FPGA
+#define SWAP_CPMP_RETURN(v) return (v)
 static unsigned swap_cpmp(unsigned badaddr) {
+#else
+#define SWAP_CPMP_RETURN(v) return
+static void swap_cpmp(unsigned badaddr) {
+#endif
     unsigned region_id, cpmp_id, start_addr, end_addr;
     unsigned ejected_region_id;
     __linear void *tmp;
@@ -3497,7 +3513,7 @@ static unsigned swap_cpmp(unsigned badaddr) {
         }
 #endif
         fault_return_from_domain(CAPSTONE_NO_CPMP_REGION);
-        return 0; /* not reached: fault_return_from_domain switches domains */
+        SWAP_CPMP_RETURN(0); /* not reached: fault_return_from_domain switches domains */
     }
 
     // check if there is free cpmp entry
@@ -3521,7 +3537,9 @@ static unsigned swap_cpmp(unsigned badaddr) {
     region_cpmp[region_id] = cpmp_id;
     tmp = regions[region_id];
     write_cpmp(cpmp_id, tmp);
+#ifdef CAPSTONE_TARGET_FPGA
     return 0;
+#endif
 }
 
 #ifdef CAPSTONE_TARGET_FPGA
