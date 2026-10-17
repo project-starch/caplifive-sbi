@@ -171,6 +171,7 @@
 #define CAPSTONE_TAG_DOMN 0x444f4d4e /* "DOMN" dom_n */
 #define CAPSTONE_TAG_RGNF 0x52474e46 /* "RGNF" region table full: a carve REFUSED before touching the pool (Phase B item 1), not a fault */
 #define CAPSTONE_TAG_RGNN 0x52474e4e /* "RGNN" region_n */
+#define CAPSTONE_TAG_FRTY 0x46525459 /* "FRTY" an S/U instruction fetch refused under a covering executable CPMP entry: retried (value = mepc) */
 #ifdef CAPSTONE_CPMX_DIAG
 /* The CPMX diagnostic (vp2 boot 3-T1's third run, 2026-10-18): the region table and the CPMP entries at the fault. */
 #define CAPSTONE_TAG_RDID 0x52444944 /* "RDID" a live region's id */
@@ -421,6 +422,11 @@ unsigned* caller_buf;
  * trap from S Linux with no domain active ran it, and the core wedged at _cap_trap_entry+4). FPGA build only: its one
  * reader, the check in fault_return_from_domain, is FPGA-only, and the QEMU monitor stays byte-identical. */
 #ifdef CAPSTONE_TARGET_FPGA
+#ifdef CAPSTONE_VP2_FETCH_RETRY
+/* the last retried fetch's pc and the minstret at its retry (fetch_retry_covered) */
+unsigned fetch_retry_pc;
+unsigned fetch_retry_ret;
+#endif
 unsigned dom_calls_active;
 #define DOM_CALL_ENTER() dom_calls_active = dom_calls_active + 1
 #define DOM_CALL_EXIT() dom_calls_active = dom_calls_active - 1
@@ -3471,6 +3477,62 @@ void handle_interrupt(unsigned int_code) {
     }
 }
 
+#ifdef CAPSTONE_VP2_FETCH_RETRY
+/* vp2 workaround (bf3db3175, 2026-10-18). The S caller's FIRST instruction fetch after a CSRUNV escape returns is
+   refused with an instruction access fault, although a LOADED CPMP entry with X covers it when M reads the CSRs
+   (the CPMX diagnostic: CPMP 3 = [0x80100000, 0xAC000000) RWX, three boots, two module builds; llvm-capstone lane
+   vp2-tier12). The mechanism is the RTL lane's to find. This retries such a fetch: flush the translation caches and
+   return to the faulting pc (swap_cpmp returns 0, so handle_exception resumes with no injection). A second refusal at
+   the same pc with fewer than FETCH_RETRY_MIN_INSTRET instructions retired since the retry is no progress: it is not
+   retried, and is injected as before. Only S/U instruction-fetch access faults under a covering X entry qualify, so
+   no access the CPMP does not already grant is made. Returns 1 when it retried. */
+#define FETCH_RETRY_MIN_INSTRET 4096
+static unsigned fetch_retry_covered(unsigned badaddr) {
+    unsigned st;
+    unsigned cause;
+    unsigned ep;
+    unsigned now;
+    unsigned i;
+    unsigned b;
+    unsigned e;
+    unsigned p;
+    unsigned hit;
+    __linear void *tmp;
+    C_READ_CSR(mstatus, st);
+    if (((st >> 11) & 3) == 3)
+        return 0;
+    C_READ_CSR(mcause, cause);
+    if (cause != CAUSE_FETCH_ACCESS)
+        return 0;
+    hit = 0;
+    for(i = 0; i < CPMP_COUNT; i += 1) {
+        if(cpmp_region[i] == -1)
+            continue;
+        tmp = read_cpmp(i);
+        b = cap_base(tmp);
+        e = cap_end(tmp);
+        p = __capfield(tmp, 5);
+        write_cpmp(i, tmp);
+        if(b <= badaddr && badaddr < e && (p & 1) != 0)
+            hit = 1;
+    }
+    if(hit == 0)
+        return 0;
+    C_READ_CSR(mepc, ep);
+    C_READ_CSR(minstret, now);
+    if(ep == fetch_retry_pc && now - fetch_retry_ret < FETCH_RETRY_MIN_INSTRET) {
+        fetch_retry_pc = 0;
+        return 0;
+    }
+    fetch_retry_pc = ep;
+    fetch_retry_ret = now;
+    capstone_report(CAPSTONE_TAG_FRTY, ep);
+    __asm__ volatile("sfence.vma x0, x0");
+    __asm__ volatile("fence.i");
+    return 1;
+}
+#endif
+
 #ifdef CAPSTONE_CPMX_DIAG
 /* vp2 boot 3-T1's third run (2026-10-18): an S-mode INSTRUCTION FETCH at physical 0x81d2e940, a page of Linux's memory
    that data loads and stores reached, faulted and reached swap_cpmp, which found no not-yet-loaded live region covering
@@ -3551,6 +3613,10 @@ static void swap_cpmp(unsigned badaddr) {
             break;
     }
     if(region_id >= region_n) {
+#if defined(CAPSTONE_TARGET_FPGA) && defined(CAPSTONE_VP2_FETCH_RETRY)
+        if(fetch_retry_covered(badaddr))
+            return 0;   /* retried: nothing to inject */
+#endif
         /* MERGE 2026-08-18: both sides kept, because they are orthogonal.
          *
          * The UART reporting below is the diagnostic half -- without it a monitor-detected
