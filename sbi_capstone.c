@@ -3131,7 +3131,9 @@ static unsigned schedule_domain(unsigned dom_id) {
         return -1;
     }
     __dom void *d = domains[dom_id];
+    dom_calls_active = dom_calls_active + 1;
     d = __ihdomcallsaves(CAPSTONE_IHI_THREAD_SPAWN, d); // TODO: this shall
+    dom_calls_active = dom_calls_active - 1;
     domains[dom_id] = d;
     return 0;
 }
