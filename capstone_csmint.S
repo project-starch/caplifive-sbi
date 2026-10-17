@@ -106,6 +106,15 @@ U##_uok: \
 .align 2
 .globl csmint_dispatch
 csmint_dispatch:
+  /* Only a CSMINT from S is emulated. From U it is illegal (QEMU: trans_capstone.c.inc makes CSMINT illegal at PRV_U),
+   * and emulating it would let a U process have the monitor read a descriptor from, and store a capability to, kernel
+   * pages (the walk checks SUM for U pages, not the requester's privilege). Not ours: the caller's handle_exception
+   * then delivers the illegal instruction to S. (claim-auditor, 2026-10-17; pre-existing since c3293b3.) */
+  csrr t0, mstatus
+  srli t0, t0, 11
+  andi t0, t0, 3
+  li t1, 1
+  bne t0, t1, csm_not_ours
   csrr t0, mtval
   bnez t0, 1f
   /* mtval 0: fetch the instruction at mepc, walked as a load (R, or X with MXR) */
