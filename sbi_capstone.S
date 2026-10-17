@@ -114,6 +114,10 @@ _handle_non_ecall:
 #endif
     mv a0, t0
     call handle_exception
+#if defined(CAPSTONE_TARGET_QEMU) && defined(CAPSTONE_S_TRAP_INJECT)
+    li t1, -2
+    beq a0, t1, _inject_s_trap
+#endif
 #ifdef CAPSTONE_TARGET_FPGA
     li t1, -2
     beq a0, t1, _inject_s_trap
@@ -144,25 +148,35 @@ _handle_non_ecall:
     csrw mepc, t2
 _handle_branch_1:
 #endif
+#if defined(CAPSTONE_TARGET_QEMU) && defined(CAPSTONE_S_TRAP_INJECT)
+_handle_branch_1:
+#endif
     CINCOFFSETIMM(sp, sp, 16)
     RESTORE_REG(a0, sp)
     RESTORE_REG(a1, sp)
     CINCOFFSETIMM(sp, sp, -16)
     j return_to_sumode
 
-#ifdef CAPSTONE_TARGET_FPGA
+#if defined(CAPSTONE_TARGET_FPGA) || (defined(CAPSTONE_TARGET_QEMU) && defined(CAPSTONE_S_TRAP_INJECT))
 /* handle_exception returned CAPSTONE_INJECT_S: a trap from S or U that the monitor does not service, which belongs to
  * the kernel. medeleg cannot route causes 24..30 to S on this RTL (Q-24), so deliver it in software: csm_inject's
- * sequence (capstone_csmint.S) fed from mcause/mtval/mepc, with SPP from MPP (1 for S, 0 for U), SPIE = SIE, SIE = 0,
- * mepc = stvec (direct mode) and MPP := S for the mret. Leaving through _handle_branch_1 restores a0/a1 and
- * return_to_sumode every other GPR and the CSCRATCH swap (2026-10-17: the old path skipped that swap and wedged).
- * Clobbers t0-t2, a5, a6 before those restores. */
+ * sequence (capstone_csmint.S) fed from mcause/mtval and the faulting pc, with SPP from MPP (1 for S, 0 for U),
+ * SPIE = SIE, SIE = 0, the return target = stvec (direct mode) and MPP := S for the mret. Leaving through
+ * _handle_branch_1 restores a0/a1 and return_to_sumode every other GPR and the CSCRATCH swap (2026-10-17: the old path
+ * skipped that swap and wedged). Clobbers t0-t2, a5, a6 before those restores.
+ *
+ * ONE entry for both targets (2026-10-18, the rule in the vp2 corpus plan, llvm-capstone 2f57a8b46833): the faulting pc
+ * is read from CEPC and the return target written to it, as the ecall path above does. Under cap_mem the kit's QEMU
+ * writes only CEPC on a trap from S or U and mret returns through it (cpu_helper.c:1986-1991, op_helper.c:352-356); on
+ * the RTL CEPC's cursor and mepc are one register (csr_regfile.sv:2616-2621). Q-28 records the divergence. The QEMU
+ * build carries it only under CAPSTONE_S_TRAP_INJECT (the vp2 kit's firmware); without the define the QEMU monitor is
+ * unchanged. */
 _inject_s_trap:
     csrr a5, mcause
     csrr a6, mtval
     csrw scause, a5
     csrw stval, a6
-    csrr t0, mepc
+    CCSRRW(t0, CCSR_CEPC, x0)    /* the faulting pc (CEPC is rewritten below) */
     csrw sepc, t0
     csrr t2, mstatus
     srli t2, t2, 11
@@ -178,7 +192,7 @@ _inject_s_from_u:
     csrw sstatus, t0
     csrr t0, stvec
     andi t0, t0, -4              /* direct mode: the vector base */
-    csrw mepc, t0
+    CCSRRW(x0, CCSR_CEPC, t0)    /* the return target: mret returns through CEPC (its cursor is mepc on the RTL) */
     li t1, 0x1800
     csrc mstatus, t1             /* MPP := 0 ... */
     li t1, 0x0800

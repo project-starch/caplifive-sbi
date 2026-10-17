@@ -3457,9 +3457,15 @@ void handle_interrupt(unsigned int_code) {
     }
 }
 
-/* FPGA: returns 1 when the fault came from S or U and no region covers it (handle_exception injects it into S),
-   else 0. QEMU: void, as before, so its monitor stays byte-identical. */
-#ifdef CAPSTONE_TARGET_FPGA
+/* The S-trap injection (_inject_s_trap in sbi_capstone.S): always on the FPGA; on the QEMU target only in the vp2 kit's
+   firmware, under CAPSTONE_S_TRAP_INJECT. Without it the QEMU monitor is byte-identical to before. */
+#if defined(CAPSTONE_TARGET_FPGA) || (defined(CAPSTONE_TARGET_QEMU) && defined(CAPSTONE_S_TRAP_INJECT))
+#define CAPSTONE_INJECTS_S_TRAPS
+#endif
+
+/* With the injection: returns 1 when the fault came from S or U and no region covers it (handle_exception injects it
+   into S), else 0. Without it (the plain QEMU monitor): void, as before. */
+#ifdef CAPSTONE_INJECTS_S_TRAPS
 #define SWAP_CPMP_RETURN(v) return (v)
 static unsigned swap_cpmp(unsigned badaddr) {
 #else
@@ -3502,7 +3508,7 @@ static void swap_cpmp(unsigned badaddr) {
         C_PRINT(badaddr);
         C_PRINT(region_n);
 #endif
-#ifdef CAPSTONE_TARGET_FPGA
+#ifdef CAPSTONE_INJECTS_S_TRAPS
         {
             unsigned st;
             C_READ_CSR(mstatus, st);
@@ -3537,24 +3543,28 @@ static void swap_cpmp(unsigned badaddr) {
     region_cpmp[region_id] = cpmp_id;
     tmp = regions[region_id];
     write_cpmp(cpmp_id, tmp);
-#ifdef CAPSTONE_TARGET_FPGA
-    return 0;
+#ifdef CAPSTONE_INJECTS_S_TRAPS
+    return 0;   /* the CPMP was loaded: nothing to inject */
 #endif
 }
 
-#ifdef CAPSTONE_TARGET_FPGA
-/* handle_exception returns -1 (resume, no rd write-back), CAPSTONE_INJECT_S (inject the trap into S: the trap
- * entry runs csm_inject's sequence fed from mcause/mtval/mepc, SPP from MPP, and leaves through return_to_sumode,
- * which undoes the CSCRATCH swap), or the emulated `time` value. medeleg cannot route 24..30 to S on this RTL
- * (Q-24), and the kernel must receive its own faults rather than have the monitor stop the core. */
+#ifdef CAPSTONE_INJECTS_S_TRAPS
+/* handle_exception returns CAPSTONE_INJECT_S to have the trap injected into S: the trap entry's _inject_s_trap runs
+ * csm_inject's sequence fed from mcause/mtval and the faulting pc, SPP from MPP, and leaves through return_to_sumode,
+ * which undoes the CSCRATCH swap. medeleg cannot route 24..30 to S on this RTL (Q-24), and the kernel must receive its
+ * own faults rather than have the monitor stop the core. The FPGA's handle_exception also returns -1 (resume, no rd
+ * write-back) or the emulated `time` value. */
 #define CAPSTONE_INJECT_S ((unsigned)-2)
 /* Report and inject, unless the injection would land on the faulting pc itself (stvec unset, or the kernel's own trap
-   vector faulting): that re-faults forever, a livelock that floods the UART, so stop with a report instead. */
+   vector faulting): that re-faults forever, a livelock that floods the UART, so stop with a report instead. The
+   faulting pc is read through CEPC, as the entry reads it: on the RTL its cursor is mepc, and the kit's QEMU writes
+   only CEPC on a trap from S or U (Q-28). The read leaves CEPC null, so it is written back. */
 static unsigned inject_into_s(unsigned cause) {
     unsigned sv;
     unsigned ep;
     C_READ_CSR(stvec, sv);
-    C_READ_CSR(mepc, ep);
+    C_READ_CCSR(cepc, ep);
+    C_WRITE_CCSR(cepc, ep);
     if (((sv >> 2) << 2) == ep) {
         capstone_report(CAPSTONE_TAG_INJL, cause);
         capstone_report(CAPSTONE_TAG_MEPC, ep);
@@ -3565,6 +3575,9 @@ static unsigned inject_into_s(unsigned cause) {
     capstone_uart_flush();
     return CAPSTONE_INJECT_S;
 }
+#endif /* CAPSTONE_INJECTS_S_TRAPS */
+
+#ifdef CAPSTONE_TARGET_FPGA
 unsigned handle_exception(unsigned cause) {
     unsigned badaddr;
     unsigned time_val;
@@ -3667,6 +3680,31 @@ unsigned handle_exception(unsigned cause) {
     return time_val;
 }
 #else /* CAPSTONE_TARGET_QEMU */
+#ifdef CAPSTONE_S_TRAP_INJECT
+/* The vp2 kit's QEMU firmware: a trap from S or U that the monitor does not service is injected into S, as on the
+ * FPGA, so the kit's QEMU reference treats it as the board does. A trap from M -- a classic domain's fault -- still
+ * runs fault_return_from_domain, so a classic caller still receives CAPSTONE_DOMAIN_FAULT_RETVAL. */
+unsigned handle_exception(unsigned cause) {
+    unsigned badaddr;
+    unsigned st;
+    switch(cause) {
+        case CAUSE_LOAD_ACCESS:
+        case CAUSE_STORE_ACCESS:
+        case CAUSE_FETCH_ACCESS:
+            C_READ_CSR(mtval, badaddr);
+            debug_counter_tick(DEBUG_COUNTER_CPMP_SWAP);
+            if (swap_cpmp(badaddr))
+                return inject_into_s(CAPSTONE_NO_CPMP_REGION);
+            return 0;
+        default:
+            C_READ_CSR(mstatus, st);
+            if (((st >> 11) & 3) != 3)
+                return inject_into_s(cause);
+            fault_return_from_domain(cause);
+    }
+    return 0;
+}
+#else
 void handle_exception(unsigned cause) {
     unsigned badaddr;
     switch(cause) {
@@ -3686,6 +3724,7 @@ void handle_exception(unsigned cause) {
             fault_return_from_domain(cause);
     }
 }
+#endif /* CAPSTONE_S_TRAP_INJECT */
 #endif
 
 
