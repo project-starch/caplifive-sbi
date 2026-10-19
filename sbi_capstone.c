@@ -185,6 +185,9 @@
 #define CAPSTONE_TAG_RFSH 0x52465348 /* "RFSH" the same srevroot, high 32 bits */
 #define CAPSTONE_TAG_RFCT 0x52464354 /* "RFCT" the same refusal: csupctl (0x7c4), as M reads it */
 #define CAPSTONE_TAG_FRTM 0x4652544d /* "FRTM" beside FRTY: the refused fetch's mtval (the CPMP's physical address), low 32 bits */
+#define CAPSTONE_TAG_FRSL 0x4652534c /* "FRSL" at a refused fetch, a loaded CPMP slot covering mtval (or with no capability): (slot << 16) | its region */
+#define CAPSTONE_TAG_FRT2 0x46525432 /* "FRT2" that slot's LCC type query (zimm 1): 0 LINEAR, 1 NONLIN, 7 no capability */
+#define CAPSTONE_TAG_FRVD 0x46525644 /* "FRVD" that slot's LCC validity query (zimm 0): 0 dead node, 1 live; 0xffffffff not asked (FRT2 7) */
 #define CAPSTONE_TAG_RFVD 0x52465644 /* "RFVD" that slot's LCC validity query (zimm 0): 0 dead node, 1 live; 0xffffffff not asked (RFTY 7) */
 #endif
 #define CAPSTONE_TAG_FRGS 0x46524753 /* "FRGS" each loaded CPMP slot at the guard: (slot << 24) | (region live << 20) | (region maps the slot back << 16) | region */
@@ -3710,6 +3713,10 @@ static unsigned fetch_retry_covered(unsigned badaddr) {
     unsigned e;
     unsigned p;
     unsigned hit;
+#ifdef CAPSTONE_S23_FETCH_SLOTS
+    unsigned t;
+    unsigned v;
+#endif
     __linear void *tmp;
     C_READ_CSR(mstatus, st);
     if (((st >> 11) & 3) == 3)
@@ -3722,10 +3729,38 @@ static unsigned fetch_retry_covered(unsigned badaddr) {
         if(cpmp_region[i] == -1)
             continue;
         tmp = read_cpmp(i);
+#ifdef CAPSTONE_S23_FETCH_SLOTS
+        /* S-23's fetch-face slot read (2026-10-20, the runtime lane's discriminator; FPGA, CAPSTONE_S23_FETCH_SLOTS with
+           CAPSTONE_S23_REFUSAL_READ, off by default): report_refusal_slots's reads at a refused fetch, for each loaded
+           slot covering mtval and each loaded slot with no capability, taken on the value read and BEFORE the
+           write-back. The type is asked first, and only a slot with a capability has its bounds read, so a slot with
+           none (FRT2 7) is reported without the cap_base that would raise at M. The write-back is that value, unchanged. */
+        t = __capfield(tmp, 1);
+        if(t == 7) {
+            write_cpmp(i, tmp);
+            capstone_report(CAPSTONE_TAG_FRSL, (i << 16) | (cpmp_region[i] & 0xffff));
+            capstone_report(CAPSTONE_TAG_FRT2, t);
+            capstone_report(CAPSTONE_TAG_FRVD, 0xffffffff);
+            continue;
+        }
+        v = 0xffffffff;
         b = cap_base(tmp);
         e = cap_end(tmp);
+        if(b <= badaddr && badaddr < e)
+            v = __capfield(tmp, 0);
+#else
+        b = cap_base(tmp);
+        e = cap_end(tmp);
+#endif
         p = __capfield(tmp, 5);
         write_cpmp(i, tmp);
+#ifdef CAPSTONE_S23_FETCH_SLOTS
+        if(b <= badaddr && badaddr < e) {
+            capstone_report(CAPSTONE_TAG_FRSL, (i << 16) | (cpmp_region[i] & 0xffff));
+            capstone_report(CAPSTONE_TAG_FRT2, t);
+            capstone_report(CAPSTONE_TAG_FRVD, v);
+        }
+#endif
         if(b <= badaddr && badaddr < e && (p & 1) != 0)
             hit = 1;
     }
