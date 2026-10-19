@@ -181,6 +181,10 @@
 #define CAPSTONE_TAG_DRT1 0x44525431 /* "DRT1" an S/U data access refused under a covering, passing, node-valid slot: retried, nothing written (value = mepc) */
 #define CAPSTONE_TAG_DRTX 0x44525458 /* "DRTX" the same mepc refused again within DATA_RETRY_MIN_INSTRET: not retried, injected as before (value = mepc) */
 #endif
+#define CAPSTONE_TAG_RFSR 0x52465352 /* "RFSR" at an S/U data refusal, before the refusal read: srevroot (0x5c1), low 32 bits */
+#define CAPSTONE_TAG_RFSH 0x52465348 /* "RFSH" the same srevroot, high 32 bits */
+#define CAPSTONE_TAG_RFCT 0x52464354 /* "RFCT" the same refusal: csupctl (0x7c4), as M reads it */
+#define CAPSTONE_TAG_FRTM 0x4652544d /* "FRTM" beside FRTY: the refused fetch's mtval (the CPMP's physical address), low 32 bits */
 #define CAPSTONE_TAG_RFVD 0x52465644 /* "RFVD" that slot's LCC validity query (zimm 0): 0 dead node, 1 live; 0xffffffff not asked (RFTY 7) */
 #endif
 #define CAPSTONE_TAG_FRGS 0x46524753 /* "FRGS" each loaded CPMP slot at the guard: (slot << 24) | (region live << 20) | (region maps the slot back << 16) | region */
@@ -3503,6 +3507,28 @@ void handle_interrupt(unsigned int_code) {
    value, as fetch_retry_covered's loop does: no other write, since a write with a different id would re-adopt the entry
    and the inspection would become the repair. Reported for every loaded slot whose bounds cover badaddr, and for every
    loaded slot with no capability (its bounds cannot be read): RFSL, RFTY, RFVD. */
+/* S-23's refusal CSRs (2026-10-19, under CAPSTONE_S23_REFUSAL_READ): at an S/U load or store refusal, before anything else,
+   srevroot (0x5c1) and csupctl (0x7c4) as M reads them, two plain CSR reads with no side effect. The RTL lane's reading
+   (csr_regfile.sv:2876-2878 on 8522d72fe): vctx_table_o is srevroot != 0 at S and csupctl.table at M, so a nonzero
+   srevroot with csupctl.table clear makes the trap into M (and the mret back) a namespace flush that re-arms every slot,
+   which would heal the deny before M can read it. Reported as RFSR (low 32), RFSH (high 32) and RFCT. */
+static void report_refusal_csrs(void) {
+    unsigned st;
+    unsigned cause;
+    unsigned v;
+    C_READ_CSR(mstatus, st);
+    if (((st >> 11) & 3) == 3)
+        return;
+    C_READ_CSR(mcause, cause);
+    if (cause != CAUSE_LOAD_ACCESS && cause != CAUSE_STORE_ACCESS)
+        return;
+    C_READ_CSR(0x5c1, v);
+    capstone_report(CAPSTONE_TAG_RFSR, v);
+    capstone_report(CAPSTONE_TAG_RFSH, v >> 32);
+    C_READ_CSR(0x7c4, v);
+    capstone_report(CAPSTONE_TAG_RFCT, v);
+}
+
 static void report_refusal_slots(unsigned badaddr) {
     unsigned i;
     unsigned r;
@@ -3714,6 +3740,9 @@ static unsigned fetch_retry_covered(unsigned badaddr) {
     fetch_retry_pc = ep;
     fetch_retry_ret = now;
     capstone_report(CAPSTONE_TAG_FRTY, ep);
+#ifdef CAPSTONE_S23_REFUSAL_READ
+    capstone_report(CAPSTONE_TAG_FRTM, badaddr);
+#endif
     __asm__ volatile("sfence.vma x0, x0");
     __asm__ volatile("fence.i");
     /* S-23a (2026-10-19, the RTL lane's s23-cpmp-rearm on bf3db3175): a broadcast naming a CPMP slot's index clears
@@ -3814,6 +3843,7 @@ static void swap_cpmp(unsigned badaddr) {
 #endif
 #if defined(CAPSTONE_TARGET_FPGA) && defined(CAPSTONE_S23_REFUSAL_READ)
         /* FIRST, before report_cpmx_diag: its cap_base on a loaded slot with no capability would raise at M. */
+        report_refusal_csrs();
         report_refusal_slots(badaddr);
 #endif
 #if defined(CAPSTONE_TARGET_FPGA) && defined(CAPSTONE_S23_REFUSAL_READ) && defined(CAPSTONE_S23_DATA_RETRY)
