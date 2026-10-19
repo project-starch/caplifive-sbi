@@ -3376,6 +3376,15 @@ unsigned handle_trap_ecall(unsigned arg0, unsigned arg1,
                     break;
                 case SBI_CAPSTONE_PROCESS_STATS:
 #ifdef CAPSTONE_SUPERVISOR_CSR_EVENTS
+#ifdef CAPSTONE_MIRROR_QUANTUM
+                    /* S-26's mirror arm (2026-10-19, that arm's firmware only): every census call also sets csupquantum
+                       (0x7C3), so a b0-stats run after b0-hello's process-ABI STEP (which wrote 2,000,000) lowers the
+                       quantum the next virtual entry loads, below the context's startup cost. Read back as "QNT1". */
+                    res = CAPSTONE_MIRROR_QUANTUM;
+                    SUP_CSR_WRITE(0x7c3, res);
+                    SUP_CSR_READ(0x7c3, res);
+                    capstone_report(0x514e5431, res);   /* "QNT1" */
+#endif
                     /* Only the census exists on silicon (selector 7, "available"); the VM's counters do not. */
                     res = 0;
                     if (arg0 == 7) { SUP_CSR_READ(0xfc4, res); }
