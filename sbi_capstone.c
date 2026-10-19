@@ -172,6 +172,9 @@
 #define CAPSTONE_TAG_RGNF 0x52474e46 /* "RGNF" region table full: a carve REFUSED before touching the pool (Phase B item 1), not a fault */
 #define CAPSTONE_TAG_RGNN 0x52474e4e /* "RGNN" region_n */
 #define CAPSTONE_TAG_FRTY 0x46525459 /* "FRTY" an S/U instruction fetch refused under a covering executable CPMP entry: retried (value = mepc) */
+#define CAPSTONE_TAG_FRGD 0x46524744 /* "FRGD" S-23a's guard after an FRTY: (unvouched slots << 16) | vouched loaded slots */
+#define CAPSTONE_TAG_FRGU 0x46524755 /* "FRGU" a CPMP slot the guard does not vouch for: (slot << 16) | its region, 0xffff for none */
+#define CAPSTONE_TAG_FRGS 0x46524753 /* "FRGS" each loaded CPMP slot at the guard: (slot << 24) | (region live << 20) | (region maps the slot back << 16) | region */
 #ifdef CAPSTONE_CPMX_DIAG
 /* The CPMX diagnostic (vp2 boot 3-T1's third run, 2026-10-18): the region table and the CPMP entries at the fault. */
 #define CAPSTONE_TAG_RDID 0x52444944 /* "RDID" a live region's id */
@@ -3478,6 +3481,59 @@ void handle_interrupt(unsigned int_code) {
 }
 
 #ifdef CAPSTONE_VP2_FETCH_RETRY
+/* S-23a's guard: every loaded CPMP slot must hold the region the monitor recorded there (cpmp_region names a live
+   region whose region_cpmp names this slot back), and every slot the monitor holds empty must hold no capability (the
+   total TYPE query, 7 = not a capability; capstone_dyn_unit.anvil func LCC, present at bf3db3175 and 8522d72fe). Each
+   slot it does not vouch for is named (FRGU); the count, with the vouched loaded slots, is always reported (FRGD), so
+   FRGD's high half is the verdict: 0 strobes, anything else skips. Every loaded slot's bookkeeping is printed first
+   (FRGS), whether vouched or not: at a refusal it says whether the slot held a live region (a deny that is false, a
+   live capability cleared by a colliding broadcast) or a retired one left loaded (a deny that is true).
+   Each capability is read and written back, as fetch_retry_covered's own loop does. */
+static unsigned cpmp_unvouched(void) {
+    unsigned i;
+    unsigned r;
+    unsigned t;
+    unsigned bad;
+    unsigned good;
+    unsigned live;
+    unsigned maps;
+    __linear void *tmp;
+    bad = 0;
+    good = 0;
+    for(i = 0; i < CPMP_COUNT; i += 1) {
+        r = cpmp_region[i];
+        if(r != -1) {
+            live = 0;
+            maps = 0;
+            if(r < region_n) {
+                if(region_live[r] != 0) {
+                    live = 1;
+                }
+                if(region_cpmp[r] == i) {
+                    maps = 1;
+                }
+            }
+            capstone_report(CAPSTONE_TAG_FRGS, (i << 24) | (live << 20) | (maps << 16) | (r & 0xffff));
+            if(live != 0 && maps != 0) {
+                good += 1;
+            } else {
+                capstone_report(CAPSTONE_TAG_FRGU, (i << 16) | (r & 0xffff));
+                bad += 1;
+            }
+        } else {
+            tmp = read_cpmp(i);
+            t = __capfield(tmp, 1);
+            write_cpmp(i, tmp);
+            if(t != 7) {
+                capstone_report(CAPSTONE_TAG_FRGU, (i << 16) | 0xffff);
+                bad += 1;
+            }
+        }
+    }
+    capstone_report(CAPSTONE_TAG_FRGD, (bad << 16) | good);
+    return bad;
+}
+
 /* vp2 workaround (bf3db3175, 2026-10-18). The S caller's FIRST instruction fetch after a CSRUNV escape returns is
    refused with an instruction access fault, although a LOADED CPMP entry with X covers it when M reads the CSRs
    (the CPMX diagnostic: CPMP 3 = [0x80100000, 0xAC000000) RWX, three boots, two module builds; llvm-capstone lane
@@ -3529,6 +3585,14 @@ static unsigned fetch_retry_covered(unsigned badaddr) {
     capstone_report(CAPSTONE_TAG_FRTY, ep);
     __asm__ volatile("sfence.vma x0, x0");
     __asm__ volatile("fence.i");
+    /* S-23a (2026-10-19, the RTL lane's s23-cpmp-rearm on bf3db3175): a broadcast naming a CPMP slot's index clears
+       that slot's validity, and the read-null-write-back above preserves the entry's id, so it cannot re-arm it; one
+       csupctl bit-2 strobe (the namespace-flush strobe) does. The strobe re-arms EVERY slot, and validity is also what
+       denies a stale capability left in a slot whose index was reclaimed (r12-recl-cpmp's P5 shape), so it is issued
+       only when the guard vouches for every slot. Otherwise the retry goes ahead without it, as before this change. */
+    if(cpmp_unvouched() == 0) {
+        __asm__ volatile("csrsi 0x7c4, 4");
+    }
     return 1;
 }
 #endif
