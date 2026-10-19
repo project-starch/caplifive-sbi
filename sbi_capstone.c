@@ -174,6 +174,11 @@
 #define CAPSTONE_TAG_FRTY 0x46525459 /* "FRTY" an S/U instruction fetch refused under a covering executable CPMP entry: retried (value = mepc) */
 #define CAPSTONE_TAG_FRGD 0x46524744 /* "FRGD" S-23a's guard after an FRTY: (unvouched slots << 16) | vouched loaded slots */
 #define CAPSTONE_TAG_FRGU 0x46524755 /* "FRGU" a CPMP slot the guard does not vouch for: (slot << 16) | its region, 0xffff for none */
+#ifdef CAPSTONE_S23_REFUSAL_READ
+#define CAPSTONE_TAG_RFSL 0x5246534c /* "RFSL" a loaded CPMP slot read at a refusal: (slot << 16) | its region (cpmp_region) */
+#define CAPSTONE_TAG_RFTY 0x52465459 /* "RFTY" that slot's LCC type query (zimm 1): 7 = no capability, its hardware tag clear */
+#define CAPSTONE_TAG_RFVD 0x52465644 /* "RFVD" that slot's LCC validity query (zimm 0): 0 dead node, 1 live; 0xffffffff not asked (RFTY 7) */
+#endif
 #define CAPSTONE_TAG_FRGS 0x46524753 /* "FRGS" each loaded CPMP slot at the guard: (slot << 24) | (region live << 20) | (region maps the slot back << 16) | region */
 #ifdef CAPSTONE_CPMX_DIAG
 /* The CPMX diagnostic (vp2 boot 3-T1's third run, 2026-10-18): the region table and the CPMP entries at the fault. */
@@ -3480,6 +3485,53 @@ void handle_interrupt(unsigned int_code) {
     }
 }
 
+#if defined(CAPSTONE_TARGET_FPGA) && defined(CAPSTONE_S23_REFUSAL_READ)
+/* S-23's refusal read (2026-10-19; FPGA, CAPSTONE_S23_REFUSAL_READ, off by default). At a refusal no live unloaded region
+   covers, before anything else reads the CPMP, each LOADED slot is read once. Its LCC type (zimm 1) is taken first:
+   a CPMP CSR read returns {cpmp_tag_q, metadata}, and commit's decompress_cap_tagged makes an untagged entry NOT_CAP, for
+   which the type query, and only it, answers (7) without raising (capstone_dyn_unit.anvil func LCC; the RTL lane's
+   trace). Only when the type is not 7 are the bounds and the validity (zimm 0: the physical node asked whether it is
+   still valid) read. Both are taken on the value read, BEFORE the write-back, and the write-back is exactly that
+   value, as fetch_retry_covered's loop does: no other write, since a write with a different id would re-adopt the entry
+   and the inspection would become the repair. Reported for every loaded slot whose bounds cover badaddr, and for every
+   loaded slot with no capability (its bounds cannot be read): RFSL, RFTY, RFVD. */
+static void report_refusal_slots(unsigned badaddr) {
+    unsigned i;
+    unsigned r;
+    unsigned t;
+    unsigned v;
+    unsigned b;
+    unsigned e;
+    unsigned hit;
+    __linear void *tmp;
+    for(i = 0; i < CPMP_COUNT; i += 1) {
+        r = cpmp_region[i];
+        if(r != -1) {
+            tmp = read_cpmp(i);
+            t = __capfield(tmp, 1);
+            v = 0xffffffff;
+            hit = 0;
+            if(t != 7) {
+                b = cap_base(tmp);
+                e = cap_end(tmp);
+                if(b <= badaddr && badaddr < e) {
+                    hit = 1;
+                    v = __capfield(tmp, 0);
+                }
+            } else {
+                hit = 1;
+            }
+            write_cpmp(i, tmp);
+            if(hit != 0) {
+                capstone_report(CAPSTONE_TAG_RFSL, (i << 16) | (r & 0xffff));
+                capstone_report(CAPSTONE_TAG_RFTY, t);
+                capstone_report(CAPSTONE_TAG_RFVD, v);
+            }
+        }
+    }
+}
+#endif
+
 #ifdef CAPSTONE_VP2_FETCH_RETRY
 /* S-23a's guard: every loaded CPMP slot must hold the region the monitor recorded there (cpmp_region names a live
    region whose region_cpmp names this slot back), and every slot the monitor holds empty must hold no capability (the
@@ -3680,6 +3732,10 @@ static void swap_cpmp(unsigned badaddr) {
 #if defined(CAPSTONE_TARGET_FPGA) && defined(CAPSTONE_VP2_FETCH_RETRY)
         if(fetch_retry_covered(badaddr))
             return 0;   /* retried: nothing to inject */
+#endif
+#if defined(CAPSTONE_TARGET_FPGA) && defined(CAPSTONE_S23_REFUSAL_READ)
+        /* FIRST, before report_cpmx_diag: its cap_base on a loaded slot with no capability would raise at M. */
+        report_refusal_slots(badaddr);
 #endif
         /* MERGE 2026-08-18: both sides kept, because they are orthogonal.
          *
