@@ -177,6 +177,10 @@
 #ifdef CAPSTONE_S23_REFUSAL_READ
 #define CAPSTONE_TAG_RFSL 0x5246534c /* "RFSL" a loaded CPMP slot read at a refusal: (slot << 16) | its region (cpmp_region) */
 #define CAPSTONE_TAG_RFTY 0x52465459 /* "RFTY" that slot's LCC type query (zimm 1): 7 = no capability, its hardware tag clear */
+#ifdef CAPSTONE_S23_DATA_RETRY
+#define CAPSTONE_TAG_DRT1 0x44525431 /* "DRT1" an S/U data access refused under a covering, passing, node-valid slot: retried, nothing written (value = mepc) */
+#define CAPSTONE_TAG_DRTX 0x44525458 /* "DRTX" the same mepc refused again within DATA_RETRY_MIN_INSTRET: not retried, injected as before (value = mepc) */
+#endif
 #define CAPSTONE_TAG_RFVD 0x52465644 /* "RFVD" that slot's LCC validity query (zimm 0): 0 dead node, 1 live; 0xffffffff not asked (RFTY 7) */
 #endif
 #define CAPSTONE_TAG_FRGS 0x46524753 /* "FRGS" each loaded CPMP slot at the guard: (slot << 24) | (region live << 20) | (region maps the slot back << 16) | region */
@@ -433,6 +437,10 @@ unsigned* caller_buf;
 #ifdef CAPSTONE_VP2_FETCH_RETRY
 /* the last retried fetch's pc and the minstret at its retry (fetch_retry_covered) */
 unsigned fetch_retry_pc;
+#ifdef CAPSTONE_S23_DATA_RETRY
+unsigned data_retry_pc;
+unsigned data_retry_ret;
+#endif
 unsigned fetch_retry_ret;
 #endif
 unsigned dom_calls_active;
@@ -3532,6 +3540,77 @@ static void report_refusal_slots(unsigned badaddr) {
 }
 #endif
 
+#if defined(CAPSTONE_TARGET_FPGA) && defined(CAPSTONE_S23_REFUSAL_READ) && defined(CAPSTONE_S23_DATA_RETRY)
+/* S-23b, step 1 only (2026-10-19; FPGA, CAPSTONE_S23_DATA_RETRY with CAPSTONE_S23_REFUSAL_READ, off by default). sql0-rf
+   read S-23's refused slot as tagged, LINEAR, covering, granting and node-valid (RFTY 0, RFVD 1): every CPMP allow term M
+   can read passes (pmp_data_if.sv cpmp_check at 8522d72fe: tag, type, bounds, perm[2] for a load and perm[1] for a store,
+   and the slot's tracker cpmp_revnode_valid_q, the one M cannot read). For an S/U load or store access fault, when SOME
+   loaded slot passes every readable term for that access, the access is simply retried: return to mepc with NOTHING
+   re-armed (each slot is read and written back exactly, as report_refusal_slots does: same id, so no re-adopt) and DRT1
+   printed. A true deny recurs, so this grants nothing the hardware does not. A second refusal at the same mepc within
+   DATA_RETRY_MIN_INSTRET is not retried: DRTX, then injected as before. DRT1 followed by progress reads as a transient
+   deny; DRTX reads as a persistent one. The per-slot re-adopt (step 2) is not here. Returns 1 when it retried. */
+#define DATA_RETRY_MIN_INSTRET 4096
+static unsigned data_retry_covered(unsigned badaddr) {
+    unsigned st;
+    unsigned cause;
+    unsigned ep;
+    unsigned now;
+    unsigned i;
+    unsigned t;
+    unsigned b;
+    unsigned e;
+    unsigned p;
+    unsigned v;
+    unsigned want;
+    unsigned hit;
+    __linear void *tmp;
+    C_READ_CSR(mstatus, st);
+    if (((st >> 11) & 3) == 3)
+        return 0;
+    C_READ_CSR(mcause, cause);
+    if (cause == CAUSE_LOAD_ACCESS) {
+        want = 4;
+    } else if (cause == CAUSE_STORE_ACCESS) {
+        want = 2;
+    } else {
+        return 0;
+    }
+    hit = 0;
+    for(i = 0; i < CPMP_COUNT; i += 1) {
+        if(cpmp_region[i] == -1)
+            continue;
+        tmp = read_cpmp(i);
+        t = __capfield(tmp, 1);
+        if(t != 7) {
+            b = cap_base(tmp);
+            e = cap_end(tmp);
+            p = __capfield(tmp, 5);
+            if(b <= badaddr && badaddr < e && (p & want) != 0) {
+                v = __capfield(tmp, 0);
+                if(v == 1) {
+                    hit = 1;
+                }
+            }
+        }
+        write_cpmp(i, tmp);
+    }
+    if(hit == 0)
+        return 0;
+    C_READ_CSR(mepc, ep);
+    C_READ_CSR(minstret, now);
+    if(ep == data_retry_pc && now - data_retry_ret < DATA_RETRY_MIN_INSTRET) {
+        data_retry_pc = 0;
+        capstone_report(CAPSTONE_TAG_DRTX, ep);
+        return 0;
+    }
+    data_retry_pc = ep;
+    data_retry_ret = now;
+    capstone_report(CAPSTONE_TAG_DRT1, ep);
+    return 1;
+}
+#endif
+
 #ifdef CAPSTONE_VP2_FETCH_RETRY
 /* S-23a's guard: every loaded CPMP slot must hold the region the monitor recorded there (cpmp_region names a live
    region whose region_cpmp names this slot back), and every slot the monitor holds empty must hold no capability (the
@@ -3736,6 +3815,10 @@ static void swap_cpmp(unsigned badaddr) {
 #if defined(CAPSTONE_TARGET_FPGA) && defined(CAPSTONE_S23_REFUSAL_READ)
         /* FIRST, before report_cpmx_diag: its cap_base on a loaded slot with no capability would raise at M. */
         report_refusal_slots(badaddr);
+#endif
+#if defined(CAPSTONE_TARGET_FPGA) && defined(CAPSTONE_S23_REFUSAL_READ) && defined(CAPSTONE_S23_DATA_RETRY)
+        if(data_retry_covered(badaddr))
+            return 0;   /* retried: nothing to inject */
 #endif
         /* MERGE 2026-08-18: both sides kept, because they are orthogonal.
          *
