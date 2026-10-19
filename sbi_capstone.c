@@ -3290,8 +3290,9 @@ unsigned handle_trap_ecall(unsigned arg0, unsigned arg1,
                     res = 0;
                     break;
                 case SBI_EXT_BASE_PROBE_EXT:
-                    // we only have time and Capstone extensions
-                    res = arg0 == SBI_EXT_TIME || arg0 == SBI_EXT_CAPSTONE;
+                    // time, remote fences and the Capstone extension
+                    res = arg0 == SBI_EXT_TIME || arg0 == SBI_EXT_RFENCE ||
+                          arg0 == SBI_EXT_CAPSTONE;
                     break;
                 case SBI_EXT_BASE_GET_MVENDORID:
                     C_READ_CSR(mvendorid, res);
@@ -3313,6 +3314,53 @@ unsigned handle_trap_ecall(unsigned arg0, unsigned arg1,
                 __asm__ volatile ("csrs mie, %0" :: "r"(MIP_MTIP));
             } else {
                 err = 1;
+            }
+            break;
+        case SBI_EXT_RFENCE:
+            /* One hart. Linux names it as hart_mask (a0) relative to hart_mask_base
+             * (a1), or every hart with base -1; an empty mask asks for nothing.
+             * Any other hart does not exist: refused. The address range (a2/a3)
+             * and ASID (a4) only narrow the flush, so the whole TLB is flushed.
+             * Without this extension Linux takes its SBI v0.1 fallback, which
+             * fences nothing and prints a warning for every executable page it
+             * maps. No H extension: the HFENCE functions, like unknown ones, are
+             * refused. The trampoline reports a refusal as error -1 (FAILED), not
+             * the specification's -2 (NOT_SUPPORTED) and -3 (INVALID_PARAM): it
+             * carries one error value for every monitor call (M-3).
+             * capstone-c evaluates shifts at 32 bits and both sides of && and ||,
+             * so the mask is checked with nested ifs and an add-doubled bit. */
+            {
+                unsigned hart;
+                unsigned wanted = 1;
+                unsigned at = 0;
+                unsigned selected = 1;
+                C_READ_CSR(mhartid, hart);
+                if (arg1 != (unsigned)-1) {
+                    if (arg0 == 0) {
+                        selected = 0;
+                    } else if (hart < arg1) {
+                        res = -1;
+                    } else {
+                        while (at < hart - arg1) {
+                            wanted = wanted + wanted;
+                            at = at + 1;
+                        }
+                        if (arg0 != wanted)
+                            res = -1;
+                    }
+                }
+                if (res == 0 && selected) {
+                    if (func_code == SBI_EXT_RFENCE_REMOTE_FENCE_I) {
+                        __asm__ volatile ("fence.i" ::: "memory");
+                    } else if (func_code == SBI_EXT_RFENCE_REMOTE_SFENCE_VMA ||
+                               func_code == SBI_EXT_RFENCE_REMOTE_SFENCE_VMA_ASID) {
+                        __asm__ volatile ("sfence.vma" ::: "memory");
+                    } else {
+                        res = -1;
+                    }
+                } else if (res == 0 && func_code > SBI_EXT_RFENCE_REMOTE_SFENCE_VMA_ASID) {
+                    res = -1;
+                }
             }
             break;
         case SBI_EXT_CAPSTONE:
