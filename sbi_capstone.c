@@ -171,6 +171,7 @@
 #define CAPSTONE_TAG_DOMN 0x444f4d4e /* "DOMN" dom_n */
 #define CAPSTONE_TAG_RGNF 0x52474e46 /* "RGNF" region table full: a carve REFUSED before touching the pool (Phase B item 1), not a fault */
 #define CAPSTONE_TAG_RGNN 0x52474e4e /* "RGNN" region_n */
+#define CAPSTONE_TAG_FRTC 0x46525443 /* "FRTC" a refused fetch NOT retried: FETCH_RETRY_MAX_STREAK retries in a row made no progress, so it is injected (value = mepc) */
 #define CAPSTONE_TAG_FRTY 0x46525459 /* "FRTY" an S/U instruction fetch refused under a covering executable CPMP entry: retried (value = mepc) */
 #define CAPSTONE_TAG_FRGD 0x46524744 /* "FRGD" S-23a's guard after an FRTY: (unvouched slots << 16) | vouched loaded slots */
 #define CAPSTONE_TAG_FRGU 0x46524755 /* "FRGU" a CPMP slot the guard does not vouch for: (slot << 16) | its region, 0xffff for none */
@@ -442,6 +443,10 @@ unsigned data_retry_pc;
 unsigned data_retry_ret;
 #endif
 unsigned fetch_retry_ret;
+#ifdef CAPSTONE_FETCH_RETRY_CAP
+/* retries since the last refusal that followed real progress (fetch_retry_covered); capped at FETCH_RETRY_MAX_STREAK */
+unsigned fetch_retry_streak;
+#endif
 #endif
 unsigned dom_calls_active;
 #define DOM_CALL_ENTER() dom_calls_active = dom_calls_active + 1
@@ -3674,6 +3679,9 @@ static unsigned cpmp_unvouched(void) {
    retried, and is injected as before. Only S/U instruction-fetch access faults under a covering X entry qualify, so
    no access the CPMP does not already grant is made. Returns 1 when it retried. */
 #define FETCH_RETRY_MIN_INSTRET 4096
+#ifdef CAPSTONE_FETCH_RETRY_CAP
+#define FETCH_RETRY_MAX_STREAK 2
+#endif
 static unsigned fetch_retry_covered(unsigned badaddr) {
     unsigned st;
     unsigned cause;
@@ -3711,6 +3719,22 @@ static unsigned fetch_retry_covered(unsigned badaddr) {
         fetch_retry_pc = 0;
         return 0;
     }
+#ifdef CAPSTONE_FETCH_RETRY_CAP
+    /* The per-pc guard above cannot see two refusing pcs that alternate: each looks like a first refusal. On a
+       bitstream whose CPMP trackers ignore the namespace flush (the batch ruling, isa.md), the strobe below no longer
+       heals a deny, so that would retry forever. Count the retries since the last one followed by real progress
+       (FETCH_RETRY_MIN_INSTRET retired since it), and at FETCH_RETRY_MAX_STREAK inject instead: FRTC, then the fault
+       goes to S as before. */
+    if(now - fetch_retry_ret >= FETCH_RETRY_MIN_INSTRET)
+        fetch_retry_streak = 0;
+    if(fetch_retry_streak >= FETCH_RETRY_MAX_STREAK) {
+        fetch_retry_streak = 0;
+        fetch_retry_pc = 0;
+        capstone_report(CAPSTONE_TAG_FRTC, ep);
+        return 0;
+    }
+    fetch_retry_streak = fetch_retry_streak + 1;
+#endif
     fetch_retry_pc = ep;
     fetch_retry_ret = now;
     capstone_report(CAPSTONE_TAG_FRTY, ep);
