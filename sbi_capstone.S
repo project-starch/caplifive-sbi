@@ -97,6 +97,19 @@ _cap_trap_entry:
     j return_to_sumode
 
 _handle_non_ecall:
+#ifdef CAPSTONE_CSCHECK_EMU
+    # MEASUREMENT ONLY: CSCHECKR/W and CSKINDS from S trap here as illegal instructions and are emulated by
+    # cscheck_dispatch (capstone_cscheck.S), with the same frame capability csmint_dispatch takes. Handled: rd is in
+    # the frame and mepc advanced. Not ours: carry on to the CSMINT emulation and handle_exception.
+    li t1, CAUSE_ILLEGAL_INSTRUCTION
+    bne t0, t1, 3f
+    MOVC(a0, sp)
+    CINCOFFSETIMM(a0, a0, 16)
+    call cscheck_dispatch
+    bnez a0, _cscheck_done
+    csrr t0, mcause
+3:
+#endif
 #if defined(CAPSTONE_TARGET_FPGA) && defined(CAPSTONE_VP2_CSMINT)
     # vp2: an S-mode CSMINT traps here as an illegal instruction and is emulated by csmint_dispatch
     # (capstone_csmint.S, validated in RTL simulation as va-csmint-emu and va-csmint-mon). It takes a capability over
@@ -144,6 +157,7 @@ _handle_non_ecall:
     csrw mepc, t2
 _handle_branch_1:
 #endif
+_cscheck_done:
     CINCOFFSETIMM(sp, sp, 16)
     RESTORE_REG(a0, sp)
     RESTORE_REG(a1, sp)
@@ -269,6 +283,10 @@ resume_smode:
 
     j return_to_sumode
 
+#ifdef CAPSTONE_CSCHECK_EMU
+/* MEASUREMENT ONLY: the CSCHECKR/W and CSKINDS emulation, in .cap_text with the rest of this file */
+#include "capstone_cscheck.S"
+#endif
 #if defined(CAPSTONE_TARGET_FPGA) && defined(CAPSTONE_VP2_CSMINT)
 /* vp2: the CSMINT emulation, in .cap_text with the rest of this file */
 #include "capstone_csmint.S"
