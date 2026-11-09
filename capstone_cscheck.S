@@ -197,6 +197,9 @@ csc_decode:
   CSC_LDC(t5, t6)              /* t5 again (STC of a NONLIN copy leaves the register; reload to be sure) */
   sd zero, 8(t2)               /* a plain store clears the scratch granule's tag (through the page capability:
                                   M is in capability mode, as every access here) */
+  fence                        /* B's load rule meets the store buffer: CVA6's load/store hazard compare is
+                                  doubleword-granular, so without a fence the ld can read the still-tagged line
+                                  while the sd to dw1 sits buffered, and gets the projected cursor (no slot) */
   ld t3, 0(t2)                 /* untagged: the raw cursor word */
   sd zero, 0(t2)
   srli t3, t3, 39              /* t3: the slot */
