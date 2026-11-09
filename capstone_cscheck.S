@@ -40,11 +40,24 @@
 #ifndef CSC_STORED_NONLIN
 #define CSC_STORED_NONLIN 2          /* the RTL's cap_type_t NONLIN, as stored (Q-35) */
 #endif
+#ifdef CSC_IDS55
+/* Option B (capstone-ariane rtl-ids55): a 55-bit id {generation[54:25], slot[24:0]}. A stored capability keeps its
+ * slot in the cursor word's [63:39] and its generation in the hi word's node field [63:34]; a wide FLAT record keeps
+ * the generation at word 1 [59:30] (capstone-qemu cap_rev_table_abi.h CAP_REV_WIDE_*); the header is the narrow one.
+ * Under B's load rule a plain load of a TAGGED granule's first doubleword reads sext39(address), so the slot cannot
+ * be read in place: the LDC copy is stored (STC) into csc_slot_scratch, a plain store to its second doubleword clears
+ * that granule's tag, and a plain load of its first doubleword then reads the raw word. The frame is not touched. */
+#define CSC_INDEX_BITS 25
+#define CSC_GEN_BITS 30
+#define CSC_GEN_SHIFT 30
+#else
 #ifndef CSC_INDEX_BITS
 #define CSC_INDEX_BITS 20            /* E5's flat index: id = {generation[29:20], index[19:0]} */
 #endif
-#define CSC_FINGERPRINT 0x4353434845
+#define CSC_GEN_BITS (30 - CSC_INDEX_BITS)
 #define CSC_GEN_SHIFT (30 + CSC_INDEX_BITS)
+#endif
+#define CSC_FINGERPRINT 0x4353434845
 
 #define CSC_CAPCREATE(reg)           .insn r 0x7B, 0x0, 0x4, reg, x0, x0
 #define CSC_CAPTYPE(rd, rs1)         .insn r 0x7B, 0x0, 0x5, rd, rs1, x0
@@ -52,6 +65,7 @@
 #define CSC_CAPBOUND(rd, rs1, rs2)   .insn r 0x7B, 0x0, 0x8, rd, rs1, rs2
 #define CSC_CINCOFFSET(rd, rs1, rs2) .insn r 0x5B, 0x1, 0xc, rd, rs1, rs2
 #define CSC_LDC(rd, rs1)             .insn i 0x5B, 0x3, rd, 0(rs1)
+#define CSC_STC(data, addr)          .insn s 0x5B, 0x4, data, 0(addr)
 #define CSC_LCC_TYPE(rd, rs1)        .insn r 0x5B, 0x1, 0x4, rd, rs1, x1
 #define CSC_LCC_CURSOR(rd, rs1)      .insn r 0x5B, 0x1, 0x4, rd, rs1, x2
 #define CSC_LCC_BASE(rd, rs1)        .insn r 0x5B, 0x1, 0x4, rd, rs1, x3
@@ -175,10 +189,23 @@ csc_decode:
   bne t4, t1, csc_clear
   /* ---- liveness in the flat RECYCLE table at srevroot */
   li s10, 25
+#ifdef CSC_IDS55
+  srli t4, s1, 34              /* t4: generation, the hi word's node field */
+  lla t1, csc_slot_scratch    /* pc-relative: no GOT load (an integer load through no capability) */
+  CSC_PHYS(t2, t1, a1, a2)     /* t2: the scratch granule (16-aligned, inside one page) */
+  CSC_STC(t5, t2)              /* t5's stored form: the slot in the cursor word's [63:39] */
+  CSC_LDC(t5, t6)              /* t5 again (STC of a NONLIN copy leaves the register; reload to be sure) */
+  sd zero, 8(t2)               /* a plain store clears the scratch granule's tag (through the page capability:
+                                  M is in capability mode, as every access here) */
+  ld t3, 0(t2)                 /* untagged: the raw cursor word */
+  sd zero, 0(t2)
+  srli t3, t3, 39              /* t3: the slot */
+#else
   srli t1, s1, 34              /* the id */
   li t2, (1 << CSC_INDEX_BITS) - 1
   and t3, t1, t2               /* t3: index */
   srli t4, t1, CSC_INDEX_BITS  /* t4: generation */
+#endif
   csrr t2, 0x5c1               /* t2: the table root */
   li a1, 4095
   and a2, t2, a1
@@ -206,7 +233,7 @@ csc_decode:
   andi s2, s0, 4
   bnez s2, csc_clear           /* FREE */
   srli s0, a1, CSC_GEN_SHIFT
-  li s2, (1 << (30 - CSC_INDEX_BITS)) - 1
+  li s2, (1 << CSC_GEN_BITS) - 1
   and s0, s0, s2
   bne s0, t4, csc_clear
   /* ---- permission */
@@ -291,3 +318,11 @@ csc_kinds:
 csc_not_ours:
   li a0, 0
   ret
+
+#ifdef CSC_IDS55
+  .pushsection .data
+  .align 4
+csc_slot_scratch:              /* one granule: CSC_IDS55's slot read; zero between checks */
+  .dword 0, 0
+  .popsection
+#endif
