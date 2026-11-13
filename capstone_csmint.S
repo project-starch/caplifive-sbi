@@ -37,6 +37,7 @@
  *   desc & 7 -> 4 (tval desc); a descriptor word not readable -> 13 (tval its VA, words read w0..w5);
  *   slot & 15 -> 6 (tval slot); the slot not writable -> 15 (tval slot); w4 != 0: w4 & 15 -> 6, w4 not writable -> 15
  *   (tval w4); base >= end, w2 & ~0x10F, w5 != 0, cursor outside [base, end], or w4 != 0 with LINEAR -> 29;
+ *   end - base >= 1022 * 2^54 -> 29 (R-71: the fixed RTL's CAPBOUND limit, checked before CAPBOUND runs in M);
  *   [base, end) not representable -> 29
  *   (a length of 4 KiB and up needs a granule-aligned base and a granule-multiple length, granule 2^(msb(len)-9):
  *   capstone_repr_ok); fewer than two free identities in the table at srevroot (capacity - next + free_count, from the
@@ -221,6 +222,12 @@ csmint_dispatch:
   beqz t0, csm_bad_desc        /* a second slot needs NONLIN */
 53:
   sub t0, s8, s7               /* len */
+  /* R-71: the fixed RTL's CAPBOUND refuses len >= 1022 * 2^54 with 29 (capstone-ariane ee82e1c6a). The mint below runs
+   * CAPBOUND in M, before the window's vector is installed, so a length it refuses would trap into the monitor's trap
+   * entry, which is not reentrant. Refuse it here first. The limit also covers three regions that encode exactly at
+   * E = 51 (the RTL refuses those too), and it is the RTL's limit, not QEMU's: helper_csmint checks a round trip. */
+  li t1, 0xff80000000000000
+  bgeu t0, t1, csm_bad_desc
   li t1, 4096
   bltu t0, t1, 7f
   li t1, 63
