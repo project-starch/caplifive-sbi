@@ -26,7 +26,7 @@
  *     2 <= index < next and < capacity, record word 1 VALID and not FREE, generation [59:30+IB] == id >> IB   -> 25
  *     (CSC_TABLE_TREE, CSC_IDS55 only: a header with RECYCLE and PAGED both set is the Sublet Section 5 Phase 1 tree,
  *     llvm-capstone capstone_vm.c CAPSTONE_VM_TABLE_TREE: the same header words and record format, and the record
- *     reached by the 5:9:9:8 walk below; a zero or unaligned entry at any level is dead, as the RTL walker reads it)
+ *     reached by the 5:9:9:8 walk below; a zero, unaligned or [63:56]-set entry at any level is dead, as the RTL reads it)
  *   LCC PERM lacks R (CSCHECKR) or W (CSCHECKW)                                      -> 27
  *   cursor + offset overflows, leaves [base, end], end - address < bytes, or an address is not Sv39  -> 28
  *   else descriptor[4] = cursor + offset, rd = 0.
@@ -339,10 +339,11 @@ csc_not_ours:
 /* The tree (header RECYCLE | PAGED). In: s0 = header[63:62], a2 = header, a1 = the header page, t2 = the root,
  * t3 = the slot. The header checks are the flat table's; then root entry slot[30:26] at root + 64, first-level
  * entry slot[25:17], second-level entry slot[16:8], record slot[7:0] at 16 bytes. Each entry is a plain physical
- * address, read through a NONLIN capability minted for its page; 0 or not 4 KiB aligned is dead (25). Back at
+ * address, read through a NONLIN capability minted for its page; 0, not 4 KiB aligned, or bits [63:56] set is dead
+ * (25), as the RTL walker's pw_entry_bad (capstone-ariane d83d3a633 core/ex_stage.sv). Back at
  * csc_record with a2 at the record's word 1. Clobbers a1, a2, s0, s2 only, as the flat path does. */
 #define CSC_TREE_ENTRY(E, T) \
-  beqz E, csc_clear; li T, 4095; and T, E, T; bnez T, csc_clear
+  beqz E, csc_clear; li T, 4095; and T, E, T; bnez T, csc_clear; srli T, E, 56; bnez T, csc_clear
 csc_tree:
   li s2, 3                     /* RECYCLE and PAGED */
   bne s0, s2, csc_clear
