@@ -24,6 +24,9 @@
  *   LDC through the frame capability, LCC TYPE 7 (untagged)                          -> 24
  *   the id hi[63:34] dead in the FLAT RECYCLE table at srevroot: header RECYCLE set and PAGED clear,
  *     2 <= index < next and < capacity, record word 1 VALID and not FREE, generation [59:30+IB] == id >> IB   -> 25
+ *     (CSC_TABLE_TREE, CSC_IDS55 only: a header with RECYCLE and PAGED both set is the Sublet Section 5 Phase 1 tree,
+ *     llvm-capstone capstone_vm.c CAPSTONE_VM_TABLE_TREE: the same header words and record format, and the record
+ *     reached by the 5:9:9:8 walk below; a zero or unaligned entry at any level is dead, as the RTL walker reads it)
  *   LCC PERM lacks R (CSCHECKR) or W (CSCHECKW)                                      -> 27
  *   cursor + offset overflows, leaves [base, end], end - address < bytes, or an address is not Sv39  -> 28
  *   else descriptor[4] = cursor + offset, rd = 0.
@@ -58,6 +61,9 @@
 #define CSC_GEN_SHIFT (30 + CSC_INDEX_BITS)
 #endif
 #define CSC_FINGERPRINT 0x4353434845
+#if defined(CSC_TABLE_TREE) && !defined(CSC_IDS55)
+#error "CSC_TABLE_TREE is the ids55 table (CSC_IDS55): its slots index the tree"
+#endif
 
 #define CSC_CAPCREATE(reg)           .insn r 0x7B, 0x0, 0x4, reg, x0, x0
 #define CSC_CAPTYPE(rd, rs1)         .insn r 0x7B, 0x0, 0x5, rd, rs1, x0
@@ -217,7 +223,11 @@ csc_decode:
   ld a2, 0(a1)                 /* capacity | RECYCLE << 63 | PAGED << 62 */
   srli s0, a2, 62
   li s2, 2                     /* RECYCLE set, PAGED clear */
+#ifdef CSC_TABLE_TREE
+  bne s0, s2, csc_tree         /* not the flat table: the tree, or refused there */
+#else
   bne s0, s2, csc_clear
+#endif
   slli a2, a2, 2
   srli a2, a2, 2               /* a2: capacity */
   ld s0, 8(a1)                 /* s0: next */
@@ -229,6 +239,9 @@ csc_decode:
   add a1, a1, t2
   addi a1, a1, 8               /* a1: the record's word 1 */
   CSC_PHYS(a2, a1, s0, s2)
+#ifdef CSC_TABLE_TREE
+csc_record:                    /* a2: a capability at the record's word 1, from either table */
+#endif
   ld a1, 0(a2)                 /* one 64-bit read: flags and generation together */
   srli s0, a1, 60
   andi s2, s0, 1
@@ -321,6 +334,53 @@ csc_kinds:
 csc_not_ours:
   li a0, 0
   ret
+
+#ifdef CSC_TABLE_TREE
+/* The tree (header RECYCLE | PAGED). In: s0 = header[63:62], a2 = header, a1 = the header page, t2 = the root,
+ * t3 = the slot. The header checks are the flat table's; then root entry slot[30:26] at root + 64, first-level
+ * entry slot[25:17], second-level entry slot[16:8], record slot[7:0] at 16 bytes. Each entry is a plain physical
+ * address, read through a NONLIN capability minted for its page; 0 or not 4 KiB aligned is dead (25). Back at
+ * csc_record with a2 at the record's word 1. Clobbers a1, a2, s0, s2 only, as the flat path does. */
+#define CSC_TREE_ENTRY(E, T) \
+  beqz E, csc_clear; li T, 4095; and T, E, T; bnez T, csc_clear
+csc_tree:
+  li s2, 3                     /* RECYCLE and PAGED */
+  bne s0, s2, csc_clear
+  slli a2, a2, 2
+  srli a2, a2, 2               /* a2: capacity */
+  ld s0, 8(a1)                 /* s0: next */
+  li s2, 2
+  bltu t3, s2, csc_clear
+  bgeu t3, s0, csc_clear
+  bgeu t3, a2, csc_clear
+  srli a1, t3, 26
+  slli a1, a1, 3
+  add a1, a1, t2
+  addi a1, a1, 64              /* a1: the root entry */
+  CSC_PHYS(a2, a1, s0, s2)
+  ld a1, 0(a2)                 /* a1: the first-level directory page */
+  CSC_TREE_ENTRY(a1, s0)
+  srli s0, t3, 17
+  andi s0, s0, 511
+  slli s0, s0, 3
+  add a1, a1, s0               /* a1: the first-level entry */
+  CSC_PHYS(a2, a1, s0, s2)
+  ld a1, 0(a2)                 /* a1: the second-level directory page */
+  CSC_TREE_ENTRY(a1, s0)
+  srli s0, t3, 8
+  andi s0, s0, 511
+  slli s0, s0, 3
+  add a1, a1, s0               /* a1: the second-level entry */
+  CSC_PHYS(a2, a1, s0, s2)
+  ld a1, 0(a2)                 /* a1: the record page */
+  CSC_TREE_ENTRY(a1, s0)
+  andi s0, t3, 255
+  slli s0, s0, 4
+  add a1, a1, s0
+  addi a1, a1, 8               /* a1: the record's word 1 */
+  CSC_PHYS(a2, a1, s0, s2)
+  j csc_record
+#endif
 
 #ifdef CSC_IDS55
   .pushsection .data
