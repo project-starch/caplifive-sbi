@@ -43,7 +43,19 @@
 #ifndef CSC_STORED_NONLIN
 #define CSC_STORED_NONLIN 2          /* the RTL's cap_type_t NONLIN, as stored (Q-35) */
 #endif
-#ifdef CSC_IDS55
+#if defined(CSC_SUBLET)
+#if defined(CSC_IDS55)
+#error "CSC_SUBLET and CSC_IDS55 are two id formats"
+#endif
+/* Line B (2026-11-21, the Sublet format: capstone-qemu c1985bb529 cap.h:226-246, cap_compress.c:73-105,
+ * cap_rev_table_abi.h:65-157). The id is {generation[62:31], slot[30:0]}, both in the stored HIGH word: generation at
+ * [63:32], slot at [31:1] (bounds[26] at bit 0). The low word is bounds[25:0] << 38 | address[37:0], and the cursor is
+ * the ZERO extension of the 38-bit address. There is NO type and NO rights: every capability decodes NONLIN with RWX,
+ * and CAPTYPE/CAPPERM are illegal. A record is live for exactly the id {its generation, its slot}: word 1 [63:32] is
+ * the generation, and there are no VALID, LINEAR or FREE flags. The paged root keeps today's header words and its 32
+ * root entries at +64, and the 5:9:9:8 walk below already spans the 31-bit slot. */
+#define CSC_SUBLET_SLOT_MASK 0x7fffffff
+#elif defined(CSC_IDS55)
 /* Option B (capstone-ariane rtl-ids55): a 55-bit id {generation[54:25], slot[24:0]}. A stored capability keeps its
  * slot in the cursor word's [63:39] and its generation in the hi word's node field [63:34]; a wide FLAT record keeps
  * the generation at word 1 [59:30] (capstone-qemu cap_rev_table_abi.h CAP_REV_WIDE_*); the header is the narrow one.
@@ -61,7 +73,7 @@
 #define CSC_GEN_SHIFT (30 + CSC_INDEX_BITS)
 #endif
 #define CSC_FINGERPRINT 0x4353434845
-#if defined(CSC_TABLE_TREE) && !defined(CSC_IDS55)
+#if defined(CSC_TABLE_TREE) && !defined(CSC_IDS55) && !defined(CSC_SUBLET)
 #error "CSC_TABLE_TREE is the ids55 table (CSC_IDS55): its slots index the tree"
 #endif
 
@@ -79,10 +91,18 @@
 #define CSC_LCC_PERM(rd, rs1)        .insn r 0x5B, 0x1, 0x4, rd, rs1, x5
 
 /* CAP = a NONLIN RW capability over the 4 KiB page holding PA, cursor at PA. T1, T2 temporaries; all distinct. */
+#ifdef CSC_SUBLET
+/* Sublet: CAPTYPE and CAPPERM are illegal; a fresh capability decodes NONLIN RWX, so bounds and the cursor suffice. */
+#define CSC_PHYS(CAP, PA, T1, T2) \
+  CSC_CAPCREATE(CAP); \
+  srli T1, PA, 12; slli T1, T1, 12; li T2, 4096; add T2, T1, T2; CSC_CAPBOUND(CAP, T1, T2); \
+  sub T1, PA, T1; CSC_CINCOFFSET(CAP, CAP, T1)
+#else
 #define CSC_PHYS(CAP, PA, T1, T2) \
   CSC_CAPCREATE(CAP); li T1, 2; CSC_CAPTYPE(CAP, T1); \
   srli T1, PA, 12; slli T1, T1, 12; li T2, 4096; add T2, T1, T2; CSC_CAPBOUND(CAP, T1, T2); \
   li T2, 6; CSC_CAPPERM(CAP, T2); sub T1, PA, T1; CSC_CINCOFFSET(CAP, CAP, T1)
+#endif
 
 .align 2
 .globl cscheck_dispatch
@@ -180,11 +200,13 @@ csc_decode:
   ld s1, 8(t6)                 /* s1: the stored hi word */
   li s10, 24
   beqz s1, csc_finish
+#ifndef CSC_SUBLET
   srli t1, s1, 27
   andi t1, t1, 7
   li t2, CSC_STORED_NONLIN
   li s10, 26
   bne t1, t2, csc_finish
+#endif
   CSC_LDC(t5, t6)              /* t5: the slot's capability (NONLIN: a copy) */
   CSC_LCC_TYPE(t4, t5)
   li t1, 7
@@ -195,7 +217,12 @@ csc_decode:
   bne t4, t1, csc_clear
   /* ---- liveness in the flat RECYCLE table at srevroot */
   li s10, 25
-#ifdef CSC_IDS55
+#if defined(CSC_SUBLET)
+  srli t4, s1, 32              /* t4: generation, hi[63:32] */
+  srli t3, s1, 1
+  li t1, CSC_SUBLET_SLOT_MASK
+  and t3, t3, t1               /* t3: the slot, hi[31:1] (a plain load of the HIGH word reads it in place) */
+#elif defined(CSC_IDS55)
   srli t4, s1, 34              /* t4: generation, the hi word's node field */
   lla t1, csc_slot_scratch    /* pc-relative: no GOT load (an integer load through no capability) */
   CSC_PHYS(t2, t1, a1, a2)     /* t2: the scratch granule (16-aligned, inside one page) */
@@ -243,6 +270,10 @@ csc_decode:
 csc_record:                    /* a2: a capability at the record's word 1, from either table */
 #endif
   ld a1, 0(a2)                 /* one 64-bit read: flags and generation together */
+#ifdef CSC_SUBLET
+  srli s0, a1, 32              /* the record's generation, word 1 [63:32]: live exactly for this id */
+  bne s0, t4, csc_clear
+#else
   srli s0, a1, 60
   andi s2, s0, 1
   beqz s2, csc_clear           /* not VALID */
@@ -252,6 +283,7 @@ csc_record:                    /* a2: a capability at the record's word 1, from 
   li s2, (1 << CSC_GEN_BITS) - 1
   and s0, s0, s2
   bne s0, t4, csc_clear
+#endif
   /* ---- permission */
   CSC_LCC_PERM(t1, t5)
   li t2, 4                     /* R */
@@ -272,6 +304,15 @@ csc_record:                    /* a2: a capability at the record's word 1, from 
   bltu t3, t4, csc_clear
   sub s0, t3, t4
   bltu s0, a6, csc_clear       /* end - address < bytes */
+#ifdef CSC_SUBLET
+  srli s0, t4, 38              /* Sublet: an address is below 2^38 (the zero-extended 38-bit field) */
+  bnez s0, csc_clear
+  beqz a6, 5f
+  add s0, t4, a6
+  addi s0, s0, -1
+  srli s2, s0, 38
+  bnez s2, csc_clear
+#else
   slli s0, t4, 25
   srai s0, s0, 25
   bne s0, t4, csc_clear
@@ -281,6 +322,7 @@ csc_record:                    /* a2: a capability at the record's word 1, from 
   slli s2, s0, 25
   srai s2, s2, 25
   bne s2, s0, csc_clear
+#endif
 5:
   sd t4, 32(s7)                /* descriptor[4] = the address */
   li s10, 0
@@ -312,10 +354,12 @@ csc_kinds:
   CSC_CINCOFFSET(t6, s6, t1)
   ld t2, 8(t6)
   beqz t2, 9f                  /* a plain integer */
+#ifndef CSC_SUBLET
   srli t3, t2, 27
   andi t3, t3, 7
   li t4, CSC_STORED_NONLIN
   bne t3, t4, 8f               /* never load a slot that might be LINEAR: report it tagged */
+#endif
   CSC_LDC(t5, t6)
   CSC_LCC_TYPE(t3, t5)
   li t5, 0

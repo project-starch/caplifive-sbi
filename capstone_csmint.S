@@ -73,10 +73,18 @@
 
 /* CAP = a NONLIN RW capability over the 4 KiB page holding the physical address in PA, cursor at PA.
  * T1 and T2 are temporaries; all four registers must be distinct. */
+#ifdef CSC_SUBLET
+/* Sublet (2026-11-21): CAPTYPE and CAPPERM are illegal; a fresh capability decodes NONLIN RWX. */
+#define CSM_PHYS(CAP, PA, T1, T2) \
+  CSM_CAPCREATE(CAP); \
+  srli T1, PA, 12; slli T1, T1, 12; li T2, 4096; add T2, T1, T2; CSM_CAPBOUND(CAP, T1, T2); \
+  sub T1, PA, T1; CSM_CINCOFFSET(CAP, CAP, T1)
+#else
 #define CSM_PHYS(CAP, PA, T1, T2) \
   CSM_CAPCREATE(CAP); li T1, CSM_TYPE_NONLIN; CSM_CAPTYPE(CAP, T1); \
   srli T1, PA, 12; slli T1, T1, 12; li T2, 4096; add T2, T1, T2; CSM_CAPBOUND(CAP, T1, T2); \
   li T2, CSM_PERM_RW; CSM_CAPPERM(CAP, T2); sub T1, PA, T1; CSM_CINCOFFSET(CAP, CAP, T1)
+#endif
 
 /* Software Sv39 walk of the S virtual address in VA (unchanged) for one access; ISSTORE is 0 or 1.
  * Out: PA = the physical address, or a jump to FAIL. U is a unique label prefix.
@@ -212,6 +220,10 @@ csmint_dispatch:
   li t0, ~0x10F
   and t0, s9, t0
   bnez t0, csm_bad_desc        /* w2: only perms bits 0-3 and NONLIN bit 8 */
+#ifdef CSC_SUBLET
+  li t0, 0x10F
+  bne s9, t0, csm_bad_desc     /* Sublet: w2 is exactly RWX | NONLIN (capstone-qemu c1985bb529 helper_csmint); 29 */
+#endif
   bnez s1, csm_bad_desc        /* w5 reserved */
   bltu a1, s7, csm_bad_desc    /* cursor < base */
   bltu s8, a1, csm_bad_desc    /* cursor > end */
@@ -255,6 +267,9 @@ csmint_dispatch:
   blt t1, t2, csm_reserve
   /* ---- mint the LINEAR capability */
   CSM_CAPCREATE(s11)
+#ifdef CSC_SUBLET
+  CSM_CAPBOUND(s11, s7, s8)    /* Sublet: no type or rights to write; the capability decodes NONLIN RWX */
+#else
   li t0, CSM_TYPE_LIN
   srli t1, s9, 8
   andi t1, t1, 1
@@ -265,6 +280,7 @@ csmint_dispatch:
   CSM_CAPBOUND(s11, s7, s8)
   andi t0, s9, 15
   CSM_CAPPERM(s11, t0)
+#endif
   csrr s6, mepc                /* a CSNODE refusal traps from M and overwrites mepc and mstatus */
   csrr s7, mstatus
   /* ---- the window's trap vector. On the RTL the vector is mtvec in both modes: CCSR ctvec is {tag, metadata} over
