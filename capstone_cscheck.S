@@ -194,6 +194,11 @@ csc_decode:
   li s10, 26
   bne t4, t1, csc_clear
   /* ---- liveness in the flat RECYCLE table at srevroot */
+#ifdef CSC_SPATIAL_ONLY
+  /* MEASUREMENT ONLY, the spatial-only core: it has no lifetime table (the rev_node unit is a stub that writes no
+   * record), so there is no liveness to check; the type, permission and bounds checks are unchanged. */
+  j csc_perm
+#endif
   li s10, 25
 #ifdef CSC_IDS55
   srli t4, s1, 34              /* t4: generation, the hi word's node field */
@@ -253,6 +258,7 @@ csc_record:                    /* a2: a capability at the record's word 1, from 
   and s0, s0, s2
   bne s0, t4, csc_clear
   /* ---- permission */
+csc_perm:
   CSC_LCC_PERM(t1, t5)
   li t2, 4                     /* R */
   beqz s11, 4f
